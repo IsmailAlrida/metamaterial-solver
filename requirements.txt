@@ -1,0 +1,5 @@
+# Current lightweight backend + PyQt research shell.
+numpy
+PyQt6
+pyvista
+pyvistaqt

@@ -42,6 +42,8 @@ def validate_request(data: dict[str, Any]) -> None:
         raise ContractError("target.frequencies_hz must not be empty")
     if len({len(frequencies), len(magnitude), len(phase)}) != 1:
         raise ContractError("target frequency, magnitude, and phase arrays must be the same length")
+    _band_list(target, "attenuation_bands_hz", "target")
+    _band_list(target, "preserve_bands_hz", "target")
 
     domain = data["domain"]
     _require_keys(domain, ("grid_shape_xyz", "voxel_size_m"), "domain")
@@ -102,3 +104,18 @@ def _positive_int(data: dict[str, Any], key: str, where: str, required: bool = T
         return
     if not isinstance(data[key], int) or data[key] <= 0:
         raise ContractError(f"{where}.{key} must be a positive integer")
+
+
+def _band_list(data: dict[str, Any], key: str, where: str) -> None:
+    if key not in data:
+        return
+    value = data[key]
+    if not isinstance(value, list):
+        raise ContractError(f"{where}.{key} must be a list of [low, high] bands")
+    for band in value:
+        if not (
+            isinstance(band, list)
+            and len(band) == 2
+            and all(isinstance(v, (int, float)) for v in band)
+        ):
+            raise ContractError(f"{where}.{key} must contain only [low, high] number pairs")

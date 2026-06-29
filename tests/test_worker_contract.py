@@ -24,6 +24,8 @@ def request(run_dir: Path) -> dict:
             "frequencies_hz": [500, 1000, 1500],
             "magnitude": [1.0, 0.2, 1.0],
             "phase_rad": [0.0, 0.0, 0.0],
+            "attenuation_bands_hz": [[900, 1100]],
+            "preserve_bands_hz": [[400, 700], [1300, 1600]],
         },
         "domain": {"grid_shape_xyz": [8, 8, 8], "voxel_size_m": 0.002},
         "materials": {
@@ -66,7 +68,7 @@ class WorkerContractTest(unittest.TestCase):
         self.assertEqual(code, 0)
         events = [json.loads(line) for line in stdout.getvalue().splitlines()]
         self.assertEqual(events[-1]["event"], "finished")
-        for name in ("manifest.json", "candidate.json", "response.csv", "summary.md"):
+        for name in ("manifest.json", "candidate.json", "response.csv", "density.npy", "summary.md"):
             self.assertTrue((run_dir / name).exists(), name)
 
     def test_cancel_sentinel_returns_cancelled(self):
