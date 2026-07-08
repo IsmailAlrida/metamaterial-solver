@@ -14,9 +14,9 @@ Here is the direct mapping.
 
 In the paper:
 
-[
+$$
 \Omega = \Omega_s \cup \Omega_a
-]
+$$
 
 but the mesh covers the **entire** computational box/channel/cell.
 
@@ -49,17 +49,17 @@ This is your fixed Eulerian/fictitious background grid.
 
 In the paper:
 
-[
+$$
 \bar{s}(\mathbf{x})>0 \Rightarrow \Omega_s
-]
+$$
 
-[
+$$
 \bar{s}(\mathbf{x})=0 \Rightarrow \Gamma_{as}
-]
+$$
 
-[
+$$
 \bar{s}(\mathbf{x})<0 \Rightarrow \Omega_a
-]
+$$
 
 In MFEM, this maps to:
 
@@ -112,15 +112,15 @@ FiniteElementSpace fes_p(&mesh, &fec);      // scalar pressure
 
 The displacement space is vector-valued:
 
-[
+$$
 \mathbf{u} = (u_x,u_y,u_z)
-]
+$$
 
 The pressure space is scalar:
 
-[
+$$
 p
-]
+$$
 
 MFEM’s `FiniteElementSpace` manages finite-element degrees of freedom, including element DOFs, local DOFs, true DOFs, and vector DOFs. This is one of the biggest pieces of plumbing you avoid writing yourself. ([MFEM Code Documentation][3])
 
@@ -139,25 +139,25 @@ MFEM lists `ParMesh`, `ParFiniteElementSpace`, `ParGridFunction`, `ParBilinearFo
 
 In the paper, the solid properties are scaled:
 
-[
+$$
 E_s(\mathbf{x})=\alpha(\mathbf{x})\tilde{E}_s
-]
+$$
 
-[
+$$
 \rho_s(\mathbf{x})=\alpha(\mathbf{x})\tilde{\rho}_s
-]
+$$
 
 with (\alpha=1) in the structural domain and (\alpha=10^{-8}) in the acoustic/void region.
 
 For acoustics:
 
-[
+$$
 K_a(\mathbf{x})=\frac{\tilde{K}_a}{\alpha(\mathbf{x})}
-]
+$$
 
-[
+$$
 \rho_a(\mathbf{x})=\frac{\tilde{\rho}_a}{\alpha(\mathbf{x})}
-]
+$$
 
 with (\alpha=1) in the acoustic domain and (\alpha=10^{-8}) in the rigid structural phase. 
 
@@ -204,7 +204,7 @@ This is the clean MFEM analogue of the paper’s fictitious-domain material inte
 
 The paper has structural elasticity:
 
-[
+$$
 \rho_s(\mathbf{x})\ddot{\mathbf{u}}
 -----------------------------------
 
@@ -215,7 +215,7 @@ The paper has structural elasticity:
 
 \nabla\cdot\left(\beta_d\dot{\sigma}\right)
 =0
-]
+$$
 
 In MFEM, the ordinary non-cut parts map to:
 
@@ -237,32 +237,32 @@ mfem::BilinearFormIntegrator
 
 Conceptually:
 
-[
+$$
 \mathbf{M}_{uu}
 ===============
 
 \int_{\Omega}
 \rho_s(\mathbf{x}) N_i N_j,d\Omega
-]
+$$
 
-[
+$$
 \mathbf{K}_{uu}
 ===============
 
 \int_{\Omega}
 B_i^T C(E_s(\mathbf{x}),\nu) B_j,d\Omega
-]
+$$
 
 Rayleigh damping:
 
-[
+$$
 \mathbf{C}_{uu}
 ===============
 
 \alpha_d \mathbf{M}*{uu}
 +
 \beta_d \mathbf{K}*{uu}
-]
+$$
 
 You can assemble these as separate matrices and combine them.
 
@@ -272,32 +272,32 @@ You can assemble these as separate matrices and combine them.
 
 The paper’s acoustic equation is:
 
-[
+$$
 \frac{1}{K_a(\mathbf{x})}\ddot{p}
 ---------------------------------
 
 \frac{1}{\rho_a(\mathbf{x})}\nabla^2 p
 =0
-]
+$$
 
 In weak form, you need acoustic mass and stiffness:
 
-[
+$$
 \mathbf{M}_{pp}
 ===============
 
 \int_{\Omega}
 \frac{1}{K_a(\mathbf{x})} N_i N_j,d\Omega
-]
+$$
 
-[
+$$
 \mathbf{K}_{pp}
 ===============
 
 \int_{\Omega}
 \frac{1}{\rho_a(\mathbf{x})}
 \nabla N_i\cdot\nabla N_j,d\Omega
-]
+$$
 
 In MFEM:
 
@@ -325,17 +325,17 @@ That maps very closely to what the paper does inside cut elements.
 
 In the paper, a cut cell is split into regions:
 
-[
+$$
 \Omega_e^s = \Omega_e\cap\Omega_s
-]
+$$
 
-[
+$$
 \Omega_e^a = \Omega_e\cap\Omega_a
-]
+$$
 
-[
+$$
 \Gamma_e^{as} = \Omega_e\cap\Gamma_{as}
-]
+$$
 
 In MFEM, the analogue is:
 
@@ -387,21 +387,21 @@ You still write the physics and decide which cut integration rule to use.
 
 The paper’s coupling terms are applied on the acoustic-structure interface:
 
-[
+$$
 \mathbf{n}_s\cdot\sigma = p\mathbf{n}*a
 \quad\text{on } \Gamma*{as}
-]
+$$
 
 and
 
-[
+$$
 \mathbf{n}_a\cdot\nabla p
 =========================
 
 \rho_a
 \frac{\partial^2(\mathbf{n}*s\cdot\mathbf{u})}{\partial t^2}
 \quad\text{on } \Gamma*{as}.
-]
+$$
 
 In MFEM, this is not a standard boundary attribute because the interface is **inside elements**, not on mesh faces.
 
@@ -418,9 +418,9 @@ mfem::Array<int> dofs
 
 The coupling matrices are block terms:
 
-[
+$$
 \mathbf{K}*{up},\quad \mathbf{K}*{pu}
-]
+$$
 
 or possibly mass-like coupling terms depending on how you discretize the acoustic interface equation.
 
@@ -454,7 +454,7 @@ MFEM gives you the element transformations, basis functions, local DOF lists, an
 
 The paper’s unknown is:
 
-[
+$$
 \mathbf{v}
 ==========
 
@@ -462,7 +462,7 @@ The paper’s unknown is:
 \mathbf{u}\
 \mathbf{p}
 \end{bmatrix}.
-]
+$$
 
 In MFEM, this maps naturally to:
 
@@ -507,7 +507,7 @@ For parallel/Hypre, you will likely move toward `BlockOperator` composed of `Hyp
 
 The paper uses Newmark and builds:
 
-[
+$$
 \hat{\mathbf{K}}
 ================
 
@@ -516,16 +516,16 @@ The paper uses Newmark and builds:
 a_6\mathbf{M}
 +
 a_3\mathbf{C}
-]
+$$
 
 then solves:
 
-[
+$$
 \hat{\mathbf{K}}\mathbf{v}^n
 ============================
 
 \hat{\mathbf{h}}^n.
-]
+$$
 
 MFEM gives you the assembled matrices and solvers. You probably write the Newmark loop yourself:
 
@@ -550,9 +550,9 @@ MFEM does have time-dependent examples, including wave and nonlinear elasticity 
 
 For the paper-style implicit solve, the heavy object is:
 
-[
+$$
 \hat{\mathbf{K}}\mathbf{v}^n=\hat{\mathbf{h}}^n.
-]
+$$
 
 In MFEM, the solver ecosystem maps to:
 
@@ -606,15 +606,15 @@ MFEM supports topologically periodic meshes according to its project description
 
 For Bloch-Floquet, you will probably need either:
 
-[
+$$
 q^+ = e^{i\mathbf{k}\cdot\mathbf{L}}q^-
-]
+$$
 
 with complex matrices, or a real-valued doubled system:
 
-[
+$$
 q = q_r + iq_i.
-]
+$$
 
 MFEM has Example 22 for complex-valued linear systems for damped harmonic oscillators, which is relevant for later frequency-domain/Bloch work. ([mfem.org][4])
 
@@ -624,15 +624,15 @@ MFEM has Example 22 for complex-valued linear systems for damped harmonic oscill
 
 The paper defines transmitted pressure by integrating pressure over the outlet:
 
-[
+$$
 \hat{p}(t)=\int_{\Gamma_{\text{out}}} p(t),d\Gamma
-]
+$$
 
 then applies FFT:
 
-[
+$$
 \hat{p}(f)=FFT(\hat{p}(t)).
-]
+$$
 
 In MFEM, you can compute this using:
 
@@ -742,19 +742,19 @@ NLopt documents `NLOPT_LD_MMA` as a globally-convergent method-of-moving-asympto
 
 That maps well to the paper’s bound/min-max formulation:
 
-[
+$$
 \min_{\mathbf{s},z} z
-]
+$$
 
 subject to:
 
-[
+$$
 \Phi_1(\mathbf{s}) < z
-]
+$$
 
-[
+$$
 \Phi_2(\mathbf{s}) < z.
-]
+$$
 
 You can implement constraints as:
 
@@ -816,7 +816,7 @@ Here is the clean map.
 
 The crucial point: MFEM already accepts the same mental model as the paper:
 
-[
+$$
 \text{one background mesh}
 +
 \text{fields defined on the mesh}
@@ -826,7 +826,7 @@ The crucial point: MFEM already accepts the same mental model as the paper:
 \text{custom integration rules}
 +
 \text{global sparse operators}
-]
+$$
 
 That is exactly the infrastructure you need for an immersed/cut method.
 
@@ -834,17 +834,17 @@ The paper’s method is not “make a body-fitted mesh every iteration.” It is
 
 The single most important MFEM feature for your research kernel is therefore:
 
-[
+$$
 \boxed{\text{Example 38: cut-surface and cut-volume integration from a level set}}
-]
+$$
 
 because it directly maps to:
 
-[
+$$
 \Omega_e\cap\Omega_s,\quad
 \Omega_e\cap\Omega_a,\quad
 \Gamma_{as}\cap\Omega_e.
-]
+$$
 
 ---
 
@@ -870,7 +870,7 @@ I would start with a minimal MFEM “research kernel skeleton”:
 
 Do not begin with the full adjoint. First get:
 
-[
+$$
 \text{geometry evolves}
 \rightarrow
 \text{solver runs}
@@ -878,7 +878,7 @@ Do not begin with the full adjoint. First get:
 \text{3D view updates}
 \rightarrow
 \text{FFT metric changes}.
-]
+$$
 
 Then add gradients.
 
