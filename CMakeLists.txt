@@ -69,6 +69,7 @@ FetchContent_MakeAvailable(implot)
 
 # 6. Fetch MFEM (Finite Element Method Library)
 # We turn off heavy external engines (like MPI) to keep your C++ integration light and fast.
+# TODO: Switch MFEM_USE_MPI to ON when the serial FEM path works and distributed meshes are worth the build/debug cost.
 set(MFEM_USE_MPI OFF CACHE BOOL "" FORCE)
 set(MFEM_USE_METIS OFF CACHE BOOL "" FORCE)
 set(MFEM_USE_OPENMP OFF CACHE BOOL "" FORCE) # Turn ON if you want quick multi-threaded CPU assembly
