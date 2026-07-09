@@ -11,6 +11,8 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
+option(METAMATERIAL_DEPS_ONLY "Configure dependencies without creating the app target" OFF)
+
 # ---------------------------------------------------------
 # AUTOMATED DEPENDENCY MANAGEMENT (Eigen, GLFW, & MFEM)
 # ---------------------------------------------------------
@@ -46,20 +48,11 @@ FetchContent_Declare(
   glfw
   GIT_REPOSITORY https://github.com/glfw/glfw.git
   GIT_TAG        3.4
+  OVERRIDE_FIND_PACKAGE
 )
 FetchContent_MakeAvailable(glfw)
 
-# 3. Fetch raylib
-set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(
-  raylib
-  URL https://github.com/raysan5/raylib/archive/refs/tags/6.0.tar.gz
-  DOWNLOAD_EXTRACT_TIMESTAMP OFF
-)
-FetchContent_MakeAvailable(raylib)
-
-# 4. Fetch Assimp
+# 3. Fetch Assimp
 set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(ASSIMP_INSTALL OFF CACHE BOOL "" FORCE)
 set(ASSIMP_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
@@ -70,7 +63,7 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(assimp)
 
-# 5. Fetch ImPlot
+# 4. Fetch ImPlot
 FetchContent_Declare(
   implot
   GIT_REPOSITORY https://github.com/epezent/implot.git
@@ -78,7 +71,7 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(implot)
 
-# 6. Fetch MFEM (Finite Element Method Library)
+# 5. Fetch MFEM (Finite Element Method Library)
 if(METAMATERIAL_MFEM_BACKEND MATCHES "mpi")
   set(MFEM_USE_MPI ON CACHE BOOL "" FORCE)
 else()
@@ -103,6 +96,11 @@ FetchContent_Declare(
   GIT_TAG        v4.6 # Stable, production-ready release tag
 )
 FetchContent_MakeAvailable(mfem)
+
+if(METAMATERIAL_DEPS_ONLY)
+  message(STATUS "Configured dependencies only; skipping metamaterial_app target.")
+  return()
+endif()
 
 # ---------------------------------------------------------
 # IMGUI & OPENGL WORKSPACE
@@ -142,7 +140,6 @@ target_include_directories(metamaterial_app PRIVATE
 target_link_libraries(metamaterial_app PRIVATE 
     glfw 
     OpenGL::GL
-    raylib
     assimp
     Eigen3::Eigen
     mfem         # Enforces direct linkage to the compiled MFEM static library
