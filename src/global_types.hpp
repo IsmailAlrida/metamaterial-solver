@@ -17,7 +17,8 @@ enum PhysicsProblems {
 
     vibroacoustic,
     electromagnetic
-}
+};
+
 struct Solid {
 
 };
@@ -47,3 +48,9 @@ struct SolverResult {
 struct SolverInput {
     
 };
+
+
+struct LevelSet {
+    int dim; 
+    
+}
