@@ -12,7 +12,7 @@ if not "%BACKEND%"=="serial" if not "%BACKEND%"=="serial-cuda" if not "%BACKEND%
 set "ROOT=%~dp0.."
 pushd "%ROOT%" >nul
 
-set "MFEM_DIR=%CD%\build-%BACKEND%\_deps\mfem-build"
+set "MFEM_DIR=%CD%\build\%BACKEND%\deps\mfem-build"
 if not exist "%MFEM_DIR%\MFEMConfig.cmake" (
     echo Missing "%MFEM_DIR%\MFEMConfig.cmake"
     echo Run build.bat %BACKEND% first.
@@ -51,7 +51,7 @@ if not exist extern\glvis (
 for %%I in ("%VCPKG_EXE%") do set "VCPKG_ROOT=%%~dpI"
 set "TOOLCHAIN=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake"
 
-cmake -S extern\glvis -B "build-glvis-%BACKEND%" -G "Visual Studio 17 2022" -A x64 ^
+cmake -S extern\glvis -B "build\glvis-%BACKEND%" -G "Visual Studio 17 2022" -A x64 ^
     -DCMAKE_TOOLCHAIN_FILE="%TOOLCHAIN%" ^
     -DCMAKE_INSTALL_PREFIX="%CD%\tools\glvis-%BACKEND%" ^
     -DMFEM_DIR="%MFEM_DIR%" ^
@@ -63,7 +63,7 @@ if errorlevel 1 (
     exit /b %errorlevel%
 )
 
-cmake --build "build-glvis-%BACKEND%" --config Release --target INSTALL
+cmake --build "build\glvis-%BACKEND%" --config Release --target INSTALL
 set "RESULT=%errorlevel%"
 
 popd >nul

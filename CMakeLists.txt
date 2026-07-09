@@ -1,23 +1,4 @@
 cmake_minimum_required(VERSION 3.22)
-project(metamaterial_solver LANGUAGES C CXX CUDA)
-
-if(NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE Debug CACHE STRING "" FORCE)
-endif()
-
-# Set standard for both C++ and CUDA compiler components
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-
-option(METAMATERIAL_DEPS_ONLY "Configure dependencies without creating the app target" OFF)
-
-# ---------------------------------------------------------
-# AUTOMATED DEPENDENCY MANAGEMENT (Eigen, GLFW, & MFEM)
-# ---------------------------------------------------------
-include(FetchContent)
-set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 
 set(_default_mfem_backend "serial")
 if(DEFINED ENV{METAMATERIAL_MFEM_BACKEND} AND NOT "$ENV{METAMATERIAL_MFEM_BACKEND}" STREQUAL "")
@@ -30,12 +11,42 @@ if(NOT METAMATERIAL_MFEM_BACKEND IN_LIST _valid_mfem_backends)
   message(FATAL_ERROR "METAMATERIAL_MFEM_BACKEND must be one of: serial, serial-cuda, parallel-cpu, parallel-cpu-cuda")
 endif()
 
+project(metamaterial_solver LANGUAGES C CXX)
+
+if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
+  enable_language(CUDA)
+endif()
+
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Debug CACHE STRING "" FORCE)
+endif()
+
+# Set standard for compiler components
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(CMAKE_CUDA_COMPILER)
+  set(CMAKE_CUDA_STANDARD 17)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+endif()
+
+option(METAMATERIAL_DEPS_ONLY "Configure dependencies without creating the app target" OFF)
+
+# ---------------------------------------------------------
+# AUTOMATED DEPENDENCY MANAGEMENT (Eigen, GLFW, & MFEM)
+# ---------------------------------------------------------
+include(FetchContent)
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL "Keep fetched dependency sources hackable after first checkout" FORCE)
+set(METAMATERIAL_DEPS_SOURCE_DIR "${CMAKE_SOURCE_DIR}/build/deps/src" CACHE PATH "Shared FetchContent dependency source directory")
+
 # 1. Fetch Eigen (Header-only library)
 # Note: Ensure the gitlab URL points to the correct official repository path
 FetchContent_Declare(
   Eigen3
   GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
   GIT_TAG        5.0.1
+  SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/eigen3-src"
+  BINARY_DIR     "${CMAKE_BINARY_DIR}/deps/eigen3-build"
 )
 FetchContent_MakeAvailable(Eigen3)
 
@@ -48,6 +59,8 @@ FetchContent_Declare(
   glfw
   GIT_REPOSITORY https://github.com/glfw/glfw.git
   GIT_TAG        3.4
+  SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/glfw-src"
+  BINARY_DIR     "${CMAKE_BINARY_DIR}/deps/glfw-build"
   OVERRIDE_FIND_PACKAGE
 )
 FetchContent_MakeAvailable(glfw)
@@ -60,6 +73,8 @@ FetchContent_Declare(
   assimp
   GIT_REPOSITORY https://github.com/assimp/assimp.git
   GIT_TAG        v6.0.5
+  SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/assimp-src"
+  BINARY_DIR     "${CMAKE_BINARY_DIR}/deps/assimp-build"
 )
 FetchContent_MakeAvailable(assimp)
 
@@ -68,6 +83,8 @@ FetchContent_Declare(
   imgui
   GIT_REPOSITORY https://github.com/ocornut/imgui.git
   GIT_TAG        v1.92.8-docking
+  SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/imgui-src"
+  BINARY_DIR     "${CMAKE_BINARY_DIR}/deps/imgui-build"
 )
 FetchContent_MakeAvailable(imgui)
 
@@ -76,6 +93,8 @@ FetchContent_Declare(
   implot
   GIT_REPOSITORY https://github.com/epezent/implot.git
   GIT_TAG        v1.0
+  SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/implot-src"
+  BINARY_DIR     "${CMAKE_BINARY_DIR}/deps/implot-build"
 )
 FetchContent_MakeAvailable(implot)
 
@@ -104,6 +123,8 @@ FetchContent_Declare(
   mfem
   GIT_REPOSITORY https://github.com/mfem/mfem.git
   GIT_TAG        v4.9 # Stable, production-ready release tag
+  SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/mfem-src"
+  BINARY_DIR     "${CMAKE_BINARY_DIR}/deps/mfem-build"
 )
 FetchContent_MakeAvailable(mfem)
 
@@ -119,10 +140,16 @@ set(IMGUI_DIR "${imgui_SOURCE_DIR}")
 
 # Find native system OpenGL
 find_package(OpenGL REQUIRED)
-find_package(CUDAToolkit REQUIRED)
+if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
+  find_package(CUDAToolkit REQUIRED)
+endif()
 
 # Gather all user source files from your directory
-file(GLOB sources "src/*.cpp" "src/*.cu")
+file(GLOB sources "src/*.cpp")
+if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
+  file(GLOB cuda_sources "src/*.cu")
+  list(APPEND sources ${cuda_sources})
+endif()
 
 add_executable(metamaterial_app 
     ${sources} 
@@ -153,8 +180,13 @@ target_link_libraries(metamaterial_app PRIVATE
     assimp
     Eigen3::Eigen
     mfem         # Enforces direct linkage to the compiled MFEM static library
-    CUDA::cudart
-    CUDA::cublas
-    CUDA::cusparse
-    CUDA::cusolver
 )
+
+if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
+  target_link_libraries(metamaterial_app PRIVATE
+      CUDA::cudart
+      CUDA::cublas
+      CUDA::cusparse
+      CUDA::cusolver
+  )
+endif()

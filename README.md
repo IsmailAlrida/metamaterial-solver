@@ -59,7 +59,7 @@ build.bat
 That defaults to the serial MFEM backend and writes build files to:
 
 ```text
-build-serial
+build/serial
 ```
 
 Select a different MFEM backend by passing one argument:
@@ -74,17 +74,32 @@ build.bat parallel-cpu-cuda
 Each backend gets its own build directory:
 
 ```text
-build-serial
-build-serial-cuda
-build-parallel-cpu
-build-parallel-cpu-cuda
+build/serial
+build/serial-cuda
+build/parallel-cpu
+build/parallel-cpu-cuda
+```
+
+Dependency source checkouts are shared and hackable under:
+
+```text
+build/deps/src
+```
+
+Configure dependencies only:
+
+```bat
+build.bat deps serial
+build.bat deps serial-cuda
+build.bat deps parallel-cpu
+build.bat deps parallel-cpu-cuda
 ```
 
 You can also configure CMake directly:
 
 ```bat
-cmake -S . -B build-parallel-cpu-cuda -G "Visual Studio 17 2022" -A x64 -DMETAMATERIAL_MFEM_BACKEND=parallel-cpu-cuda
-cmake --build build-parallel-cpu-cuda --config Debug
+cmake -S . -B build/parallel-cpu-cuda -G "Visual Studio 17 2022" -A x64 -DMETAMATERIAL_MFEM_BACKEND=parallel-cpu-cuda -DMETAMATERIAL_DEPS_ONLY=OFF
+cmake --build build/parallel-cpu-cuda --config Debug
 ```
 
 Valid `METAMATERIAL_MFEM_BACKEND` values are:
