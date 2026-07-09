@@ -4,8 +4,8 @@ setlocal
 set "BACKEND=%~1"
 if "%BACKEND%"=="" set "BACKEND=serial"
 
-if not "%BACKEND%"=="serial" if not "%BACKEND%"=="mpi" if not "%BACKEND%"=="cuda" if not "%BACKEND%"=="mpi-cuda" (
-    echo Usage: scripts\install_glvis.bat [serial^|mpi^|cuda^|mpi-cuda]
+if not "%BACKEND%"=="serial" if not "%BACKEND%"=="serial-cuda" if not "%BACKEND%"=="parallel-cpu" if not "%BACKEND%"=="parallel-cpu-cuda" (
+    echo Usage: scripts\install_glvis.bat [serial^|serial-cuda^|parallel-cpu^|parallel-cpu-cuda]
     exit /b 1
 )
 

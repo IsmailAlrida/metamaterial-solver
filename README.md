@@ -66,34 +66,43 @@ Select a different MFEM backend by passing one argument:
 
 ```bat
 build.bat serial
-build.bat mpi
-build.bat cuda
-build.bat mpi-cuda
+build.bat serial-cuda
+build.bat parallel-cpu
+build.bat parallel-cpu-cuda
 ```
 
 Each backend gets its own build directory:
 
 ```text
 build-serial
-build-mpi
-build-cuda
-build-mpi-cuda
+build-serial-cuda
+build-parallel-cpu
+build-parallel-cpu-cuda
 ```
 
 You can also configure CMake directly:
 
 ```bat
-cmake -S . -B build-cuda -G "Visual Studio 17 2022" -A x64 -DMETAMATERIAL_MFEM_BACKEND=cuda
-cmake --build build-cuda --config Debug
+cmake -S . -B build-parallel-cpu-cuda -G "Visual Studio 17 2022" -A x64 -DMETAMATERIAL_MFEM_BACKEND=parallel-cpu-cuda
+cmake --build build-parallel-cpu-cuda --config Debug
 ```
 
 Valid `METAMATERIAL_MFEM_BACKEND` values are:
 
 ```text
 serial
-mpi
-cuda
-mpi-cuda
+serial-cuda
+parallel-cpu
+parallel-cpu-cuda
+```
+
+Backend meaning:
+
+```text
+serial              CPU, one host thread
+serial-cuda         CPU host flow plus CUDA device backend
+parallel-cpu        OpenMP CPU backend
+parallel-cpu-cuda   OpenMP CPU backend plus CUDA device backend
 ```
 
 For GLVis, build the matching MFEM backend first, then run:
@@ -102,4 +111,4 @@ For GLVis, build the matching MFEM backend first, then run:
 scripts\install_glvis.bat serial
 ```
 
-or replace `serial` with `mpi`, `cuda`, or `mpi-cuda`. Native Windows GLVis builds need `vcpkg`; set `VCPKG_ROOT` if `vcpkg.exe` is not on `PATH`.
+or replace `serial` with another backend. Native Windows GLVis builds need `vcpkg`; set `VCPKG_ROOT` if `vcpkg.exe` is not on `PATH`.
