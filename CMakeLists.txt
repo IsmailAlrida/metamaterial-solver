@@ -35,7 +35,7 @@ endif()
 FetchContent_Declare(
   Eigen3
   GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
-  GIT_TAG        3.4.0
+  GIT_TAG        5.0.1
 )
 FetchContent_MakeAvailable(Eigen3)
 
@@ -63,7 +63,15 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(assimp)
 
-# 4. Fetch ImPlot
+# 4. Fetch Dear ImGui docking
+FetchContent_Declare(
+  imgui
+  GIT_REPOSITORY https://github.com/ocornut/imgui.git
+  GIT_TAG        v1.92.8-docking
+)
+FetchContent_MakeAvailable(imgui)
+
+# 5. Fetch ImPlot
 FetchContent_Declare(
   implot
   GIT_REPOSITORY https://github.com/epezent/implot.git
@@ -71,7 +79,7 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(implot)
 
-# 5. Fetch MFEM (Finite Element Method Library)
+# 6. Fetch MFEM (Finite Element Method Library)
 if(METAMATERIAL_MFEM_BACKEND MATCHES "mpi")
   set(MFEM_USE_MPI ON CACHE BOOL "" FORCE)
 else()
@@ -93,7 +101,7 @@ message(STATUS "MFEM backend: ${METAMATERIAL_MFEM_BACKEND}")
 FetchContent_Declare(
   mfem
   GIT_REPOSITORY https://github.com/mfem/mfem.git
-  GIT_TAG        v4.6 # Stable, production-ready release tag
+  GIT_TAG        v4.9 # Stable, production-ready release tag
 )
 FetchContent_MakeAvailable(mfem)
 
@@ -105,7 +113,7 @@ endif()
 # ---------------------------------------------------------
 # IMGUI & OPENGL WORKSPACE
 # ---------------------------------------------------------
-set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/imgui")
+set(IMGUI_DIR "${imgui_SOURCE_DIR}")
 
 # Find native system OpenGL
 find_package(OpenGL REQUIRED)
