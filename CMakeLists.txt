@@ -17,6 +17,17 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 include(FetchContent)
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 
+set(_default_mfem_backend "serial")
+if(DEFINED ENV{METAMATERIAL_MFEM_BACKEND} AND NOT "$ENV{METAMATERIAL_MFEM_BACKEND}" STREQUAL "")
+  set(_default_mfem_backend "$ENV{METAMATERIAL_MFEM_BACKEND}")
+endif()
+set(METAMATERIAL_MFEM_BACKEND "${_default_mfem_backend}" CACHE STRING "MFEM backend: serial, mpi, cuda, or mpi-cuda")
+set_property(CACHE METAMATERIAL_MFEM_BACKEND PROPERTY STRINGS serial mpi cuda mpi-cuda)
+set(_valid_mfem_backends serial mpi cuda mpi-cuda)
+if(NOT METAMATERIAL_MFEM_BACKEND IN_LIST _valid_mfem_backends)
+  message(FATAL_ERROR "METAMATERIAL_MFEM_BACKEND must be one of: serial, mpi, cuda, mpi-cuda")
+endif()
+
 # 1. Fetch Eigen (Header-only library)
 # Note: Ensure the gitlab URL points to the correct official repository path
 FetchContent_Declare(
@@ -68,14 +79,23 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(implot)
 
 # 6. Fetch MFEM (Finite Element Method Library)
-# We turn off heavy external engines (like MPI) to keep your C++ integration light and fast.
-# TODO: Switch MFEM_USE_MPI to ON when the serial FEM path works and distributed meshes are worth the build/debug cost.
-set(MFEM_USE_MPI OFF CACHE BOOL "" FORCE)
+if(METAMATERIAL_MFEM_BACKEND MATCHES "mpi")
+  set(MFEM_USE_MPI ON CACHE BOOL "" FORCE)
+else()
+  set(MFEM_USE_MPI OFF CACHE BOOL "" FORCE)
+endif()
+if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
+  set(MFEM_USE_CUDA ON CACHE BOOL "" FORCE)
+  set(CUDA_ARCH "native" CACHE STRING "" FORCE)
+else()
+  set(MFEM_USE_CUDA OFF CACHE BOOL "" FORCE)
+endif()
 set(MFEM_USE_METIS OFF CACHE BOOL "" FORCE)
 set(MFEM_USE_OPENMP OFF CACHE BOOL "" FORCE) # Turn ON if you want quick multi-threaded CPU assembly
 set(MFEM_ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(MFEM_ENABLE_MINIAPPS OFF CACHE BOOL "" FORCE)
 set(MFEM_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+message(STATUS "MFEM backend: ${METAMATERIAL_MFEM_BACKEND}")
 
 FetchContent_Declare(
   mfem

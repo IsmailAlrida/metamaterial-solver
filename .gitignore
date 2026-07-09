@@ -214,3 +214,7 @@ compile_commands.json
 CTestTestfile.cmake
 _deps/
 out/
+extern/
+build-*/
+build-glvis-*/
+tools/glvis-*/

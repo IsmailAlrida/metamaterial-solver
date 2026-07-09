@@ -47,3 +47,59 @@ Constraints: Periodic unit cell, solid geometry must be continous starting from 
 ## Notes
 
 Main author has an RTX 5060 GPU and thought it's a shame not to use it. CUDA is certainly an option here so we make use of the hardware as much as possible
+
+## Building
+
+Use the Visual Studio 2022 x64 toolchain from the repository root:
+
+```bat
+build.bat
+```
+
+That defaults to the serial MFEM backend and writes build files to:
+
+```text
+build-serial
+```
+
+Select a different MFEM backend by passing one argument:
+
+```bat
+build.bat serial
+build.bat mpi
+build.bat cuda
+build.bat mpi-cuda
+```
+
+Each backend gets its own build directory:
+
+```text
+build-serial
+build-mpi
+build-cuda
+build-mpi-cuda
+```
+
+You can also configure CMake directly:
+
+```bat
+cmake -S . -B build-cuda -G "Visual Studio 17 2022" -A x64 -DMETAMATERIAL_MFEM_BACKEND=cuda
+cmake --build build-cuda --config Debug
+```
+
+Valid `METAMATERIAL_MFEM_BACKEND` values are:
+
+```text
+serial
+mpi
+cuda
+mpi-cuda
+```
+
+For GLVis, build the matching MFEM backend first, then run:
+
+```bat
+scripts\install_glvis.bat serial
+```
+
+or replace `serial` with `mpi`, `cuda`, or `mpi-cuda`. Native Windows GLVis builds need `vcpkg`; set `VCPKG_ROOT` if `vcpkg.exe` is not on `PATH`.
