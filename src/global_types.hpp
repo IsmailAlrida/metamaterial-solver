@@ -14,8 +14,6 @@ struct SimulationInfo {
     std::string title;
     std::string body;
 };
-// TODO: Check if we need or if setup can be straightforward
-
 
 // Maybe add an ID for bandgap?
 struct Bandgap { 
