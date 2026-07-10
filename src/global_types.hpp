@@ -1,35 +1,33 @@
 #pragma once
 #include <string>
 #include <vector>
+#include "mfem.hpp"
+#include "settings.hpp"
+
 
 struct Result {
     int code;
     std::string msg;
 };
 
-enum solverDevices { 
-    serial,
-    parallel,
-    cuda
+struct SimulationInfo {
+    std::string title;
+    std::string body;
 };
+// TODO: Check if we need or if setup can be straightforward
 
-enum PhysicsProblems {
 
-    vibroacoustic,
-    electromagnetic
-};
-
-struct Solid {
-
-};
-
-struct Air {
-
+// Maybe add an ID for bandgap?
+struct Bandgap { 
+    float center;
+    float bandwidth;
+    float attenuationDb; 
 };
 
 struct SignalFFT {
-    int N;
+    int size;
     std::vector<float> amplitude;
+    std::vector<float> attenuationDB; 
     std::vector<float> phase;
     std::vector<float> frequency;
 };
@@ -52,5 +50,6 @@ struct SolverInput {
 
 struct LevelSet {
     int dim; 
+
     
-}
+};
