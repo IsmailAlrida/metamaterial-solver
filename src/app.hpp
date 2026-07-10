@@ -3,9 +3,7 @@
 #include <string>
 #include <vector>
 #include "global_types.hpp"
-#include "solver.hpp"
 #include "renderer.hpp"
-#include "exporter.hpp"
 
 namespace MetamaterialDesigner
 {
@@ -24,15 +22,11 @@ namespace MetamaterialDesigner
 
         // Exposing these cuz why not we wanna try running headless ops too.
         // TODO: Consider making a headless server mode instead
-        Result runSolver();
-        Result setup();
-        void setupGui();
-        // TODO: For now we're just going to run the web server of glvis alone and mfem::sockstream to it, but later I reaaally do want to fork over the code and put it in one window for the app
-        bool setupGlvis(std::string host, int port = );
-        Result setupSolver(std::string problem, std::string optimizer, std::string solverDevice, int nx = 0, int ny = 0, int nz = 0);
+        // Setup should bind the shouldClose bool to the shouldClose from the renderer btw
+        Result setup(std::string glvisHost, int glvisPort = 19916);
 
     private:
-        Solver solver;
+        // ImGui code has to mix with solver/optimizer/exporter so the immediate mode stuff can directly call stuff
         Renderer renderer;
 
     };
