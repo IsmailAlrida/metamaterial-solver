@@ -21,9 +21,7 @@ int main() {
     std::string glvisHost = "localhost";
     int glvisPort = 19916;
 
-    // Stuff imgui stuff into here
-    app.setupGui();
-    app.setupGlvis(glvisHost, glvisPort);
+    app.setup();
     
     while (!app.shouldClose){
         app.frame();
