@@ -5,9 +5,8 @@ class Exporter {
     
     public:
         Exporter();
-        // TODO: Change the data
-        bool export(LevelSet geometry, std::string target);
+        bool export(const LevelSet& geometry, std::string targetPlatform);
 
     private:
 
-}
+};
