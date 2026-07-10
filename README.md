@@ -86,6 +86,14 @@ Dependency source checkouts are shared and hackable under:
 build/deps/src
 ```
 
+Examples:
+
+```text
+build/deps/src/fftw3-src
+build/deps/src/mfem-src
+build/deps/src/imgui-src
+```
+
 Configure dependencies only:
 
 ```bat

@@ -32,7 +32,7 @@ endif()
 option(METAMATERIAL_DEPS_ONLY "Configure dependencies without creating the app target" OFF)
 
 # ---------------------------------------------------------
-# AUTOMATED DEPENDENCY MANAGEMENT (Eigen, GLFW, & MFEM)
+# AUTOMATED DEPENDENCY MANAGEMENT
 # ---------------------------------------------------------
 include(FetchContent)
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
@@ -98,7 +98,26 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(implot)
 
-# 6. Fetch MFEM (Finite Element Method Library)
+# 6. Fetch FFTW
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+if(METAMATERIAL_MFEM_BACKEND MATCHES "parallel-cpu")
+  set(ENABLE_OPENMP ON CACHE BOOL "" FORCE)
+else()
+  set(ENABLE_OPENMP OFF CACHE BOOL "" FORCE)
+endif()
+set(ENABLE_THREADS OFF CACHE BOOL "" FORCE)
+set(WITH_COMBINED_THREADS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+  fftw
+  GIT_REPOSITORY https://github.com/FFTW/fftw3.git
+  GIT_TAG        fftw-3.3.10
+  SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/fftw3-src"
+  BINARY_DIR     "${CMAKE_BINARY_DIR}/deps/fftw3-build"
+)
+FetchContent_MakeAvailable(fftw)
+
+# 7. Fetch MFEM (Finite Element Method Library)
 set(MFEM_USE_MPI OFF CACHE BOOL "" FORCE)
 set(MFEM_FETCH_TPLS OFF CACHE BOOL "" FORCE)
 set(MFEM_USE_METIS OFF CACHE BOOL "" FORCE)
@@ -170,6 +189,7 @@ target_include_directories(metamaterial_app PRIVATE
     ${IMGUI_DIR}
     ${IMGUI_DIR}/backends
     ${implot_SOURCE_DIR}
+    "${fftw_SOURCE_DIR}/api"
 )
 
 # Link all targets cleanly
@@ -179,8 +199,13 @@ target_link_libraries(metamaterial_app PRIVATE
     OpenGL::GL
     assimp
     Eigen3::Eigen
+    fftw3
     mfem         # Enforces direct linkage to the compiled MFEM static library
 )
+
+if(METAMATERIAL_MFEM_BACKEND MATCHES "parallel-cpu" AND TARGET fftw3_omp)
+  target_link_libraries(metamaterial_app PRIVATE fftw3_omp)
+endif()
 
 if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
   target_link_libraries(metamaterial_app PRIVATE
