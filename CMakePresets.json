@@ -1,0 +1,94 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "cacheVariables": {
+        "METAMATERIAL_DEPS_ONLY": "OFF"
+      }
+    },
+    {
+      "name": "serial",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build/serial",
+      "cacheVariables": {
+        "METAMATERIAL_MFEM_BACKEND": "serial"
+      }
+    },
+    {
+      "name": "serial-cuda",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build/serial-cuda",
+      "cacheVariables": {
+        "METAMATERIAL_MFEM_BACKEND": "serial-cuda"
+      }
+    },
+    {
+      "name": "parallel-cpu",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build/parallel-cpu",
+      "cacheVariables": {
+        "METAMATERIAL_MFEM_BACKEND": "parallel-cpu"
+      }
+    },
+    {
+      "name": "parallel-cpu-cuda",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build/parallel-cpu-cuda",
+      "cacheVariables": {
+        "METAMATERIAL_MFEM_BACKEND": "parallel-cpu-cuda"
+      }
+    },
+    {
+      "name": "deps-serial",
+      "inherits": "serial",
+      "cacheVariables": {
+        "METAMATERIAL_DEPS_ONLY": "ON"
+      }
+    },
+    {
+      "name": "deps-serial-cuda",
+      "inherits": "serial-cuda",
+      "cacheVariables": {
+        "METAMATERIAL_DEPS_ONLY": "ON"
+      }
+    },
+    {
+      "name": "deps-parallel-cpu",
+      "inherits": "parallel-cpu",
+      "cacheVariables": {
+        "METAMATERIAL_DEPS_ONLY": "ON"
+      }
+    },
+    {
+      "name": "deps-parallel-cpu-cuda",
+      "inherits": "parallel-cpu-cuda",
+      "cacheVariables": {
+        "METAMATERIAL_DEPS_ONLY": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "serial",
+      "configurePreset": "serial",
+      "configuration": "Debug"
+    },
+    {
+      "name": "serial-cuda",
+      "configurePreset": "serial-cuda",
+      "configuration": "Debug"
+    },
+    {
+      "name": "parallel-cpu",
+      "configurePreset": "parallel-cpu",
+      "configuration": "Debug"
+    },
+    {
+      "name": "parallel-cpu-cuda",
+      "configurePreset": "parallel-cpu-cuda",
+      "configuration": "Debug"
+    }
+  ]
+}

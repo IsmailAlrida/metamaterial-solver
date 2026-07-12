@@ -41,10 +41,14 @@ if errorlevel 1 (
 
 if not exist extern mkdir extern
 if not exist extern\glvis (
-    git clone https://github.com/GLVis/glvis.git extern\glvis
+    call git.exe clone https://github.com/GLVis/glvis.git extern\glvis
     if errorlevel 1 (
         popd >nul
-        exit /b %errorlevel%
+        exit /b 1
+    )
+    if not exist extern\glvis\.git (
+        popd >nul
+        exit /b 1
     )
 )
 
