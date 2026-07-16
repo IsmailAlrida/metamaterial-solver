@@ -1,933 +1,823 @@
-Yes, that is exactly the right way to ask it.
+# Coupled transient vibroacoustics with MFEM and NLopt
 
-The paper’s immersed-boundary idea is: **solve both physics on the same fixed computational domain** (\Omega), even though the real solid and acoustic regions are separated by a moving level-set interface. The paper does this with a fictitious-domain material model: the structural equation is solved everywhere, but the acoustic region is made into a weak “void” solid; the acoustic equation is also solved everywhere, but the solid region is made into a rigid acoustic phase. Then cut-element integration resolves the real acoustic-structure interface inside the background mesh. 
+This is the implementation reference for translating Dilgen and Aage's
+*Topology optimization of transient vibroacoustic problems for broadband
+filter design using cut elements* into this repository's C++ stack.
 
-So your MFEM question becomes:
+- Primary source: C. B. Dilgen and N. Aage, 2024,
+  [doi:10.1016/j.finel.2024.104123](https://doi.org/10.1016/j.finel.2024.104123).
+- Local copy: [`golden-paper.pdf`](golden-paper.pdf).
+- Companion derivation used by the paper for the detailed cut-element weak
+  forms: C. B. Dilgen and N. Aage, 2021,
+  [doi:10.1002/nme.6591](https://doi.org/10.1002/nme.6591).
 
-> Which MFEM classes help me build this fixed-background, level-set, cut-volume, cut-surface, coupled vibroacoustic solver without writing a full FEM library?
+References such as **(paper Eq. 12, p. 4)** point to the numbered equation and
+printed page in the primary paper. Equations labelled **derived** below follow
+from the paper's strong form but are not printed there verbatim. Sections
+labelled **repository adaptation** describe implementation choices for MFEM,
+FFTW, or NLopt and should not be mistaken for claims made by the authors.
 
-Here is the direct mapping.
+The shortest safe route is:
 
----
+1. reproduce the paper's two-dimensional plane-stress duct;
+2. verify the forward and adjoint models independently;
+3. connect the verified evaluator to MMA;
+4. only then extend the same formulation to three dimensions.
 
-# 1. Background computational domain (\Omega)
+Periodic/Bloch unit-cell analysis is a separate problem. It is not part of the
+paper's duct model and must not be mixed into the first validation target.
 
-In the paper:
+## 1. What the paper actually solves
+
+The method uses one fixed background mesh for both physics. A nodal level-set
+field \(\phi\) identifies the phases:
 
 $$
-\Omega = \Omega_s \cup \Omega_a
+\phi(\mathbf{x}) > 0 \Rightarrow \Omega_s, \qquad
+\phi(\mathbf{x}) = 0 \Rightarrow \Gamma_{as}, \qquad
+\phi(\mathbf{x}) < 0 \Rightarrow \Omega_a.
+\tag{1}
 $$
 
-but the mesh covers the **entire** computational box/channel/cell.
+This is paper Eq. 1, p. 3. The structural displacement \(\mathbf{u}\) and
+acoustic pressure \(p\) are both solved over the whole computational domain
+\(\Omega=\Omega_s\cup\Omega_a\). Cut quadrature resolves the physical
+subdomains and the internal interface without remeshing.
 
-In MFEM, this maps to:
+Use two phase indicators in code; the paper reuses the symbol \(\alpha\) in
+two different physical contexts:
+
+$$
+\alpha_s = \begin{cases}1 & \phi>0\\ \epsilon_f & \phi<0\end{cases},
+\qquad
+\alpha_a = \begin{cases}\epsilon_f & \phi>0\\ 1 & \phi<0\end{cases},
+\qquad \epsilon_f=10^{-8}.
+\tag{2}
+$$
+
+The solid properties are
+
+$$
+E_s(\mathbf{x})=\alpha_s\widetilde E_s,
+\qquad
+\rho_s(\mathbf{x})=\alpha_s\widetilde\rho_s,
+\tag{3}
+$$
+
+from paper Eq. 6, pp. 3-4. The acoustic properties are
+
+$$
+K_a(\mathbf{x})=\frac{\widetilde K_a}{\alpha_a},
+\qquad
+\rho_a(\mathbf{x})=\frac{\widetilde\rho_a}{\alpha_a},
+\qquad \widetilde K_a=\widetilde\rho_a c_a^2,
+\tag{4}
+$$
+
+from paper Eq. 11, p. 4. Thus the fictitious region contributes only
+\(\epsilon_f\) times the physical mass and stiffness for either field.
+
+The authors explicitly warn that scaling stiffness and density by the same
+contrast can introduce fictitious-domain modes (paper p. 4). Keep
+\(\epsilon_f\) configurable and inspect modes and conditioning; \(10^{-8}\) is
+a reproduction value, not a universal safe default.
+
+### 1.1 Structural equation
+
+The paper uses small-strain linear elasticity with Rayleigh damping:
+
+$$
+\rho_s\ddot{\mathbf u}
+-\nabla\!\cdot\boldsymbol\sigma
++\alpha_d\rho_s\dot{\mathbf u}
+-\nabla\!\cdot(\beta_d\dot{\boldsymbol\sigma})=\mathbf0
+\quad\text{in }\Omega,
+\tag{5}
+$$
+
+with clamping, traction-free boundaries, and pressure traction
+
+$$
+\mathbf u=\mathbf0\text{ on }\Gamma_{sd},\qquad
+\boldsymbol\sigma\mathbf n_s=\mathbf0\text{ on }\Gamma_{sn},\qquad
+\boldsymbol\sigma\mathbf n_s=p\mathbf n_a\text{ on }\Gamma_{as}.
+\tag{6}
+$$
+
+These are paper Eqs. 2-5, p. 3. Normals point out of their respective domains,
+so \(\mathbf n_s=-\mathbf n_a\) on the interface.
+
+For the paper-faithful two-dimensional model, use plane-stress Lamé
+coefficients with MFEM's `ElasticityIntegrator`:
+
+$$
+\lambda_{ps}=\frac{E\nu}{1-\nu^2},
+\qquad
+\mu=\frac{E}{2(1+\nu)}.
+\tag{7}
+$$
+
+Equation (7) is a repository adaptation of the paper's stated plane-stress
+constitutive law (paper p. 3). Do not use the plane-strain value
+\(E\nu/[(1+\nu)(1-2\nu)]\) for the 2D reproduction.
+
+### 1.2 Acoustic equation and boundaries
+
+The pressure satisfies
+
+$$
+\frac{1}{K_a}\ddot p-\frac{1}{\rho_a}\nabla^2p=0
+\quad\text{in }\Omega,
+\tag{8}
+$$
+
+with
+
+$$
+\begin{aligned}
+\mathbf n_a\!\cdot\nabla p &=0 &&\text{on }\Gamma_{ad},\\
+\mathbf n_a\!\cdot\nabla p
+&=\rho_a\frac{\partial^2(\mathbf n_s\!\cdot\mathbf u)}{\partial t^2}
+&&\text{on }\Gamma_{as},\\
+\mathbf n_a\!\cdot\nabla p+\frac1{c_a}\dot p
+&=\frac2{c_a}\dot p_{in} &&\text{on }\Gamma_{ar}.
+\end{aligned}
+\tag{9}
+$$
+
+These are paper Eqs. 7-10, p. 4. The first condition is a hard wall, the
+second couples normal structural acceleration into the acoustic field, and the
+third is a first-order plane-wave absorbing/injection condition.
+
+## 2. Weak form and coupled block system
+
+This section is **derived** from paper Eqs. 2-10. It fixes the signs and block
+locations needed by the implementation. Let \(\mathbf w\) and \(q\) be the
+structural and acoustic test functions. Define
+
+$$
+\begin{aligned}
+m_{uu}(\mathbf w,\mathbf u)
+&=\int_\Omega \rho_s\,\mathbf w\!\cdot\mathbf u\,d\Omega,\\
+k_{uu}(\mathbf w,\mathbf u)
+&=\int_\Omega \boldsymbol\varepsilon(\mathbf w):
+  \mathsf C:\boldsymbol\varepsilon(\mathbf u)\,d\Omega,\\
+c_{uu}&=\alpha_d m_{uu}+\beta_d k_{uu},\\
+m_{pp}(q,p)&=\int_\Omega \frac1{K_a}qp\,d\Omega,\\
+k_{pp}(q,p)&=\int_\Omega \frac1{\rho_a}\nabla q\!\cdot\nabla p\,d\Omega,\\
+c_{pp}(q,p)&=\int_{\Gamma_{ar}}\frac1{\rho_a c_a}qp\,d\Gamma,\\
+k_{up}(\mathbf w,p)&=-\int_{\Gamma_{as}}
+  (\mathbf w\!\cdot\mathbf n_a)p\,d\Gamma,\\
+m_{pu}(q,\mathbf u)&=-\int_{\Gamma_{as}}
+  q(\mathbf n_s\!\cdot\mathbf u)\,d\Gamma,\\
+g(q,t)&=\int_{\Gamma_{ar}}\frac2{\rho_a c_a}q\dot p_{in}(t)\,d\Gamma.
+\end{aligned}
+\tag{10}
+$$
+
+The signs follow directly from integration by parts with outward acoustic and
+solid normals. A reversed level-set normal reverses both interface signs; this
+is why a normal-orientation test is mandatory.
+
+With \(\mathbf v=[\mathbf u,\mathbf p]^T\), the semi-discrete system is
+
+$$
+\mathbf M\ddot{\mathbf v}
++\mathbf C\dot{\mathbf v}
++\mathbf K\mathbf v=\mathbf h,
+\qquad
+\mathbf h=\begin{bmatrix}\mathbf0\\\mathbf g\end{bmatrix},
+\tag{11}
+$$
+
+which is paper Eqs. 12-13, pp. 4-5. The useful block layout is
+
+$$
+\mathbf M=
+\begin{bmatrix}M_{uu}&0\\M_{pu}&M_{pp}\end{bmatrix},\qquad
+\mathbf C=
+\begin{bmatrix}C_{uu}&0\\0&C_{pp}\end{bmatrix},\qquad
+\mathbf K=
+\begin{bmatrix}K_{uu}&K_{up}\\0&K_{pp}\end{bmatrix}.
+\tag{12}
+$$
+
+The interface coupling is not two generic stiffness blocks:
+
+- pressure traction is \(K_{up}\mathbf p\);
+- normal structural acceleration is \(M_{pu}\ddot{\mathbf u}\).
+
+Consequently the effective coupled operator is generally nonsymmetric. Do not
+use CG merely because the diagonal elasticity and acoustic blocks are
+symmetric.
+
+## 3. MFEM 4.9 spatial implementation
+
+The repository pins MFEM 4.9 and already enables Algoim in
+[`CMakeLists.txt`](../CMakeLists.txt). Start with the serial classes because
+the current `parallel-cpu` option enables OpenMP, not MPI:
 
 ```cpp
-mfem::Mesh
-mfem::ParMesh
+mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(
+    nx, ny, mfem::Element::QUADRILATERAL, true, lx, ly);
+
+mfem::H1_FECollection q1(1, 2);
+mfem::FiniteElementSpace pressure_fes(&mesh, &q1);
+mfem::FiniteElementSpace displacement_fes(
+    &mesh, &q1, 2, mfem::Ordering::byVDIM);
+mfem::FiniteElementSpace level_set_fes(&mesh, &q1);
+
+mfem::GridFunction phi(&level_set_fes);
+mfem::GridFunctionCoefficient phi_coeff(&phi);
 ```
 
-Use `Mesh` for serial, `ParMesh` for MPI. MFEM supports triangular, quadrilateral, tetrahedral, and hexahedral meshes, including topologically periodic meshes and refinement capabilities. ([GitHub][1])
+The paper uses continuous Galerkin Q4 elements and special cut/interface
+quadrature (paper Section 2.3, p. 4). The code above is the direct MFEM Q1/Q4
+mapping.
 
-For your 3D cell:
+### 3.1 Reuse standard MFEM integrators where possible
 
-```cpp
-Mesh mesh = Mesh::MakeCartesian3D(
-    nx, ny, nz,
-    Element::HEXAHEDRON,
-    sx, sy, sz
-);
-```
+The uncut algebra maps to:
 
-or use Gmsh/imported meshes later.
+| Term | MFEM building block |
+|---|---|
+| \(M_{uu}\) | `BilinearForm` + `VectorMassIntegrator` |
+| \(K_{uu}\) | `BilinearForm` + `ElasticityIntegrator` |
+| \(M_{pp}\) | `BilinearForm` + `MassIntegrator` |
+| \(K_{pp}\) | `BilinearForm` + `DiffusionIntegrator` |
+| \(C_{pp}\) on an exterior boundary | `BoundaryMassIntegrator` |
+| coupled vectors/operators | `BlockVector`, `BlockMatrix`, `BlockOperator` |
 
-This is your fixed Eulerian/fictitious background grid.
+In cut elements, ordinary integrators cannot select a different quadrature
+rule for each element and phase. Reuse their formulas, but put them in a small
+custom `BilinearFormIntegrator` or direct element loop which obtains the
+element's cut rule before evaluating shapes.
 
----
+MFEM already owns element transformations, basis functions, DOF ordering,
+dense element algebra, sparse insertion, and block operators. Eigen is already
+linked by this repository but is unnecessary for global FEM assembly. Using a
+second sparse algebra stack would only add conversions and ownership bugs.
 
-# 2. Level-set field (\bar{s}(\mathbf{x}))
+### 3.2 Cut volume and interface rules
 
-In the paper:
+MFEM's [Example 38](../build/deps/src/mfem-src/examples/ex38.cpp) demonstrates
+`AlgoimIntegrationRules`, cut-volume rules, cut-surface rules, and the required
+surface transformation weights. MFEM's contract is important:
+`GetVolumeIntegrationRule` integrates the region where its level-set
+coefficient is **positive**.
 
-$$
-\bar{s}(\mathbf{x})>0 \Rightarrow \Omega_s
-$$
-
-$$
-\bar{s}(\mathbf{x})=0 \Rightarrow \Gamma_{as}
-$$
-
-$$
-\bar{s}(\mathbf{x})<0 \Rightarrow \Omega_a
-$$
-
-In MFEM, this maps to:
-
-```cpp
-mfem::GridFunction phi;
-mfem::Coefficient;
-mfem::GridFunctionCoefficient;
-mfem::FunctionCoefficient;
-```
-
-`GridFunction` stores a discrete finite-element field, while MFEM’s `Coefficient` classes represent mathematical functions that can be evaluated during assembly. ([DeepWiki][2])
-
-So your level set should be a `GridFunction`:
+Therefore construct the three rules as follows:
 
 ```cpp
-H1_FECollection fec_phi(order, dim);
-FiniteElementSpace fes_phi(&mesh, &fec_phi);
-
-GridFunction phi(&fes_phi);
-```
-
-Then expose it to integrators as:
-
-```cpp
-GridFunctionCoefficient phi_coeff(&phi);
-```
-
-This lets your custom cut-element assembler ask, at quadrature points:
-
-```cpp
-double val = phi_coeff.Eval(T, ip);
-```
-
-where `T` is the element transformation and `ip` is an integration point.
-
----
-
-# 3. Same computational space for (\mathbf{u}) and (p)
-
-In the paper, both structural displacement and acoustic pressure are solved over the whole (\Omega), even though one physics is fictitious in part of the domain.
-
-In MFEM, use two FE spaces on the same mesh:
-
-```cpp
-H1_FECollection fec(order, dim);
-
-FiniteElementSpace fes_u(&mesh, &fec, dim); // vector displacement
-FiniteElementSpace fes_p(&mesh, &fec);      // scalar pressure
-```
-
-The displacement space is vector-valued:
-
-$$
-\mathbf{u} = (u_x,u_y,u_z)
-$$
-
-The pressure space is scalar:
-
-$$
-p
-$$
-
-MFEM’s `FiniteElementSpace` manages finite-element degrees of freedom, including element DOFs, local DOFs, true DOFs, and vector DOFs. This is one of the biggest pieces of plumbing you avoid writing yourself. ([MFEM Code Documentation][3])
-
-For parallel:
-
-```cpp
-ParFiniteElementSpace pfes_u(&pmesh, &fec, dim);
-ParFiniteElementSpace pfes_p(&pmesh, &fec);
-```
-
-MFEM lists `ParMesh`, `ParFiniteElementSpace`, `ParGridFunction`, `ParBilinearForm`, `HypreParMatrix`, and `HypreSolver` as main parallel classes. ([mfem.org][4])
-
----
-
-# 4. Fictitious-domain material properties
-
-In the paper, the solid properties are scaled:
-
-$$
-E_s(\mathbf{x})=\alpha(\mathbf{x})\tilde{E}_s
-$$
-
-$$
-\rho_s(\mathbf{x})=\alpha(\mathbf{x})\tilde{\rho}_s
-$$
-
-with (\alpha=1) in the structural domain and (\alpha=10^{-8}) in the acoustic/void region.
-
-For acoustics:
-
-$$
-K_a(\mathbf{x})=\frac{\tilde{K}_a}{\alpha(\mathbf{x})}
-$$
-
-$$
-\rho_a(\mathbf{x})=\frac{\tilde{\rho}_a}{\alpha(\mathbf{x})}
-$$
-
-with (\alpha=1) in the acoustic domain and (\alpha=10^{-8}) in the rigid structural phase. 
-
-In MFEM, this maps to custom coefficients:
-
-```cpp
-class SolidAlphaCoefficient : public mfem::Coefficient
-{
+class NegatedCoefficient final : public mfem::Coefficient {
 public:
-    GridFunctionCoefficient &phi;
-
-    double Eval(ElementTransformation &T,
-                const IntegrationPoint &ip) override
-    {
-        double s = phi.Eval(T, ip);
-        return (s > 0.0) ? 1.0 : 1e-8;
+    explicit NegatedCoefficient(mfem::Coefficient &source) : source(source) {}
+    mfem::real_t Eval(mfem::ElementTransformation &T,
+                      const mfem::IntegrationPoint &ip) override {
+        return -source.Eval(T, ip);
     }
+private:
+    mfem::Coefficient &source;
 };
+
+mfem::AlgoimIntegrationRules solid_rules(order, phi_coeff, 1);
+NegatedCoefficient minus_phi(phi_coeff); // Eval returns -phi_coeff.Eval(...)
+mfem::AlgoimIntegrationRules acoustic_rules(order, minus_phi, 1);
+
+mfem::IntegrationRule solid_ir;     // phi > 0
+mfem::IntegrationRule acoustic_ir;  // -phi > 0, therefore phi < 0
+mfem::IntegrationRule interface_ir; // phi == 0
+
+solid_rules.GetVolumeIntegrationRule(T, solid_ir);
+acoustic_rules.GetVolumeIntegrationRule(T, acoustic_ir);
+solid_rules.GetSurfaceIntegrationRule(T, interface_ir);
 ```
 
-Then:
+For surface integration, also call `GetSurfaceWeights` as Example 38 does and
+multiply the integration-point weights by those values. Do not assume a
+cut-surface rule behaves like an ordinary element-boundary rule.
+
+For each cut element:
+
+1. integrate physical structural terms on `solid_ir` and multiply the same
+   formulas by \(\epsilon_f\) on `acoustic_ir`;
+2. integrate physical acoustic terms on `acoustic_ir` and multiply them by
+   \(\epsilon_f\) on `solid_ir`;
+3. integrate \(K_{up}\) and \(M_{pu}\) once on `interface_ir`;
+4. obtain \(\nabla\phi\) at each interface point using
+   `GridFunction::GetGradient`, then set
+   \(\mathbf n_a=\nabla\phi/\|\nabla\phi\|\) and
+   \(\mathbf n_s=-\mathbf n_a\), because \(\phi>0\) is solid.
+
+Reject or diagnose interface points where \(\|\nabla\phi\|\) is too small to
+define a stable normal.
+
+The current CMake configuration has `MFEM_USE_ALGOIM=ON` and
+`MFEM_USE_LAPACK=OFF`. Example 38's Algoim path is available; its
+moment-fitting path is not. Do not describe moment fitting as a runtime option
+until LAPACK is enabled and tested.
+
+### 3.3 Interface assembly
+
+The internal interface is not a mesh boundary attribute, so standard boundary
+integrators cannot assemble it. One element loop is sufficient:
 
 ```cpp
-class YoungsCoefficient : public mfem::Coefficient
-{
-    double E0;
-    SolidAlphaCoefficient &alpha;
-public:
-    double Eval(ElementTransformation &T,
-                const IntegrationPoint &ip) override
-    {
-        return alpha.Eval(T, ip) * E0;
-    }
-};
-```
-
-MFEM already has coefficient types such as `PWConstCoefficient` for piecewise constants by element attribute, but for level-set-defined material you likely want a custom `Coefficient` or `MatrixCoefficient`. ([MFEM Code Documentation][5])
-
-This is the clean MFEM analogue of the paper’s fictitious-domain material interpolation.
-
----
-
-# 5. Structural mass, stiffness, and damping
-
-The paper has structural elasticity:
-
-$$
-\rho_s(\mathbf{x})\ddot{\mathbf{u}}
------------------------------------
-
-\nabla\cdot\sigma
-+
-\rho_s(\mathbf{x})\alpha_d\dot{\mathbf{u}}
-------------------------------------------
-
-\nabla\cdot\left(\beta_d\dot{\sigma}\right)
-=0
-$$
-
-In MFEM, the ordinary non-cut parts map to:
-
-```cpp
-mfem::BilinearForm m_u(&fes_u);
-mfem::BilinearForm k_u(&fes_u);
-```
-
-Relevant integrator concepts:
-
-```cpp
-mfem::MassIntegrator
-mfem::ElasticityIntegrator
-mfem::VectorMassIntegrator
-mfem::BilinearFormIntegrator
-```
-
-`BilinearFormIntegrator` is the abstract base class for bilinear-form integrators, so your custom cut/fictitious integrators inherit from that interface. ([MFEM Code Documentation][6])
-
-Conceptually:
-
-$$
-\mathbf{M}_{uu}
-===============
-
-\int_{\Omega}
-\rho_s(\mathbf{x}) N_i N_j,d\Omega
-$$
-
-$$
-\mathbf{K}_{uu}
-===============
-
-\int_{\Omega}
-B_i^T C(E_s(\mathbf{x}),\nu) B_j,d\Omega
-$$
-
-Rayleigh damping:
-
-$$
-\mathbf{C}_{uu}
-===============
-
-\alpha_d \mathbf{M}*{uu}
-+
-\beta_d \mathbf{K}*{uu}
-$$
-
-You can assemble these as separate matrices and combine them.
-
----
-
-# 6. Acoustic mass and stiffness
-
-The paper’s acoustic equation is:
-
-$$
-\frac{1}{K_a(\mathbf{x})}\ddot{p}
----------------------------------
-
-\frac{1}{\rho_a(\mathbf{x})}\nabla^2 p
-=0
-$$
-
-In weak form, you need acoustic mass and stiffness:
-
-$$
-\mathbf{M}_{pp}
-===============
-
-\int_{\Omega}
-\frac{1}{K_a(\mathbf{x})} N_i N_j,d\Omega
-$$
-
-$$
-\mathbf{K}_{pp}
-===============
-
-\int_{\Omega}
-\frac{1}{\rho_a(\mathbf{x})}
-\nabla N_i\cdot\nabla N_j,d\Omega
-$$
-
-In MFEM:
-
-```cpp
-BilinearForm m_p(&fes_p);
-BilinearForm k_p(&fes_p);
-
-m_p.AddDomainIntegrator(new MassIntegrator(inv_K_coeff));
-k_p.AddDomainIntegrator(new DiffusionIntegrator(inv_rho_coeff));
-```
-
-or write custom versions if you want cut-cell quadrature.
-
-MFEM’s standard documentation lists `LinearForm`, `BilinearForm`, `MixedBilinearForm`, `BilinearFormIntegrator`, `LinearFormIntegrator`, `SparseMatrix`, and `Operator` as core FEM and linear algebra abstractions. ([MFEM Code Documentation][7])
-
----
-
-# 7. Cut-volume integration: (\Omega_e\cap\Omega_s), (\Omega_e\cap\Omega_a)
-
-This is the part where MFEM is more relevant than I implied earlier.
-
-MFEM has **Example 38: cut-surface and cut-volume integration**. The MFEM examples page says this example demonstrates construction of cut-surface and cut-volume `IntegrationRules`, with the cut specified by the zero level set of a coefficient (\phi). ([mfem.org][8])
-
-That maps very closely to what the paper does inside cut elements.
-
-In the paper, a cut cell is split into regions:
-
-$$
-\Omega_e^s = \Omega_e\cap\Omega_s
-$$
-
-$$
-\Omega_e^a = \Omega_e\cap\Omega_a
-$$
-
-$$
-\Gamma_e^{as} = \Omega_e\cap\Gamma_{as}
-$$
-
-In MFEM, the analogue is:
-
-```cpp
-IntegrationRule solid_ir;
-IntegrationRule acoustic_ir;
-IntegrationRule interface_ir;
-```
-
-built from a level-set coefficient.
-
-The exact API details depend on the example helpers, but the architectural role is clear:
-
-```cpp
-// pseudo-code
-auto ir_solid   = MakeCutVolumeIntegrationRule(element, phi, positive_side);
-auto ir_acoustic= MakeCutVolumeIntegrationRule(element, phi, negative_side);
-auto ir_iface   = MakeCutSurfaceIntegrationRule(element, phi);
-```
-
-Then your custom integrator loops over those integration points:
-
-```cpp
-for (int q = 0; q < ir_solid.GetNPoints(); q++)
-{
-    const IntegrationPoint &ip = ir_solid.IntPoint(q);
-    T.SetIntPoint(&ip);
-
-    // evaluate shape functions and gradients
-    // add structural contribution
+for (int e = 0; e < mesh.GetNE(); ++e) {
+    mfem::ElementTransformation *T = mesh.GetElementTransformation(e);
+    // Build interface_ir for T. Empty rules contribute nothing.
+    // Evaluate scalar pressure shapes and vector displacement shapes.
+    // Compute n_a from grad(phi), then accumulate local Kup and Mpu.
+    // Insert both local matrices using the two spaces' element VDofs.
 }
 ```
 
-MFEM’s integration documentation explains that `ElementTransformation::SetIntPoint()` sets the quadrature point and that `ElementTransformation` then provides geometric quantities such as Jacobians and physical coordinates, with caching to avoid recomputation. ([mfem.org][9])
-
-This means MFEM can help you avoid writing:
-
-* reference-to-physical mapping,
-* Jacobian calculation,
-* basis evaluation plumbing,
-* quadrature bookkeeping,
-* global sparse insertion.
-
-You still write the physics and decide which cut integration rule to use.
-
----
-
-# 8. Cut-surface/interface integration: (\Gamma_{as})
-
-The paper’s coupling terms are applied on the acoustic-structure interface:
+Keep the two local matrices rectangular:
 
 $$
-\mathbf{n}_s\cdot\sigma = p\mathbf{n}*a
-\quad\text{on } \Gamma*{as}
+K_{up}^{(e)}\in\mathbb R^{n_u\times n_p},\qquad
+M_{pu}^{(e)}\in\mathbb R^{n_p\times n_u}.
 $$
 
-and
+Handle signed MFEM VDof indices with MFEM's DOF transformation/insertion
+utilities; manually taking absolute indices loses orientation information.
 
-$$
-\mathbf{n}_a\cdot\nabla p
-=========================
+### 3.4 Essential boundaries and linear solver
 
-\rho_a
-\frac{\partial^2(\mathbf{n}*s\cdot\mathbf{u})}{\partial t^2}
-\quad\text{on } \Gamma*{as}.
-$$
+Clamp structural true DOFs on \(\Gamma_{sd}\). The acoustic hard-wall
+condition is natural and requires no essential elimination. Apply structural
+elimination consistently to `M`, `C`, `K`, the off-diagonal blocks, and the
+right-hand side before forming the effective operator.
 
-In MFEM, this is not a standard boundary attribute because the interface is **inside elements**, not on mesh faces.
-
-So you likely build a custom mixed/interface assembler using:
+Use true-DOF offsets:
 
 ```cpp
-mfem::MixedBilinearForm
-mfem::BilinearFormIntegrator
-mfem::ElementTransformation
-mfem::IntegrationRule
-mfem::DenseMatrix
-mfem::Array<int> dofs
-```
-
-The coupling matrices are block terms:
-
-$$
-\mathbf{K}*{up},\quad \mathbf{K}*{pu}
-$$
-
-or possibly mass-like coupling terms depending on how you discretize the acoustic interface equation.
-
-A pseudo-interface assembler looks like:
-
-```cpp
-for each cut element e:
-    ir_gamma = cut_surface_rule(e, phi)
-
-    get u element dofs
-    get p element dofs
-
-    DenseMatrix Kup(ndof_u, ndof_p);
-    DenseMatrix Kpu(ndof_p, ndof_u);
-
-    for qp in ir_gamma:
-        evaluate u shape vector basis
-        evaluate p shape scalar basis
-        evaluate normal n_gamma
-        integrate coupling term
-
-    add Kup into global block (u,p)
-    add Kpu into global block (p,u)
-```
-
-MFEM gives you the element transformations, basis functions, local DOF lists, and global matrix insertion machinery. You own the mathematical coupling.
-
----
-
-# 9. Block coupled system
-
-The paper’s unknown is:
-
-$$
-\mathbf{v}
-==========
-
-\begin{bmatrix}
-\mathbf{u}\
-\mathbf{p}
-\end{bmatrix}.
-$$
-
-In MFEM, this maps naturally to:
-
-```cpp
-mfem::BlockVector
-mfem::BlockMatrix
-mfem::BlockOperator
-```
-
-MFEM’s `BlockOperator` is designed to combine operators as matrix blocks using row and column offsets. ([MFEM Code Documentation][10])
-
-For the vibroacoustic system:
-
-```cpp
-Array<int> offsets(3);
+mfem::Array<int> offsets(3);
 offsets[0] = 0;
-offsets[1] = fes_u.GetTrueVSize();
-offsets[2] = offsets[1] + fes_p.GetTrueVSize();
-
-BlockMatrix M(offsets);
-BlockMatrix C(offsets);
-BlockMatrix K(offsets);
+offsets[1] = displacement_fes.GetTrueVSize();
+offsets[2] = offsets[1] + pressure_fes.GetTrueVSize();
 ```
 
-Then:
+For the initial small 2D problem, assemble `SparseMatrix` blocks and use a
+direct solver if one is enabled, otherwise `GMRESSolver` with a simple block
+preconditioner. The paper used PETSc and MUMPS (paper p. 5), neither of which
+is enabled by the current repository. `HypreParMatrix` and MPI are future
+choices, not current building blocks.
+
+The repository's CUDA option does not automatically accelerate Algoim rule
+construction, custom cut loops, or a host-assembled sparse solve. Establish a
+correct CPU baseline before considering device kernels.
+
+## 4. Average-acceleration Newmark integration
+
+The paper uses Newmark with
+
+$$
+\widetilde\beta=\frac14,\qquad
+\widetilde\gamma=\frac12,
+\tag{13}
+$$
+
+which is paper Eq. 20, p. 5. For \(\Delta t\), define
+
+$$
+\begin{aligned}
+a_1&=1-\widetilde\gamma/\widetilde\beta,&
+a_2&=(1-\widetilde\gamma/(2\widetilde\beta))\Delta t,&
+a_3&=\widetilde\gamma/(\widetilde\beta\Delta t),\\
+a_4&=1/(\widetilde\beta\Delta t),&
+a_5&=1/(2\widetilde\beta)-1,&
+a_6&=1/(\widetilde\beta\Delta t^2).
+\end{aligned}
+\tag{14}
+$$
+
+This is paper Eq. 19, p. 5. Each step solves
+
+$$
+\widehat K\mathbf v^n=\widehat h^n,
+\qquad
+\widehat K=K+a_6M+a_3C,
+\tag{15}
+$$
+
+$$
+\widehat h^n=h^n
++M(a_4\dot v^{n-1}+a_5\ddot v^{n-1}+a_6v^{n-1})
++C(-a_1\dot v^{n-1}-a_2\ddot v^{n-1}+a_3v^{n-1}),
+\tag{16}
+$$
+
+from paper Eqs. 16-18, p. 5. Then recover
+
+$$
+\begin{aligned}
+\dot v^n&=a_1\dot v^{n-1}+a_2\ddot v^{n-1}
+          +a_3(v^n-v^{n-1}),\\
+\ddot v^n&=-a_4\dot v^{n-1}-a_5\ddot v^{n-1}
+           +a_6(v^n-v^{n-1}),
+\end{aligned}
+\tag{17}
+$$
+
+which are paper Eqs. 14-15, p. 5. With the paper's zero displacement and
+velocity initial conditions, solve
+
+$$M\ddot v^0=h^0$$
+
+as in paper Eq. 21, p. 5.
+
+MFEM provides `NewmarkSolver(0.25, 0.5)` and Example 23 demonstrates a
+`SecondOrderTimeDependentOperator`. That is useful for an independent forward
+smoke test. The optimization implementation should keep the explicit loop
+above because the fully discrete adjoint needs the exact residual and stored
+\((v^n,\dot v^n,\ddot v^n)\) sequence.
+
+For adjoint assembly, use the three residuals printed in paper Eqs. 23-25,
+p. 5:
+
+$$
+\begin{aligned}
+r_1^n={}&(K+a_6M+a_3C)v^n-(a_6M+a_3C)v^{n-1}\\
+&-(a_4M-a_1C)\dot v^{n-1}
++(a_2C-a_5M)\ddot v^{n-1}-h^n,\\
+r_2^n={}&\dot v^n-a_1\dot v^{n-1}-a_2\ddot v^{n-1}
+-a_3(v^n-v^{n-1}),\\
+r_3^n={}&\ddot v^n+a_4\dot v^{n-1}+a_5\ddot v^{n-1}
+-a_6(v^n-v^{n-1}).
+\end{aligned}
+\tag{18}
+$$
+
+Then \(R^n=[r_1^n,r_2^n,r_3^n]^T=A U^n+B U^{n-1}\), as in paper
+Eqs. 22 and 43, pp. 5 and 8.
+
+## 5. Broadband response with FFTW
+
+After the forward solve, integrate the pressure at the outlet:
+
+$$
+\widehat p(t_n)=\int_{\Gamma_{out}}p(\mathbf x,t_n)\,d\Gamma,
+\tag{19}
+$$
+
+which is paper Eq. 49, p. 9. The outlet is an exterior mesh boundary, so a
+small boundary quadrature loop is enough; this does not need cut integration.
+
+Apply the same Hann window to the design and empty-duct time histories, then
+use FFTW:
+
+$$
+P_m=\operatorname{FFT}\{w_n\widehat p(t_n)\},
+\qquad f_m=\frac{m}{N\Delta t}.
+\tag{20}
+$$
+
+The DFT is paper Eq. 29, p. 6; the paper states that a “Hanning” window and
+FFTW are used on the same page. Create FFTW plans once and reuse them across
+design evaluations.
+
+The paper writes transmission as the ratio to an empty duct (paper Eqs. 50-51,
+p. 9) and discusses it as an amplitude. Use the real nonnegative amplitude
+ratio
+
+$$
+S_m=\frac{|P_m|}{|P_{0,m}|}.
+\tag{21}
+$$
+
+Compute \(P_{0,m}\) once with no structure using the identical mesh, source,
+time step, duration, outlet functional, and window. Exclude bins where
+\(|P_{0,m}|\) is below a documented excitation threshold; dividing by an
+unexcited reference bin is not a meaningful transmission measurement.
+
+The paper's pass- and stop-band functions are
+
+$$
+\Phi_1=\sum_{m\in\mathcal P}\frac{(S_m-a)^2}{a^2},\quad a=1,
+\qquad
+\Phi_2=\sum_{m\in\mathcal S}\frac{(S_m-b)^2}{b^2},
+\tag{22}
+$$
+
+from paper Eqs. 52-53, p. 9. The paper studies \(b\) values rather than using
+literal zero because of the inverse weight (paper Section 5.1, p. 11). Treat
+\(b\) as a user setting and never allow \(b=0\).
+
+The differentiable epigraph formulation is
+
+$$
+\min_{s,z}z
+\quad\text{subject to}\quad
+\Phi_1(s)-z\le0,\quad\Phi_2(s)-z\le0,\quad0\le s_i\le1,
+\tag{23}
+$$
+
+from paper Eqs. 55-59, p. 9.
+
+For reproducing the paper's numerical scale, it used \(T=0.02\) s,
+\(\Delta t=2\times10^{-5}\) s, a 2 mm element edge, air with
+\(c_a=343\) m/s and \(\rho_a=1.21\) kg/m³, and a structural material with
+\(E=50\) MPa, \(\nu=0.4\), and \(\rho_s=1000\) kg/m³ (paper pp. 10-11).
+These are validation inputs, not hard-coded application defaults.
+
+The Rayleigh parameters are
+
+$$
+\alpha_d=2\zeta\frac{\omega_1\omega_2}{\omega_1+\omega_2},
+\qquad
+\beta_d=2\zeta\frac1{\omega_1+\omega_2},
+\tag{24}
+$$
+
+from paper Eqs. 60-61, p. 11. Its example uses \(\zeta=0.1\),
+\(\omega_1=1600(2\pi)\) rad/s, and \(\omega_2=2200(2\pi)\) rad/s on the same
+page.
+
+## 6. Fully discrete adjoint
+
+Because the objective is defined through a discrete FFT of a discrete Newmark
+history, the paper rejects a semi-discrete-in-time adjoint and uses a fully
+discrete one (paper Section 3.3, p. 6).
+
+### 6.1 Frequency-to-time derivative
+
+First compute the complex derivative of each band function with respect to its
+selected FFT bins. Then apply the adjoint of the actual FFT pipeline:
+
+$$
+\frac{\partial\Phi}{\partial U^n}
+=\left(\frac{\partial U_f}{\partial U}\right)^T
+  \frac{\partial\Phi}{\partial U_f},
+\tag{25}
+$$
+
+which is paper Eq. 38, p. 7. Paper Eq. 39, p. 7 expresses this step as an
+inverse DFT. The implementation must also differentiate the Hann window, so
+the time-domain derivative is multiplied by \(w_n\).
+
+FFTW leaves both forward and backward transforms unnormalized. Pick one
+normalization convention, document it, and verify the coded adjoint with the
+discrete transpose identity
+
+$$
+\langle F_w x,y\rangle=\langle x,F_w^*y\rangle.
+\tag{26}
+$$
+
+Do not guess an extra factor of \(N\); make this identity and a scalar finite
+difference pass for the exact window/FFT/objective code.
+
+### 6.2 Reverse Newmark solve
+
+The global adjoint is
+
+$$
+\left(\frac{\partial R}{\partial U}\right)^T\Lambda
+=-\frac{\partial\Phi}{\partial U},
+\tag{27}
+$$
+
+from paper Eq. 41, p. 7. Since each residual depends only on the current and
+previous step, solve backwards:
+
+$$
+\begin{aligned}
+A^T\Lambda^N&=-\Phi_U^N,\\
+A^T\Lambda^n&=-\Phi_U^n-B^T\Lambda^{n+1},
+\quad n=N-1,\ldots,1,\\
+A_0^T\Lambda^0&=-\Phi_U^0-B^T\Lambda^1.
+\end{aligned}
+\tag{28}
+$$
+
+These are paper Eqs. 44-46, p. 8. The physical-design sensitivity is
+
+$$
+\frac{d\Phi}{d\bar s}
+=(\Lambda^0)^T\frac{\partial A_0}{\partial\bar s}U^0
++\sum_{n=1}^{N}(\Lambda^n)^T
+\left(
+\frac{\partial A}{\partial\bar s}U^n
++\frac{\partial B}{\partial\bar s}U^{n-1}
+\right),
+\tag{29}
+$$
+
+from paper Eq. 47, p. 8. Store all forward states for the first implementation.
+Checkpointing is only needed after memory measurements justify the extra
+forward solves.
+
+The paper notes that these matrix derivatives are nonzero only in cut elements
+(paper p. 8). MFEM Example 38 supplies cut quadrature, not derivatives of the
+quadrature and interface geometry with respect to nodal level-set variables.
+Those analytic cut sensitivities are the main custom research component and
+are delegated by the primary paper to the companion formulation. Until they
+are implemented, finite differences are a verification tool for small meshes,
+not a scalable replacement for the adjoint.
+
+### 6.3 Design parameterization and filter
+
+The optimizer variables obey \(0\le s_i\le1\) (paper Eq. 26, p. 5) and are
+mapped to \([-h_e/2,h_e/2]\) so the interface cannot jump too far in one
+update (paper Eq. 27, p. 6). The paper then applies
+
+$$
+-r^2\nabla^2\bar s_c+\bar s_c=\widetilde s_c
+\tag{30}
+$$
+
+with Neumann conditions (paper Eq. 28, p. 6). It uses a finite-volume,
+cell-centred filter plus node/cell interpolation.
+
+**Repository adaptation:** the minimal MFEM equivalent is an H1 Helmholtz
+filter assembled as `MassIntegrator + r*r*DiffusionIntegrator`; homogeneous
+Neumann conditions are natural. This avoids a separate finite-volume stack but
+is not bit-for-bit identical to the paper. Its adjoint is the transpose filter
+solve. If exact reproduction requires the paper's cell-centred mapping, add
+that only after the rest of the gradient passes finite differences.
+
+Apply the chain in reverse as paper Eq. 48, p. 8:
+
+$$
+\frac{d\Phi}{ds}
+=\frac{d\Phi}{d\bar s}
+ \frac{\partial\bar s}{\partial\bar s_c}
+ \frac{\partial\bar s_c}{\partial\widetilde s_c}
+ \frac{\partial\widetilde s_c}{\partial\widetilde s}
+ \frac{\partial\widetilde s}{\partial s}.
+\tag{31}
+$$
+
+The paper checked every case against first-order finite differences and reports
+worst-case disagreement below 0.1% (paper p. 8). Use the same target before
+running topology optimization.
+
+## 7. Minimal NLopt MMA adapter
+
+NLopt is not currently fetched or linked by this repository. When the verified
+evaluator exists, add NLopt as one dependency and use its official C++ API;
+do not write an MMA implementation.
+
+NLopt's `LD_MMA` is a globally convergent CCSA/MMA variant supporting nonlinear
+inequality constraints. It is **not** the parallel MMA implementation used by
+the paper. The paper's initial/decrease/increase asymptote values and penalty
+parameter (paper p. 11) do not map directly to NLopt settings and must not be
+advertised as reproduced.
+
+Represent \(x=[s_0,\ldots,s_{n-1},z]\):
 
 ```cpp
-M.SetBlock(0,0, Muu);
-M.SetBlock(1,1, Mpp);
+nlopt::opt opt(nlopt::LD_MMA, n_design + 1);
 
-K.SetBlock(0,0, Kuu);
-K.SetBlock(0,1, Kup);
-K.SetBlock(1,0, Kpu);
-K.SetBlock(1,1, Kpp);
+std::vector<double> lower(n_design + 1, 0.0);
+std::vector<double> upper(n_design + 1, 1.0);
+upper.back() = std::numeric_limits<double>::infinity();
+opt.set_lower_bounds(lower);
+opt.set_upper_bounds(upper);
+
+opt.set_min_objective(
+    [](const std::vector<double> &x, std::vector<double> &grad, void *) {
+        if (!grad.empty()) {
+            std::fill(grad.begin(), grad.end(), 0.0);
+            grad.back() = 1.0;
+        }
+        return x.back();
+    }, nullptr);
+
+std::vector<double> constraint_tol(2, 1e-8);
+opt.add_inequality_mconstraint(band_constraints, &problem,
+                               constraint_tol);
+opt.set_maxeval(max_evaluations);
 ```
 
-For parallel/Hypre, you will likely move toward `BlockOperator` composed of `HypreParMatrix` blocks instead of a purely serial `BlockMatrix`.
-
----
-
-# 10. Newmark time stepping
-
-The paper uses Newmark and builds:
-
-$$
-\hat{\mathbf{K}}
-================
-
-\mathbf{K}
-+
-a_6\mathbf{M}
-+
-a_3\mathbf{C}
-$$
-
-then solves:
-
-$$
-\hat{\mathbf{K}}\mathbf{v}^n
-============================
-
-\hat{\mathbf{h}}^n.
-$$
-
-MFEM gives you the assembled matrices and solvers. You probably write the Newmark loop yourself:
+The vector callback performs one shared forward analysis and two adjoint solves:
 
 ```cpp
-SparseMatrix Keff;
-Add(1.0, K, a6, M, Keff);
-Add(1.0, Keff, a3, C, Keff);
+void band_constraints(unsigned m, double *value,
+                      unsigned n, const double *x,
+                      double *grad, void *data) {
+    // s = x[0..n-2], z = x[n-1]
+    // evaluate returns Phi1, Phi2, dPhi1/ds, dPhi2/ds
+    const auto result = static_cast<Problem *>(data)->evaluate(x, n - 1);
+    value[0] = result.phi1 - x[n - 1];
+    value[1] = result.phi2 - x[n - 1];
 
-for (int n = 1; n <= Nt; n++)
-{
-    build_rhs(h_n, v_prev, vdot_prev, vddot_prev);
-    solver.Mult(rhs, v);
-    update_vdot_vddot();
+    if (grad) {
+        for (unsigned j = 0; j + 1 < n; ++j) {
+            grad[0*n + j] = result.dphi1[j];
+            grad[1*n + j] = result.dphi2[j];
+        }
+        grad[0*n + n - 1] = -1.0;
+        grad[1*n + n - 1] = -1.0;
+    }
 }
 ```
 
-MFEM does have time-dependent examples, including wave and nonlinear elasticity examples, but for matching the paper’s discrete adjoint later, you want full control over the time-step residuals. MFEM’s docs list Example 23 for a second-order-in-time wave equation and Example 10 for time-dependent implicit nonlinear elasticity, which are good templates, not final solutions. ([mfem.org][4])
-
----
-
-# 11. Linear solvers, parallelism, and GPU path
-
-For the paper-style implicit solve, the heavy object is:
-
-$$
-\hat{\mathbf{K}}\mathbf{v}^n=\hat{\mathbf{h}}^n.
-$$
-
-In MFEM, the solver ecosystem maps to:
-
-```cpp
-mfem::CGSolver
-mfem::GMRESSolver
-mfem::MINRESSolver
-mfem::HypreBoomerAMG
-mfem::HypreParMatrix
-mfem::HypreSolver
-```
-
-For parallel:
-
-```cpp
-ParBilinearForm
-HypreParMatrix
-HypreParVector
-```
-
-MFEM also documents GPU-related classes such as:
-
-```cpp
-mfem::Device
-mfem::Memory
-mfem::MemoryManager
-mfem::forall
-```
-
-in its main code documentation. ([mfem.org][4])
-
-Important caveat: CUDA will not automatically accelerate your whole CutFEM code. MFEM’s device backend helps most when kernels are expressed in MFEM’s partial assembly / operator style. Your custom cut-cell geometry construction is branchy and irregular, so it may remain CPU-side for a while. But the assembled operator application, vector operations, and some solver pieces can eventually benefit.
-
----
-
-# 12. Boundary conditions: hard wall, clamped, absorbing, periodic/Bloch
-
-The paper uses clamped structure, traction-free boundaries, hard-wall acoustics, interface coupling, and absorbing/radiating boundaries. 
-
-MFEM mapping:
-
-| Paper BC                              | MFEM building block                                          |
-| ------------------------------------- | ------------------------------------------------------------ |
-| (\mathbf{u}=0) on structural clamp    | `GetEssentialTrueDofs`, `FormLinearSystem`, marker arrays    |
-| (n_a\cdot\nabla p=0) hard wall        | natural Neumann, often no explicit term                      |
-| absorbing/radiation acoustic boundary | custom `BoundaryMassIntegrator` / custom boundary integrator |
-| periodic faces                        | periodic mesh / DOF constraints                              |
-| Bloch periodic                        | complex-valued system or real-imag block doubling            |
-
-MFEM supports topologically periodic meshes according to its project description. ([GitHub][1])
-
-For Bloch-Floquet, you will probably need either:
-
-$$
-q^+ = e^{i\mathbf{k}\cdot\mathbf{L}}q^-
-$$
-
-with complex matrices, or a real-valued doubled system:
-
-$$
-q = q_r + iq_i.
-$$
-
-MFEM has Example 22 for complex-valued linear systems for damped harmonic oscillators, which is relevant for later frequency-domain/Bloch work. ([mfem.org][4])
-
----
-
-# 13. Pressure integration over inlet/outlet regions
-
-The paper defines transmitted pressure by integrating pressure over the outlet:
-
-$$
-\hat{p}(t)=\int_{\Gamma_{\text{out}}} p(t),d\Gamma
-$$
-
-then applies FFT:
-
-$$
-\hat{p}(f)=FFT(\hat{p}(t)).
-$$
-
-In MFEM, you can compute this using:
-
-```cpp
-BoundaryLFIntegrator
-LinearForm
-GridFunction::GetValue
-Coefficient integration
-```
-
-Practical version:
-
-```cpp
-double outlet_integral = 0.0;
-
-for each boundary element on outlet:
-    get face transformation
-    get pressure element/face dofs
-    for qp in boundary_ir:
-        p_q = evaluate p at qp
-        outlet_integral += p_q * weight * detJ_face;
-```
-
-MFEM gives you the face transformations and boundary element iteration. You own the signal collection.
-
-For FFT, use:
-
-```cpp
-FFTW
-```
-
-The paper also used FFTW for the FFT operation. 
-
----
-
-# 14. Visualization of evolving 3D cell
-
-This is one of MFEM’s strongest practical advantages for you.
-
-Useful MFEM/GLVis classes:
-
-```cpp
-mfem::socketstream
-mfem::ParaViewDataCollection
-mfem::VisItDataCollection
-mfem::GridFunction
-mfem::ParGridFunction
-```
-
-`socketstream` is the class MFEM uses for socket-based streaming, commonly to GLVis. ([MFEM Code Documentation][11])
-
-GLVis is an OpenGL finite-element visualization tool with support for MFEM workflows, parallel visualization, VTK, and NURBS according to its site. ([glvis.org][12])
-
-For your live optimizer:
-
-```cpp
-ParaViewDataCollection dc("cell_evolution", &mesh);
-dc.RegisterField("level_set", &phi);
-dc.RegisterField("pressure", &p);
-dc.RegisterField("displacement", &u);
-dc.SetCycle(iter);
-dc.SetTime(iter);
-dc.Save();
-```
-
-or stream periodically to GLVis.
-
-This lets you see:
-
-* (\bar{s}) level-set surface,
-* solid/acoustic mask,
-* pressure amplitude,
-* displacement magnitude,
-* evolving cell geometry.
-
----
-
-# 15. Topology optimization scaffolding
-
-MFEM has Example 37 for topology optimization and Example 37p for parallel topology optimization. ([mfem.org][4])
-
-This does not solve your vibroacoustic CutFEM problem, but it gives you useful patterns for:
-
-* design fields,
-* filtering,
-* density-like material interpolation,
-* optimizer loop structure,
-* parallel design update.
-
-Your case is level-set/cut-element rather than standard density topology optimization, but the scaffolding is still useful.
-
----
-
-# 16. NLopt and MMA
-
-The paper uses MMA. 
-
-NLopt gives you a practical C++ interface:
-
-```cpp
-nlopt::opt opt(nlopt::LD_MMA, n_design_vars);
-```
-
-NLopt’s C++ API revolves around `nlopt::opt`, where you specify dimension, algorithm, stopping criteria, constraints, objective, and then call `optimize`. ([nlopt.readthedocs.io][13])
-
-NLopt documents `NLOPT_LD_MMA` as a globally-convergent method-of-moving-asymptotes algorithm for gradient-based local optimization with nonlinear inequality constraints, but not equality constraints. ([nlopt.readthedocs.io][14])
-
-That maps well to the paper’s bound/min-max formulation:
-
-$$
-\min_{\mathbf{s},z} z
-$$
-
-subject to:
-
-$$
-\Phi_1(\mathbf{s}) < z
-$$
-
-$$
-\Phi_2(\mathbf{s}) < z.
-$$
-
-You can implement constraints as:
-
-```cpp
-opt.add_inequality_constraint(phi1_minus_z, data, tol);
-opt.add_inequality_constraint(phi2_minus_z, data, tol);
-```
-
-For early work, finite-difference gradients are acceptable. For serious work, use the paper’s discrete adjoint.
-
-Other optimization libraries:
-
-| Library                  | Use                                                              |
-| ------------------------ | ---------------------------------------------------------------- |
-| **NLopt**                | easiest MMA/SLSQP/global-local optimization                      |
-| **IPOPT**                | large nonlinear constrained optimization, needs derivatives      |
-| **pagmo**                | evolutionary/global optimization experiments                     |
-| **ensmallen**            | ML-style optimizers, less ideal for constrained PDE optimization |
-| **MMA standalone codes** | closer to topology optimization literature                       |
-| **PETSc TAO**            | serious large-scale optimization if you go full PETSc            |
-
-For this project, I would start with **NLopt LD_MMA**, then later consider PETSc/TAO or a dedicated MMA implementation if NLopt becomes limiting.
-
----
-
-# 17. The “paper-to-MFEM” map
-
-Here is the clean map.
-
-| Paper concept                              | MFEM building block                                                          |
-| ------------------------------------------ | ---------------------------------------------------------------------------- |
-| Fixed computational domain (\Omega)        | `Mesh`, `ParMesh`                                                            |
-| Level set (\bar{s})                        | `GridFunction`, `ParGridFunction`, `GridFunctionCoefficient`                 |
-| Structural displacement (\mathbf{u})       | vector `FiniteElementSpace`, `ParFiniteElementSpace`                         |
-| Acoustic pressure (p)                      | scalar `FiniteElementSpace`, `ParFiniteElementSpace`                         |
-| Fictitious solid/acoustic material scaling | custom `Coefficient`, `MatrixCoefficient`, `VectorCoefficient`               |
-| Structural mass                            | `VectorMassIntegrator` or custom integrator                                  |
-| Structural stiffness                       | `ElasticityIntegrator` or custom cut integrator                              |
-| Acoustic mass                              | `MassIntegrator` with (1/K_a) coefficient                                    |
-| Acoustic stiffness                         | `DiffusionIntegrator` with (1/\rho_a) coefficient                            |
-| Cut-volume integration                     | Example 38 cut-volume `IntegrationRule` logic                                |
-| Cut-surface interface (\Gamma_{as})        | Example 38 cut-surface `IntegrationRule` plus custom mixed integrator        |
-| Interface coupling                         | `MixedBilinearForm`, custom block assembly                                   |
-| Coupled global system                      | `BlockMatrix`, `BlockOperator`, `BlockVector`                                |
-| Newmark effective matrix                   | manual matrix combination using MFEM matrices/operators                      |
-| Linear solve                               | `CGSolver`, `GMRESSolver`, `HypreParMatrix`, `HypreSolver`, external solvers |
-| Parallel assembly                          | `ParBilinearForm`, `ParLinearForm`, `ParGridFunction`                        |
-| GPU pathway                                | `Device`, `Memory`, `MemoryManager`, `mfem::forall`                          |
-| Outlet pressure integral                   | boundary element loops, `LinearForm`, custom boundary integration            |
-| FFT response                               | FFTW, external to MFEM                                                       |
-| Optimizer                                  | NLopt `LD_MMA`, IPOPT, PETSc TAO                                             |
-| Live visualization                         | `socketstream`, GLVis, `ParaViewDataCollection`                              |
-| Topology optimization pattern              | MFEM Example 37/37p                                                          |
-| Cut integration pattern                    | MFEM Example 38                                                              |
-
----
-
-# 18. Why MFEM is especially relevant to immersed boundaries
-
-The crucial point: MFEM already accepts the same mental model as the paper:
-
-$$
-\text{one background mesh}
-+
-\text{fields defined on the mesh}
-+
-\text{coefficients evaluated at quadrature points}
-+
-\text{custom integration rules}
-+
-\text{global sparse operators}
-$$
-
-That is exactly the infrastructure you need for an immersed/cut method.
-
-The paper’s method is not “make a body-fitted mesh every iteration.” It is “keep the mesh fixed and update the interface through a level set.” MFEM’s `GridFunction` + `Coefficient` + custom `IntegrationRule` path is a natural way to express that.
-
-The single most important MFEM feature for your research kernel is therefore:
-
-$$
-\boxed{\text{Example 38: cut-surface and cut-volume integration from a level set}}
-$$
-
-because it directly maps to:
-
-$$
-\Omega_e\cap\Omega_s,\quad
-\Omega_e\cap\Omega_a,\quad
-\Gamma_{as}\cap\Omega_e.
-$$
-
----
-
-# 19. What I would build first in MFEM
-
-I would start with a minimal MFEM “research kernel skeleton”:
-
-```text
-1. Make 3D Cartesian hex mesh
-2. Define phi GridFunction
-3. Use Example 38 logic to construct:
-   - positive cut-volume integration rule
-   - negative cut-volume integration rule
-   - zero-level cut-surface integration rule
-4. Assemble only acoustic scalar wave first
-5. Integrate pressure over outlet face
-6. FFT outlet signal
-7. Visualize phi and pressure in GLVis/ParaView
-8. Add vector elasticity field
-9. Add interface coupling
-10. Add NLopt MMA loop
-```
-
-Do not begin with the full adjoint. First get:
-
-$$
-\text{geometry evolves}
-\rightarrow
-\text{solver runs}
-\rightarrow
-\text{3D view updates}
-\rightarrow
-\text{FFT metric changes}.
-$$
-
-Then add gradients.
-
----
-
-# 20. The practical verdict
-
-Use MFEM if your goal is a real 3D evolving-cell tool.
-
-Not because MFEM gives you the finished vibroacoustic optimizer, but because it gives you the reusable car parts:
-
-```text
-mesh
-finite element spaces
-field storage
-quadrature
-element transformations
-sparse assembly
-block systems
-parallel vectors/matrices
-solver interfaces
-visualization
-GPU-aware memory model
-cut integration example
-```
-
-You still design the engine:
-
-```text
-3D cut-cell vibroacoustic interface physics
-FFT objective
-optimizer loop
-structural integrity constraints
-periodic/Bloch cell logic
-```
-
-But MFEM prevents you from also having to manufacture every bolt, wire, bearing, and dashboard before testing the engine.
-
-[1]: https://github.com/mfem/mfem?utm_source=chatgpt.com "GitHub - mfem/mfem: Lightweight, general, scalable C++ library for ..."
-[2]: https://deepwiki.com/mfem/mfem/4.1-grid-functions-and-coefficients?utm_source=chatgpt.com "Grid Functions and Coefficients | mfem/mfem | DeepWiki"
-[3]: https://docs.mfem.org/html/classmfem_1_1FiniteElementSpace.html?utm_source=chatgpt.com "mfem::FiniteElementSpace Class Reference"
-[4]: https://mfem.org/dox/?utm_source=chatgpt.com "MFEM - Finite Element Discretization Library"
-[5]: https://docs.mfem.org/html/classmfem_1_1PWConstCoefficient.html?utm_source=chatgpt.com "MFEM: mfem::PWConstCoefficient Class Reference"
-[6]: https://docs.mfem.org/html/classmfem_1_1BilinearFormIntegrator.html?utm_source=chatgpt.com "MFEM: mfem::BilinearFormIntegrator Class Reference"
-[7]: https://docs.mfem.org/4.7/?utm_source=chatgpt.com "MFEM: Code Documentation"
-[8]: https://mfem.org/examples/?utm_source=chatgpt.com "MFEM - Finite Element Discretization Library"
-[9]: https://mfem.org/integration/?utm_source=chatgpt.com "MFEM - Finite Element Discretization Library"
-[10]: https://docs.mfem.org/html/classmfem_1_1BlockOperator.html?utm_source=chatgpt.com "mfem::BlockOperator Class Reference"
-[11]: https://docs.mfem.org/html/classmfem_1_1socketstream.html?utm_source=chatgpt.com "MFEM: mfem::socketstream Class Reference - MFEM Code Documentation"
-[12]: https://glvis.org/?utm_source=chatgpt.com "GLVis - OpenGL Finite Element Visualization Tool"
-[13]: https://nlopt.readthedocs.io/en/latest/NLopt_C-plus-plus_Reference/?utm_source=chatgpt.com "C++ reference - NLopt Documentation"
-[14]: https://nlopt.readthedocs.io/en/latest/NLopt_Algorithms/?utm_source=chatgpt.com "NLopt algorithms - NLopt Documentation - Read the Docs"
+NLopt stores vector-constraint gradients row-major as `grad[i*n + j]`.
+Exceptions from the PDE solve must cross the callback boundary safely; record
+the failing design and call NLopt's forced-stop mechanism rather than returning
+fabricated objective values.
+
+Official references:
+
+- [NLopt C++ reference](https://nlopt.readthedocs.io/en/latest/NLopt_C-plus-plus_Reference/)
+- [NLopt algorithms: MMA/CCSA](https://nlopt.readthedocs.io/en/stable/NLopt_Algorithms/#mma-method-of-moving-asymptotes-and-ccsa)
+- [FFTW one-dimensional DFTs](https://www.fftw.org/fftw3_doc/Complex-One_002dDimensional-DFTs.html)
+- [MFEM examples](https://mfem.org/examples/)
+- [MFEM 4.9 `AlgoimIntegrationRules`](https://docs.mfem.org/4.9/classmfem_1_1AlgoimIntegrationRules.html)
+- [MFEM 4.9 `NewmarkSolver`](https://docs.mfem.org/4.9/classmfem_1_1NewmarkSolver.html)
+
+## 8. Verification gates and implementation order
+
+Do not debug the optimizer and PDE at the same time. Each gate should leave one
+small runnable regression check.
+
+### Gate 1: cut integration
+
+- Reproduce Example 38's analytic cut-volume and cut-surface integrals.
+- Verify both \(\phi>0\) and \(\phi<0\) volumes and that they sum to the full
+  element/domain volume.
+- Check interface normals on a linear level set with a known direction.
+
+### Gate 2: uncoupled physics
+
+- Acoustic-only: hard-wall or manufactured wave problem with mesh/time-step
+  convergence.
+- Elasticity-only: clamped plane-stress patch test and structural eigenmodes.
+- Confirm fictitious material reduces contributions by \(\epsilon_f\) without
+  producing relevant spurious modes.
+
+### Gate 3: coupled transient system
+
+- Check every block dimension and the sparsity locations in Eq. (12).
+- A uniform interface pressure must load the structure in the expected normal
+  direction.
+- A prescribed normal acceleration must create pressure with the expected sign.
+- Compare the explicit Newmark loop with MFEM's `NewmarkSolver` on a fixed
+  linear system.
+
+### Gate 4: broadband response
+
+- Run the empty duct through the identical FFT pipeline and obtain
+  \(S(f)\approx1\) in excited bins.
+- Confirm FFT frequencies, window, normalization, and outlet integration with
+  a single known sinusoid.
+- Compare a fixed design at selected frequencies with a frequency-domain solve
+  or independent FEM package, as the paper does in Section 5.4.
+
+### Gate 5: adjoint
+
+- Verify the FFT transpose identity in Eq. (26).
+- Compare each band gradient with centred finite differences over several
+  random design variables.
+- Require relative disagreement below 0.1%, matching the paper's reported
+  check on p. 8, before enabling MMA.
+
+### Gate 6: optimization
+
+- Start on a coarse mesh and a few active frequency bins.
+- Confirm both epigraph constraints and their gradients use the same design.
+- Require a reduction in the maximum of \(\Phi_1\) and \(\Phi_2\), not merely
+  a successful NLopt return code.
+- Log NLopt status, evaluations, \(z\), both constraints, and gradient norms.
+
+## 9. Three-dimensional extension
+
+Only extend the validated 2D solver. The governing block structure, Newmark
+scheme, FFT objective, and adjoint recursion remain unchanged.
+
+Change the spatial pieces:
+
+- use a Cartesian hexahedral `Mesh` and Q1 `H1_FECollection(1, 3)`;
+- create the displacement space with `vdim=3`;
+- use the three-dimensional Lamé coefficient
+  \(\lambda=E\nu/[(1+\nu)(1-2\nu)]\), not the plane-stress value;
+- obtain Algoim cut volumes and two-dimensional cut surfaces inside each hex;
+- compute three-component normals from \(\nabla\phi\);
+- interpret Eq. (19) as an outlet-area integral;
+- validate on an extruded 2D case before attempting new 3D topology.
+
+Memory becomes the first practical limit: storing three Newmark fields for all
+time steps, plus one or two adjoint histories, scales with the full coupled DOF
+count. Measure it before adding checkpointing. Likewise, MPI/Hypre, GPU partial
+assembly, and periodic/Bloch constraints should be added only when the
+validated 3D baseline demonstrates that they are necessary.
+
+## 10. Definition of done
+
+The implementation represented by this guide is ready for research use only
+when all of the following are true:
+
+- positive, negative, and surface cut quadrature pass analytic checks;
+- plane-stress acoustic and elastic subproblems converge independently;
+- interface signs and block locations match Eqs. (10)-(12);
+- the empty-duct normalization gives \(S(f)\approx1\);
+- the coded FFT/Newmark adjoint agrees with finite differences below 0.1%;
+- NLopt reduces the worst band error on a coarse reproducible case;
+- a fixed optimized geometry is checked independently in the frequency domain.
+
+That sequence uses MFEM for the FEM machinery, Algoim for cut quadrature, FFTW
+for spectra, and NLopt for MMA. The remaining custom code is limited to the
+actual research contribution: cut-phase physics, interface coupling, and
+their consistent shape sensitivities.
