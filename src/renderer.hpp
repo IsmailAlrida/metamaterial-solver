@@ -54,7 +54,7 @@
             };
 
         private:
-            Solver solver; 
+            App::Solver solver;
             Optimizer optimizer;
             Exporter exporter; 
             LevelSet geometry; 
