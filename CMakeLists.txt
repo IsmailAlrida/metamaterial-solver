@@ -117,10 +117,56 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(fftw)
 
-# 7. Fetch MFEM (Finite Element Method Library)
+# 7. Fetch MFEM's CutFEM dependencies
+FetchContent_Declare(
+  blitz
+  GIT_REPOSITORY https://github.com/blitzpp/blitz.git
+  GIT_TAG        f24a250a43dff88c31ad92916da828b7ea9a98b7
+  SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/blitz-src"
+  BINARY_DIR     "${CMAKE_BINARY_DIR}/deps/blitz-build"
+  SOURCE_SUBDIR  cmake # Populate only; Blitz's top-level project is not subproject-safe.
+)
+FetchContent_MakeAvailable(blitz)
+
+set(_blitz_configure_args
+  -S "${blitz_SOURCE_DIR}"
+  -B "${blitz_BINARY_DIR}"
+  -G "${CMAKE_GENERATOR}"
+  "-DCMAKE_CXX_COMPILER:FILEPATH=${CMAKE_CXX_COMPILER}"
+  -DBUILD_TESTING=OFF
+  -DBUILD_DOC=OFF
+)
+if(CMAKE_GENERATOR_PLATFORM)
+  list(APPEND _blitz_configure_args -A "${CMAKE_GENERATOR_PLATFORM}")
+endif()
+if(CMAKE_GENERATOR_TOOLSET)
+  list(APPEND _blitz_configure_args -T "${CMAKE_GENERATOR_TOOLSET}")
+endif()
+execute_process(
+  COMMAND "${CMAKE_COMMAND}" ${_blitz_configure_args}
+  COMMAND_ERROR_IS_FATAL ANY
+)
+
+FetchContent_Declare(
+  algoim
+  GIT_REPOSITORY https://github.com/algoim/algoim.git
+  GIT_TAG        9c9ca0ef094d8ab0390ed36367a1151b459bbe0a
+  SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/algoim-src"
+)
+FetchContent_MakeAvailable(algoim)
+
+# MFEM's find modules otherwise look only for installed copies.
+set(BLITZ_FOUND ON CACHE BOOL "" FORCE)
+set(BLITZ_INCLUDE_DIRS "${blitz_BINARY_DIR};${blitz_SOURCE_DIR}" CACHE STRING "" FORCE)
+set(BLITZ_LIBRARIES "" CACHE STRING "" FORCE)
+set(ALGOIM_DIR "${algoim_SOURCE_DIR}" CACHE PATH "" FORCE)
+
+# 8. Fetch MFEM (Finite Element Method Library)
 set(MFEM_USE_MPI OFF CACHE BOOL "" FORCE)
 set(MFEM_FETCH_TPLS OFF CACHE BOOL "" FORCE)
 set(MFEM_USE_METIS OFF CACHE BOOL "" FORCE)
+set(MFEM_USE_LAPACK OFF CACHE BOOL "" FORCE)
+set(MFEM_USE_ALGOIM ON CACHE BOOL "" FORCE)
 if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
   set(MFEM_USE_CUDA ON CACHE BOOL "" FORCE)
   set(CUDA_ARCH "native" CACHE STRING "" FORCE)
@@ -145,7 +191,9 @@ FetchContent_Declare(
   SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/mfem-src"
   BINARY_DIR     "${CMAKE_BINARY_DIR}/deps/mfem-build"
 )
+set(CMAKE_SKIP_INSTALL_RULES ON)
 FetchContent_MakeAvailable(mfem)
+set(CMAKE_SKIP_INSTALL_RULES OFF)
 
 if(METAMATERIAL_DEPS_ONLY)
   message(STATUS "Configured dependencies only; skipping metamaterial_app target.")

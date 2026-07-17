@@ -67,10 +67,10 @@ mfem::GridFunction displacement(&displacement_fes);
 
 The sign convention is paper Eq. 1:
 
-\[
+$$
 \phi>0:\Omega_s,\qquad \phi=0:\Gamma_{as},\qquad
 \phi<0:\Omega_a.
-\]
+$$
 
 Initialize a test geometry by projection:
 
@@ -114,11 +114,11 @@ That remains valid if the mesh later becomes nonconforming or parallel.
 
 The paper's design chain is
 
-\[
+$$
 s\in[0,1]
 \longrightarrow \widetilde s\in[-h_e/2,h_e/2]
 \longrightarrow \bar s=\phi,
-\]
+$$
 
 followed by a Helmholtz/PDE smoothing filter. The first map is simply:
 
@@ -130,9 +130,9 @@ for (int i = 0; i < design.Size(); ++i) {
 
 For the compact MFEM implementation, solve
 
-\[
+$$
 (M_\phi+r^2K_\phi)\,\bar s=M_\phi\widetilde s.
-\]
+$$
 
 Build `M_phi` with `mfem::MassIntegrator` and `K_phi` with
 `mfem::DiffusionIntegrator`. Homogeneous Neumann conditions are natural, so no
@@ -234,7 +234,7 @@ const mfem::Vector &n_acoustic = grad_phi; // negative phi -> positive phi
 
 The weak terms represented by the code are:
 
-\[
+$$
 \begin{aligned}
 m_{uu}(w,u)&=\int_\Omega \rho_s w\cdot u\,d\Omega,\\
 k_{uu}(w,u)&=\int_\Omega \varepsilon(w):C:\varepsilon(u)\,d\Omega,\\
@@ -244,7 +244,7 @@ c_{pp}(q,p)&=\int_{\Gamma_{ar}}(\rho_ac_a)^{-1}qp\,d\Gamma,\\
 k_{up}(w,p)&=-\int_{\Gamma_{as}}(w\cdot n_a)p\,d\Gamma,\\
 m_{pu}(q,u)&=-\int_{\Gamma_{as}}q(n_s\cdot u)\,d\Gamma.
 \end{aligned}
-\]
+$$
 
 Their MFEM building blocks are:
 
@@ -259,10 +259,10 @@ Their MFEM building blocks are:
 
 For the paper's 2D plane-stress solid, pass
 
-\[
+$$
 \lambda=\frac{E\nu}{1-\nu^2},\qquad
 \mu=\frac{E}{2(1+\nu)}
-\]
+$$
 
 to `ElasticityIntegrator`:
 
@@ -283,10 +283,10 @@ For every volume term, integrate both phases. Use physical coefficients in its
 own phase and multiply the same formula by \(\epsilon_f=10^{-8}\) in the
 fictitious phase:
 
-\[
+$$
 \alpha_s=1\text{ in }\phi>0,\quad
 \alpha_s=\epsilon_f\text{ in }\phi<0,
-\]
+$$
 
 with the reverse assignment for acoustics. Keep `epsilon_f` configurable; the
 paper warns that equal stiffness and mass scaling can create fictitious modes.
@@ -342,17 +342,17 @@ The complete assembly loop is therefore:
 
 The coupled semi-discrete system is paper Eq. 12:
 
-\[
+$$
 M\ddot v+C\dot v+Kv=h,\qquad v=[u,p]^T,
-\]
+$$
 
 with the non-symmetric block layout
 
-\[
+$$
 M=\begin{bmatrix}M_{uu}&0\\M_{pu}&M_{pp}\end{bmatrix},\quad
 C=\begin{bmatrix}C_{uu}&0\\0&C_{pp}\end{bmatrix},\quad
 K=\begin{bmatrix}K_{uu}&K_{up}\\0&K_{pp}\end{bmatrix}.
-\]
+$$
 
 Pressure traction belongs in `Kup`; structural acceleration coupling belongs in
 `Mpu`. Do not mirror them into a symmetric stiffness matrix, and do not use CG
@@ -388,11 +388,11 @@ export.
 For the paper's average-acceleration Newmark scheme,
 \(\beta=1/4\), \(\gamma=1/2\), each step solves
 
-\[
+$$
 \widehat K v^n=\widehat h^n,\qquad
 \widehat K=K+\frac{1}{\beta\Delta t^2}M
              +\frac{\gamma}{\beta\Delta t}C.
-\]
+$$
 
 Store all three fields needed by the fully discrete adjoint:
 
@@ -429,16 +429,16 @@ or export.
 
 At every time step, integrate outlet pressure on the ordinary exterior outlet:
 
-\[
+$$
 \widehat p(t_n)=\int_{\Gamma_{out}}p(x,t_n)\,d\Gamma.
-\]
+$$
 
 Apply the same Hann window to the design and empty-duct histories, then use the
 already-linked FFTW library. The transmission is
 
-\[
+$$
 S_m=\frac{|P_m|}{|P_{0,m}|}.
-\]
+$$
 
 Compute `P0` once using the identical mesh, source, time step, duration, outlet
 functional, and FFT normalization. Reject frequency bins where `abs(P0)` is
@@ -446,28 +446,28 @@ below an excitation tolerance.
 
 The paper balances pass- and stop-band errors with
 
-\[
+$$
 \Phi_{pass}=\sum_{m\in P}(S_m-1)^2,
 \qquad
 \Phi_{stop}=\sum_{m\in S}\frac{(S_m-b)^2}{b^2},
-\]
+$$
 
 where `b` is a small nonzero target transmission. Its epigraph form is
 
-\[
+$$
 \min_{s,z}z\quad\text{subject to}\quad
 \Phi_{pass}(s)-z\le0,\quad
 \Phi_{stop}(s)-z\le0,\quad 0\le s_i\le1.
-\]
+$$
 
 Do not set `b=0`, because it appears in the denominator.
 
 Because the objective is a discrete function of a discrete FFT of the Newmark
 history, use the paper's fully discrete adjoint:
 
-\[
+$$
 (\partial R/\partial U)^T\Lambda=-\partial\Phi/\partial U.
-\]
+$$
 
 Run the FFT adjoint back to time, then solve the Newmark adjoint in reverse
 time. `mfem::Operator::MultTranspose` is the useful common matrix contract.
