@@ -11,7 +11,7 @@
 // TODO: im kind of leaning more towards nfd
 #include "imfilebrowser.h"
 #include "implot.h"
-
+#include "mfem.hpp"
 
 
     class Renderer { 
