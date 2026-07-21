@@ -18,17 +18,17 @@ Data path:
 
 ```text
 LevelSet::phi
-  -> mfem::GridFunction phi_h
-  -> mfem::GridFunctionCoefficient phi_coeff
-  -> mfem::AlgoimIntegrationRules
+  -> GridFunction phi_h
+  -> GridFunctionCoefficient phi_coeff
+  -> AlgoimIntegrationRules
   -> solid volume, acoustic volume, and interface quadrature
 ```
 
 Use a Cartesian domain with measurable dimensions:
 
 ```cpp
-mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(
-    nx, ny, mfem::Element::QUADRILATERAL, true, lx, ly);
+Mesh mesh = Mesh::MakeCartesian2D(
+    nx, ny, Element::QUADRILATERAL, true, lx, ly);
 ```
 
 Use $h_e=lx/nx=ly/ny$ for the paper-style uniform mesh. Do not optimize on a
@@ -97,9 +97,9 @@ $$
 \mu=\frac{E}{2(1+\nu)}.
 $$
 
-Use `mfem::ElasticityIntegrator(lambda, mu)` with those plane-stress values for
-the paper reproduction. In 3D, use
-$\lambda=E\nu/((1+\nu)(1-2\nu))$ and the same $\mu$.
+Use `ElasticityIntegrator(lambda, mu)` with those plane-stress values for
+the paper reproduction. The 3D model uses the tensor form in the extension
+section below.
 
 Acoustic pressure in the full fictitious domain:
 
@@ -141,7 +141,149 @@ $$
 
 Paper value: $\epsilon_f=10^{-8}$.
 
-## 3. Weak Form And Matrix Blocks
+## 3. 3D Extension
+
+This is an extension path, not the first validation target. The paper model is
+2D plane stress; 3D must be validated separately.
+
+Sources:
+
+| Topic | Source |
+|---|---|
+| MFEM elasticity weak form and 3D stress component order | https://docs.mfem.org/html/classmfem_1_1ElasticityIntegrator.html |
+| MFEM vector/elasticity integrator math | https://mfem.org/bilininteg/ |
+| MFEM ordinary periodic meshes, i.e. zero phase shift | https://mfem.org/howto/periodic-boundaries/ |
+| MFEM `Mesh::MakePeriodic` and `CreatePeriodicVertexMapping` | https://docs.mfem.org/4.9/classmfem_1_1Mesh.html |
+| Floquet periodicity phase relation | https://doc.comsol.com/6.3/doc/com.comsol.help.sme/sme_ug_theory.06.075.html |
+| Acoustic-structure coupling principle | https://doc.comsol.com/6.3/doc/com.comsol.help.aco/aco_ug_acousticstructure.07.03.html |
+| Existing 3D vibroacoustic cut-element precedent | https://orbit.dtu.dk/en/publications/three-dimensional-vibroacoustic-topology-optimization-of-hearing-/ |
+
+3D structural unknown:
+
+$$
+u=(u_1,u_2,u_3)^T.
+$$
+
+Use the full small-strain tensor:
+
+$$
+\epsilon(u)=\frac12(\nabla u+\nabla u^T).
+$$
+
+Use the 3D isotropic stress law:
+
+$$
+\sigma(u)=\lambda\operatorname{tr}(\epsilon(u))I+2\mu\epsilon(u),
+$$
+
+with
+
+$$
+\mu=\frac{E}{2(1+\nu)},\qquad
+\lambda=\frac{E\nu}{(1+\nu)(1-2\nu)}.
+$$
+
+The structural stiffness block becomes:
+
+$$
+K_{uu}(w,u)=\int_{\Omega_s}\sigma(u):\epsilon(w)\,d\Omega,
+$$
+
+with fictitious scaling still applied in the acoustic phase. MFEM's
+`ElasticityIntegrator(lambda, mu)` is the direct 3D integrator for this form.
+MFEM stores the symmetric stress components in 3D as `s_xx`, `s_yy`, `s_zz`,
+`s_xy`, `s_xz`, `s_yz`.
+
+The acoustic pressure is still a scalar field in 3D. The acoustic equation and
+the `Mpp`, `Kpp`, and `Cpp` definitions stay the same, but domain integrals are
+3D volumes and boundary/interface integrals are 2D surfaces.
+
+The interface blocks keep the same formulas:
+
+$$
+K_{up}(w,p)=-\int_{\Gamma_{as}}(w\cdot n_a)p\,d\Gamma,
+$$
+
+$$
+M_{pu}(q,u)=-\int_{\Gamma_{as}}q(n_s\cdot u)\,d\Gamma.
+$$
+
+The implementation difference is that $w$, $u$, $n_a$, and $n_s$ have three
+components, and `AlgoimIntegrationRules` generates cut volumes and cut surfaces
+inside hexahedral cells.
+
+Minimal MFEM 3D mapping:
+
+```cpp
+Mesh mesh = Mesh::MakeCartesian3D(
+    nx, ny, nz, Element::HEXAHEDRON, lx, ly, lz);
+
+H1_FECollection fec(1, 3);
+FiniteElementSpace pressure_fes(&mesh, &fec);
+FiniteElementSpace level_set_fes(&mesh, &fec);
+FiniteElementSpace displacement_fes(
+    &mesh, &fec, 3, Ordering::byVDIM);
+```
+
+Optional Floquet-Bloch boundary for later unit-cell work:
+
+Do not use this for the paper duct model. It is for a later extension where the
+design domain represents a repeatable unit cell rather than an inlet-to-outlet
+duct. Here `f-b` means Floquet-Bloch, not front-back.
+
+For a lattice translation vector $R$ and Bloch wave vector $k$, paired fields
+satisfy:
+
+$$
+p(x+R,t)=\exp(i k\cdot R)p(x,t),
+$$
+
+$$
+u(x+R,t)=\exp(i k\cdot R)u(x,t).
+$$
+
+The geometry itself is periodic, not phase shifted:
+
+$$
+\phi(x+R)=\phi(x).
+$$
+
+The special case $k=0$ gives phase $1$, which reduces to ordinary periodic
+DOF identification. Only that zero-phase case can use MFEM's periodic mesh
+topology directly:
+
+```cpp
+Mesh box = Mesh::MakeCartesian3D(
+    nx, ny, nz, Element::HEXAHEDRON, lx, ly, lz);
+
+std::vector<Vector> translations = {
+    Vector({lx, 0.0, 0.0}), // choose the unit-cell lattice vector
+};
+
+Mesh mesh = Mesh::MakePeriodic(
+    box, box.CreatePeriodicVertexMapping(translations));
+```
+
+For nonzero $k$, do not use `MakePeriodic` alone. The phase factor is complex,
+so the implementation needs either complex-valued algebra or a doubled real
+system for real and imaginary parts, plus explicit phase constraints between
+paired boundary DOFs. Those constraints belong to a separate unit-cell runner,
+not the duct white-noise inlet/outlet runner.
+
+Floquet-Bloch faces are not inlet, outlet, source, absorbing, or hard-wall
+faces. Unit-cell runs need their own loading, measurement, and wave-vector
+sweep definitions.
+
+3D validation gates:
+
+1. Validate 3D elasticity with no acoustic coupling.
+2. Validate 3D acoustics with no structure.
+3. Validate cut volume and cut-surface area on a known level set.
+4. Validate interface normal orientation and `Kup`/`Mpu` signs.
+5. If Floquet-Bloch is enabled, validate the $k=0$ periodic case first, then
+   validate nonzero phase constraints against a known unit-cell problem.
+
+## 4. Weak Form And Matrix Blocks
 
 Let $w$ be the displacement test function and $q$ the pressure test function.
 The semi-discrete system is:
@@ -191,22 +333,22 @@ Integrator arguments:
 | `BoundaryMassIntegrator(q)` | boundary coefficient $q(x)$ | $A_{ij}=\int_\Gamma q\psi_j\psi_i\,d\Gamma$ |
 | `BoundaryLFIntegrator(q)` | boundary coefficient $q(x,t_n)$ | $b_i=\int_\Gamma q\psi_i\,d\Gamma$ |
 
-## 4. MFEM Spaces And Fields
+## 5. MFEM Spaces And Fields
 
 Use one scalar H1 space for pressure and level set, and one vector H1 space for
 displacement:
 
 ```cpp
-mfem::H1_FECollection fec(1, mesh.Dimension());
+H1_FECollection fec(1, mesh.Dimension());
 
-mfem::FiniteElementSpace pressure_fes(&mesh, &fec);
-mfem::FiniteElementSpace level_set_fes(&mesh, &fec);
-mfem::FiniteElementSpace displacement_fes(
-    &mesh, &fec, mesh.Dimension(), mfem::Ordering::byVDIM);
+FiniteElementSpace pressure_fes(&mesh, &fec);
+FiniteElementSpace level_set_fes(&mesh, &fec);
+FiniteElementSpace displacement_fes(
+    &mesh, &fec, mesh.Dimension(), Ordering::byVDIM);
 
-mfem::GridFunction phi_h(&level_set_fes);
-mfem::GridFunction pressure(&pressure_fes);
-mfem::GridFunction displacement(&displacement_fes);
+GridFunction phi_h(&level_set_fes);
+GridFunction pressure(&pressure_fes);
+GridFunction displacement(&displacement_fes);
 ```
 
 Mathematical meaning:
@@ -230,30 +372,30 @@ Arguments:
 Lifetime rule: `Mesh` outlives `FiniteElementSpace`; `H1_FECollection` outlives
 `FiniteElementSpace`; `FiniteElementSpace` outlives `GridFunction`.
 
-## 5. Cut Integration Recipe
+## 6. Cut Integration Recipe
 
 MFEM/Algoim integrates where its level-set coefficient is positive. With
 `phi > 0` as solid:
 
 ```cpp
-mfem::GridFunctionCoefficient phi_coeff(&phi_h);
-mfem::AlgoimIntegrationRules solid_rules(cut_order, phi_coeff, level_set_order);
+GridFunctionCoefficient phi_coeff(&phi_h);
+AlgoimIntegrationRules solid_rules(cut_order, phi_coeff, level_set_order);
 ```
 
 For the acoustic side, pass `-phi` through a tiny coefficient wrapper:
 
 ```cpp
-class NegatedCoefficient final : public mfem::Coefficient {
+class NegatedCoefficient final : public Coefficient {
 public:
-    explicit NegatedCoefficient(mfem::Coefficient &source) : source(source) {}
+    explicit NegatedCoefficient(Coefficient &source) : source(source) {}
 
-    mfem::real_t Eval(mfem::ElementTransformation &T,
-                      const mfem::IntegrationPoint &ip) override {
+    real_t Eval(ElementTransformation &T,
+                      const IntegrationPoint &ip) override {
         return -source.Eval(T, ip);
     }
 
 private:
-    mfem::Coefficient &source;
+    Coefficient &source;
 };
 ```
 
@@ -261,12 +403,12 @@ Then build element rules:
 
 ```cpp
 NegatedCoefficient minus_phi(phi_coeff);
-mfem::AlgoimIntegrationRules acoustic_rules(cut_order, minus_phi, level_set_order);
+AlgoimIntegrationRules acoustic_rules(cut_order, minus_phi, level_set_order);
 
-mfem::IntegrationRule solid_ir;
-mfem::IntegrationRule acoustic_ir;
-mfem::IntegrationRule interface_ir;
-mfem::Vector surface_weights;
+IntegrationRule solid_ir;
+IntegrationRule acoustic_ir;
+IntegrationRule interface_ir;
+Vector surface_weights;
 
 solid_rules.GetVolumeIntegrationRule(*T, solid_ir);
 acoustic_rules.GetVolumeIntegrationRule(*T, acoustic_ir);
@@ -301,7 +443,7 @@ $$
 Compute it from `phi_h.GetGradient(*T, grad_phi)` after setting the integration
 point on `T`. Reject or diagnose points where $\|\nabla\phi\|$ is near zero.
 
-## 6. Boundary Conditions
+## 7. Boundary Conditions
 
 Exterior boundary conditions:
 
@@ -318,18 +460,18 @@ Exterior boundary conditions:
 Essential displacement DOFs:
 
 ```cpp
-mfem::Array<int> clamp_marker(mesh.bdr_attributes.Max());
+Array<int> clamp_marker(mesh.bdr_attributes.Max());
 clamp_marker = 0;
 clamp_marker[clamp_attr - 1] = 1;
 
-mfem::Array<int> ess_u_tdofs;
+Array<int> ess_u_tdofs;
 displacement_fes.GetEssentialTrueDofs(clamp_marker, ess_u_tdofs);
 ```
 
 Apply structural elimination consistently to `M`, `C`, `K`, all coupled blocks,
 and RHS vectors before solving.
 
-## 7. White-Noise Source
+## 8. White-Noise Source
 
 The paper uses incoming acoustic white noise at the inlet with random pressure
 values between $-1$ Pa and $1$ Pa.
@@ -338,9 +480,9 @@ Minimal reproducible source state:
 
 ```cpp
 std::mt19937 rng(seed);
-std::uniform_real_distribution<mfem::real_t> dist(-1.0, 1.0);
+std::uniform_real_distribution<real_t> dist(-1.0, 1.0);
 
-std::vector<mfem::real_t> p_in(num_steps);
+std::vector<real_t> p_in(num_steps);
 for (auto &value : p_in) { value = dist(rng); }
 ```
 
@@ -361,7 +503,7 @@ $$
 Use the same `seed`, `p_in`, `dot_p_in`, `dt`, duration, window, and FFT
 normalization for the empty duct and every design evaluation.
 
-## 8. Newmark Runner
+## 9. Newmark Runner
 
 Use average-acceleration Newmark:
 
@@ -385,14 +527,14 @@ $$
 Build block offsets:
 
 ```cpp
-mfem::Array<int> offsets(3);
+Array<int> offsets(3);
 offsets[0] = 0;
 offsets[1] = displacement_fes.GetTrueVSize();
 offsets[2] = offsets[1] + pressure_fes.GetTrueVSize();
 
-mfem::BlockVector v(offsets);
-mfem::BlockVector v_dot(offsets);
-mfem::BlockVector v_ddot(offsets);
+BlockVector v(offsets);
+BlockVector v_dot(offsets);
+BlockVector v_ddot(offsets);
 ```
 
 Each step solves:
@@ -442,7 +584,7 @@ Because `M` has `Mpu` and `K` has `Kup`, the coupled system is generally not a
 plain SPD scalar problem. Do not default to CG unless the assembled operator is
 verified symmetric positive definite.
 
-## 9. Outlet FFT And Objective
+## 10. Outlet FFT And Objective
 
 At every time step:
 
@@ -475,7 +617,7 @@ $$
 
 Use nonzero `b`; the paper tested `1e-2`, `1e-3`, and `1e-4`.
 
-## 10. PDE Filter And Optimization Data
+## 11. PDE Filter And Optimization Data
 
 Optimizer chain:
 
@@ -484,7 +626,7 @@ design s
   -> mapped design s_tilde in [-h_e/2, h_e/2]
   -> PDE-filtered physical phi
   -> LevelSet::phi
-  -> mfem::GridFunction phi_h
+  -> GridFunction phi_h
   -> cut quadrature and physics solve
 ```
 
@@ -509,16 +651,16 @@ $$
 MFEM build:
 
 ```cpp
-mfem::ConstantCoefficient one(1.0);
-mfem::ConstantCoefficient r2_coeff(r * r);
-mfem::GridFunctionCoefficient mapped_design_coeff(&mapped_design_h);
+ConstantCoefficient one(1.0);
+ConstantCoefficient r2_coeff(r * r);
+GridFunctionCoefficient mapped_design_coeff(&mapped_design_h);
 
-mfem::BilinearForm filter_a(&level_set_fes);
-filter_a.AddDomainIntegrator(new mfem::MassIntegrator(one));
-filter_a.AddDomainIntegrator(new mfem::DiffusionIntegrator(r2_coeff));
+BilinearForm filter_a(&level_set_fes);
+filter_a.AddDomainIntegrator(new MassIntegrator(one));
+filter_a.AddDomainIntegrator(new DiffusionIntegrator(r2_coeff));
 
-mfem::LinearForm filter_b(&level_set_fes);
-filter_b.AddDomainIntegrator(new mfem::DomainLFIntegrator(mapped_design_coeff));
+LinearForm filter_b(&level_set_fes);
+filter_b.AddDomainIntegrator(new DomainLFIntegrator(mapped_design_coeff));
 ```
 
 Homogeneous Neumann is natural, so no essential marker is needed. This is not
@@ -531,15 +673,17 @@ Important data distinction:
 |---|---|---|
 | Shared app | `LevelSet::design` | optimizer variables, mutable by optimizer |
 | Shared app | `LevelSet::phi` | filtered physical level set, read by solver/exporter |
-| Solver adapter | `mfem::GridFunction phi_h` | MFEM DOF copy of `LevelSet::phi` |
-| Cut integration | `mfem::GridFunctionCoefficient` | point evaluator of `phi_h` |
+| Solver adapter | `GridFunction phi_h` | MFEM DOF copy of `LevelSet::phi` |
+| Cut integration | `GridFunctionCoefficient` | point evaluator of `phi_h` |
 
-## 11. MFEM Syntax Appendix
+## 12. MFEM Syntax Appendix
 
 | Object/API | Arguments | Math role | Data role |
 |---|---|---|---|
 | `Mesh::MakeCartesian2D(nx, ny, QUADRILATERAL, true, lx, ly)` | element counts, element type, boundary flag, lengths | background domain $\Omega_h$ | vertices, elements, boundary attributes |
 | `Mesh::MakeCartesian3D(nx, ny, nz, HEXAHEDRON, lx, ly, lz)` | 3D counts, element type, lengths | 3D background domain | hex mesh storage |
+| `Mesh::CreatePeriodicVertexMapping(translations)` | translation vectors, optional tolerance | periodic identification | maps coincident periodic vertices |
+| `Mesh::MakePeriodic(mesh, v2v)` | original mesh, vertex map | periodic topology | creates mesh with identified periodic DOFs |
 | `H1_FECollection(order, dim)` | polynomial order, dimension | basis family | owns finite element basis definitions |
 | `FiniteElementSpace(&mesh, &fec)` | mesh, collection | scalar space for $p_h$ or $\phi_h$ | global scalar DOF map |
 | `FiniteElementSpace(&mesh, &fec, dim, byVDIM)` | mesh, collection, vector dimension, ordering | vector space for $u_h$ | global vector DOF map |
@@ -571,7 +715,7 @@ Important data distinction:
 | `GetSurfaceWeights(*T, ir, weights)` | transformation, surface rule, output weights | correct interface measure | metric weights for cut surface |
 | `ParaViewDataCollection(name, &mesh)` | collection name, mesh | visualization output | writes mesh and fields |
 
-## 12. Paper Reproduction Defaults
+## 13. Paper Reproduction Defaults
 
 | Parameter | Value |
 |---|---|
