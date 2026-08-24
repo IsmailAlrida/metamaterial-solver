@@ -71,6 +71,15 @@ build.bat parallel-cpu
 build.bat parallel-cpu-cuda
 ```
 
+CUDA presets target the GPU detected during configuration. Override the target
+with CMake's standard architecture switch when building for another GPU:
+
+```bat
+cmake --preset serial-cuda -DCMAKE_CUDA_ARCHITECTURES=89
+```
+
+For example: `86` targets Ampere, `89` targets Ada, and `120` targets Blackwell.
+
 Each backend gets its own build directory:
 
 ```text

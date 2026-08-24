@@ -3,11 +3,14 @@
 #include <vector>
 #include <string> 
 #include "solver.hpp"
-
+#include "coeffs.hpp"
 
 
 using namespace std;
 using namespace mfem;
+
+// move this later outside?
+// TODO: Make comments doxygen-style with math and all to explain ur stuff
 
 
 App::Solver::Solver( LevelSet& lset, SolverResult& result,
@@ -17,6 +20,7 @@ App::Solver::Solver( LevelSet& lset, SolverResult& result,
             )
             : 
             duration(0.2),
+            dt(duration/1000),
             nx(nx),
             ny(ny),
             nz(nz),
@@ -25,8 +29,9 @@ App::Solver::Solver( LevelSet& lset, SolverResult& result,
             problem(problem),
             mesh(nullptr),
             fec(nullptr),
-            scalar_fes(nullptr),
+            pressure_fes(nullptr),
             displacement_fes(nullptr),
+            level_set_fes(nullptr),
             fe_order(0),
             level_set_order(0),
             cut_integration_order(0),
@@ -37,7 +42,7 @@ App::Solver::Solver( LevelSet& lset, SolverResult& result,
 
                 setMesh(nx, ny, nz);
                 (void)solverAlgo;
-}
+            }
 
 App::Solver::~Solver() = default;
 
@@ -57,16 +62,16 @@ bool App::Solver::setMesh(int nx, int ny, int nz, mfem::real_t sx, mfem::real_t 
         return false;
     }
 
-    scalar_fes.reset();
+    pressure_fes.reset();
     displacement_fes.reset();
     fec.reset();
 
     if (nz > 0) {
-        mesh = make_unique<Mesh>(Mesh::MakeCartesian3D(nx, ny, nz, Element::HEXAHEDRON, sx, sy, sz));
+        mesh = make_unique<mesh>(mesh::MakeCartesian3D(nx, ny, nz, Element::HEXAHEDRON, sx, sy, sz));
     }
     else
     {
-        mesh = make_unique<Mesh>(Mesh::MakeCartesian2D(nx, ny, Element::QUADRILATERAL, true, sx, sy));
+        mesh = make_unique<mesh>(mesh::MakeCartesian2D(nx, ny, Element::QUADRILATERAL, true, sx, sy));
     }
 
     this->nx = nx;
@@ -91,8 +96,119 @@ bool App::Solver::assembleSolutionSpace(){
     const int dim = mesh->Dimension();
 
     fec = make_unique<H1_FECollection>(fe_order, dim);
-    scalar_fes = make_unique<FiniteElementSpace>(mesh.get(), fec.get());
+    pressure_fes = make_unique<FiniteElementSpace>(mesh.get(), fec.get());
     displacement_fes = make_unique<FiniteElementSpace>(mesh.get(), fec.get(), dim, Ordering::byVDIM);
+
+    // TODO: How can we construct your mesh from the app levelset?
+    level_set_fes = make_unique<FiniteElementSpace>(mesh.get(), fec.get());
+
+
+    //TODO: later make all below these comments persistent class members
+    Array<int> pressure_boundary_dofs;
+    Array<int> displacment_boundary_dofs;
+    Array<int> level_set_boundary_dofs;
+
+    pressure_fes->GetBoundaryTrueDofs(pressure_boundary_dofs);
+    displacement_fes->GetBoundaryTrueDofs(displacment_boundary_dofs);
+    level_set_fes->GetBoundaryTrueDofs(level_set_boundary_dofs);
+
+    // TODO: ALl needs to be unique_pointered and set as class variables
+    GridFunction phi_h(level_set_fes.get());
+    GridFunction pressure(pressure_fes.get());
+    GridFunction displacement(displacement_fes.get());
+
+
+    // TODO: Here is where we adapt the LevelSet lset into the phi_h grid function
+    phi_h.ProjectCoefficient()
+
+    // because algoimintegrationrules takes the level set as a coefficient
+    GridFunctionCoefficient phi_coeff(&phi_h)
+
+    // All these doubles should be re-evaluted in later steps as mfem ConstantCoeffecients
+    // Well, not CONSTANT coeffecient. We want to have a base coeff, then for the 
+    // Fictitious domain, we want just a spatially varying coeff that is either real or fict
+    // Depending on where it is in the cut
+
+    // Material settings, these should be gotten from the data type structs
+    double epsilon_f; // fictitious contrast
+
+    // Structural domain stuff
+    double rho_s; // Solid Density kg/m^3
+    double E; // Young modulus Pa
+    double nu; // Poisson ratio, which is the weird-looking V you see
+    double mu = E / (2*(1 + nu));    // Shear modulus
+    double lame_ps = (E * nu) / (1 - nu**2);
+    double lame_3D = (E * nu) / ((1 + nu)*(1 - 2*nu));
+
+    // Acoustic domain stuff
+    double rho_a; // Fluid Density kg/m^3
+    double c_a; // sound speed, m/s
+    // FIXME: Use std::pow here
+    double K_a = rho_a * (c_a ** 2); // acoustic bulk modulus, please use std::pow
+    
+    // Only holds if the zeta is equal at both frequencies omega 1 and omega 2
+    // We'll make these configurable from the UI
+    double alpha_d = (2 * zeta * omega_1 * omega_2)/(omega_1 + omega_2); // Rayleigh mass factor, 1/s
+    double beta_d  = (2 * zeta) * (omega_1 + omega_2); // Rayleigh stiffness factor, s
+
+
+    // Rayleigh Params
+
+    // Newmark constants 
+
+    // These are selected to keep the algo UNCONDITIONALLY STABLE
+    double beta_nm = 0.25;
+    double gamma_nm = 0.5;
+
+    double a1 = 1.0 - gamma_nm/beta_nm;
+    double a2 = (1.0 - gamma_nm/(2*beta_nm)) * dt;
+    double a3 = gamma_nm/(beta_nm * dt);
+    double a4 = 1.0 / (beta_nm * dt);
+    double a5 = 1/(2*beta_nm) - 1.0;
+    double a6 = 1 / (beta_nm * dt * dt);
+
+    
+    // Weak form matrix blocks
+    // All these should be unique_pointers initially null in the solver since their 
+    // Construction is stateful
+    // TODO: Reimplement these bad boys in the header file as unique pointers
+    
+
+
+    // We call finalize for all just before the run, better not finalize it when "setting" the thing and tweaking the params
+    
+
+    // You know, maybe we only need to have the final sparse matrix as class-wide, not these
+    // These bad boys can be ressambleed each time
+    // FInal input of this function is that the final discrete system 
+    // Is assembled and ready to go
+    BilinearForm muu_form(displacement_fes.get());
+    BilinearForm Kuu_form(displacement_fes.get());
+    BilinearForm Cuu_form(displacement_fes.get());
+    BilinearForm Mpp_form(pressure_fes.get());
+    BilinearForm Kpp_form(pressure_fes.get());
+    BilinearForm Cpp_form(pressure_fes.get());
+
+    MixedBilinearForm Kup_form(
+        pressure_fes.get(), 
+        displacement_fes.get()
+    );
+    MixedBilinearForm Mpu_form(
+        displacement_fes.get(), 
+        pressure_fes.get()
+    );
+
+
+    mfem::Vector g;
+    mfem::BlockVector h;
+
+
+    // we still need this bad boy to more accurately sample
+    // stuff even in a fictitious domain
+    // See, though we're doing physics on the whole thing, we're more able 
+    // to discern the geometry through cutting, rather than just sampling based on pos/neg
+    // Here, phi_degree is the polynomial degree of which we project the level set coefficient to a gridfunction
+    mfem::AlgoimIntegrationRules solid_rules(cut_order, phi_coeff, phi_degree);
 
     return true;
 }

@@ -4,7 +4,7 @@
 #include <vector>
 #include "global_types.hpp"
 #include "mfem.hpp"
-
+#include "coeffs.hpp"
 
 // Classes like solver, exporter, and optimizer should be stateless
 
@@ -15,7 +15,7 @@ namespace App {
 
         Solver( LevelSet& lset,
                 SolverResult& result,
-                PhysicsProblem& problem,
+                const PhysicsProblem& problem,
                 int nx, int ny = 0, int nz = 0,
                 std::string solverAlgo = "newmark"
             );
@@ -28,9 +28,9 @@ namespace App {
         bool solve();
         bool bindToGlvis(std::string host, int port);
         void setSimDuration(float val);
-        void getSimDuration(float val);
+        float getSimDuration();
         void setProblem(std::string prob);
-        void getProblem(std::string prob);
+        std::string getProblem();
 
 
 
@@ -38,7 +38,9 @@ namespace App {
         // TODO: Come up with better return types for these
 
 
-        float duration;
+        // these are settings derived from the UI, and lset is the global data structure key to the app
+        double duration;
+        double dt;
         int nx;
         int ny;
         int nz;
@@ -48,14 +50,22 @@ namespace App {
 
         std::unique_ptr<mfem::Mesh> mesh;
         std::unique_ptr<mfem::H1_FECollection> fec;
-        std::unique_ptr<mfem::FiniteElementSpace> scalar_fes;
+        std::unique_ptr<mfem::FiniteElementSpace> pressure_fes;
         std::unique_ptr<mfem::FiniteElementSpace> displacement_fes;
+        std::unique_ptr<mfem::FiniteElementSpace> level_set_fes;
+
         int fe_order;
         int level_set_order;
         int cut_integration_order;
         mfem::real_t sx;
         mfem::real_t sy;
         mfem::real_t sz;
+
+        // Newmark discrete matrices. What else should be classwide? the state vectors?
+        std::unique_ptr<mfem::SparseMatrix> M;
+        std::unique_ptr<mfem::SparseMatrix> C;
+        std::unique_ptr<mfem::SparseMatrix> K;
+
 
 
 

@@ -4,7 +4,11 @@
     {
       "name": "base",
       "hidden": true,
+      "generator": "Ninja",
       "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": true,
+        "CMAKE_POLICY_VERSION_MINIMUM": "3.5",
         "METAMATERIAL_DEPS_ONLY": "OFF"
       }
     },
@@ -21,6 +25,7 @@
       "inherits": "base",
       "binaryDir": "${sourceDir}/build/serial-cuda",
       "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "native",
         "METAMATERIAL_MFEM_BACKEND": "serial-cuda"
       }
     },
@@ -37,6 +42,7 @@
       "inherits": "base",
       "binaryDir": "${sourceDir}/build/parallel-cpu-cuda",
       "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "native",
         "METAMATERIAL_MFEM_BACKEND": "parallel-cpu-cuda"
       }
     },
