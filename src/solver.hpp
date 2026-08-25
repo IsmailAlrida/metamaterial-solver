@@ -16,7 +16,7 @@ namespace App {
         Solver( LevelSet& lset,
                 SolverResult& result,
                 const PhysicsProblem& problem,
-                int nx, int ny = 0, int nz = 0,
+                int nx, int ny = 0, int nz = 0, 
                 std::string solverAlgo = "newmark"
             );
 
@@ -46,7 +46,7 @@ namespace App {
         int nz;
         LevelSet& lset;
         SolverResult& result;
-        PhysicsProblem& problem;
+        const PhysicsProblem& problem;
 
         std::unique_ptr<mfem::Mesh> mesh;
         std::unique_ptr<mfem::H1_FECollection> fec;

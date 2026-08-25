@@ -1,3 +1,5 @@
+#pragma once
+
 #include "mfem.hpp"
 #include <iostream>
 #include <string>

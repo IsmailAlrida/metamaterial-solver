@@ -1,4 +1,5 @@
 #include <mfem.hpp>
+#include <cmath>
 #include <iostream>
 #include <vector>
 #include <string> 
@@ -6,17 +7,18 @@
 #include "coeffs.hpp"
 
 
-using namespace std;
 using namespace mfem;
 
 // move this later outside?
 // TODO: Make comments doxygen-style with math and all to explain ur stuff
 
 
-App::Solver::Solver( LevelSet& lset, SolverResult& result,
-                PhysicsProblem& problem,
-                int nx, int ny, int nz,
-                string solverAlgo
+App::Solver::Solver( 
+            LevelSet& lset, 
+            SolverResult& result, 
+            const PhysicsProblem& problem,
+            int nx, int ny, int nz,
+            std::string solverAlgo
             )
             : 
             duration(0.2),
@@ -54,7 +56,7 @@ bool App::Solver::setMesh(int nx, int ny, int nz, mfem::real_t sx, mfem::real_t 
     }
 
     if (ny == 0 && nz == 0) {
-        cout << "1D not yet lol." << endl;
+        std::cout << "1D not yet lol." << std::endl;
         return false;
     }
 
@@ -67,11 +69,11 @@ bool App::Solver::setMesh(int nx, int ny, int nz, mfem::real_t sx, mfem::real_t 
     fec.reset();
 
     if (nz > 0) {
-        mesh = make_unique<mesh>(mesh::MakeCartesian3D(nx, ny, nz, Element::HEXAHEDRON, sx, sy, sz));
+        mesh = std::make_unique<Mesh>(Mesh::MakeCartesian3D(nx, ny, nz, Element::HEXAHEDRON, sx, sy, sz));
     }
     else
     {
-        mesh = make_unique<mesh>(mesh::MakeCartesian2D(nx, ny, Element::QUADRILATERAL, true, sx, sy));
+        mesh = std::make_unique<Mesh>(Mesh::MakeCartesian2D(nx, ny, Element::QUADRILATERAL, true, sx, sy));
     }
 
     this->nx = nx;
@@ -95,12 +97,12 @@ bool App::Solver::assembleSolutionSpace(){
 
     const int dim = mesh->Dimension();
 
-    fec = make_unique<H1_FECollection>(fe_order, dim);
-    pressure_fes = make_unique<FiniteElementSpace>(mesh.get(), fec.get());
-    displacement_fes = make_unique<FiniteElementSpace>(mesh.get(), fec.get(), dim, Ordering::byVDIM);
+    fec = std::make_unique<H1_FECollection>(fe_order, dim);
+    pressure_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get());
+    displacement_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get(), dim, Ordering::byVDIM);
 
     // TODO: How can we construct your mesh from the app levelset?
-    level_set_fes = make_unique<FiniteElementSpace>(mesh.get(), fec.get());
+    level_set_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get());
 
 
     //TODO: later make all below these comments persistent class members
@@ -119,10 +121,10 @@ bool App::Solver::assembleSolutionSpace(){
 
 
     // TODO: Here is where we adapt the LevelSet lset into the phi_h grid function
-    phi_h.ProjectCoefficient()
+    phi_h.ProjectCoefficient();
 
     // because algoimintegrationrules takes the level set as a coefficient
-    GridFunctionCoefficient phi_coeff(&phi_h)
+    GridFunctionCoefficient phi_coeff(&phi_h);
 
     // All these doubles should be re-evaluted in later steps as mfem ConstantCoeffecients
     // Well, not CONSTANT coeffecient. We want to have a base coeff, then for the 
@@ -137,14 +139,14 @@ bool App::Solver::assembleSolutionSpace(){
     double E; // Young modulus Pa
     double nu; // Poisson ratio, which is the weird-looking V you see
     double mu = E / (2*(1 + nu));    // Shear modulus
-    double lame_ps = (E * nu) / (1 - nu**2);
+    double lame_ps = (E * nu) / (1 - std::pow(nu, 2));
     double lame_3D = (E * nu) / ((1 + nu)*(1 - 2*nu));
 
     // Acoustic domain stuff
     double rho_a; // Fluid Density kg/m^3
     double c_a; // sound speed, m/s
     // FIXME: Use std::pow here
-    double K_a = rho_a * (c_a ** 2); // acoustic bulk modulus, please use std::pow
+    double K_a = rho_a * std::pow(c_a, 2); // acoustic bulk modulus
     
     // Only holds if the zeta is equal at both frequencies omega 1 and omega 2
     // We'll make these configurable from the UI
@@ -208,7 +210,7 @@ bool App::Solver::assembleSolutionSpace(){
     // See, though we're doing physics on the whole thing, we're more able 
     // to discern the geometry through cutting, rather than just sampling based on pos/neg
     // Here, phi_degree is the polynomial degree of which we project the level set coefficient to a gridfunction
-    mfem::AlgoimIntegrationRules solid_rules(cut_order, phi_coeff, phi_degree);
+    mfem::AlgoimIntegrationRules solid_rules(cut_integration_order, phi_coeff, level_set_order);
 
     return true;
 }
@@ -218,23 +220,26 @@ bool App::Solver::solve(){
     return false;
 }
 
-bool App::Solver::bindToGlvis(string host, int port){
+bool App::Solver::bindToGlvis(std::string host, int port){
     return false;
 }
 
 void App::Solver::setSimDuration(float val){
 }
 
-void App::Solver::getSimDuration(float val){
-    (void)val;
+float App::Solver::getSimDuration(){
+    float val = 0.0;
+    return val;
 }
 
-void App::Solver::setProblem(string prob){
+void App::Solver::setProblem(std::string prob){
     (void)prob;
 }
 
-void App::Solver::getProblem(string prob){
-    (void)prob;
+std::string App::Solver::getProblem(){
+    std::string prob = "hi";
+    
+    return prob;
 }
 
 bool App::Solver::setup(){
