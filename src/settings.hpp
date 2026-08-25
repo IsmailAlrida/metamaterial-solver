@@ -38,6 +38,16 @@ struct SettingEntry {
 
 // TODO: Add more to this, and this is where setting entries get used.
 struct VibroacousticSettings {
+    float rho_s;
+    float rho_a;
+
+    // Rayleigh damping
+    float alpha_d;
+    float beta_d;
+
+    // Epsilon
+    float epsilon
+    
 
 };
 
@@ -55,14 +65,28 @@ struct OptimizerSettings {
 
 };
 
-struct AppSettings {
-    PhysicsProblem problem;
-    SolverDevice device;
+// TODO: For all settings, pick default app values.
+struct SolverSettings {
     int nx;
-    int ny;
+    int ny; 
     int nz;
-    PhysicsSettings phySettings;
+    std::string algo;
+    PhysicsSettings physics;
+    SolverDevice device; 
+    
+};
+
+struct ExporterSettings {
+    // I dont know what to put here
+    // yet, but this will have something to do with the meshing
+
+
+};
+
+struct AppSettings {
+    SolverSettings solverSettings;
     OptimizerSettings optSettings;
+    ExporterSettings exporterSettings;
 };
 
 struct DesignSettings {

@@ -75,7 +75,7 @@ struct LevelSet {
         return static_cast<std::size_t>(i)
                 + static_cast<std::size_t>(nx)
                     * (static_cast<std::size_t>(j)
-                    + static_cast<std::size_t>(ny) * k);
+                        + static_cast<std::size_t>(ny) * k);
     }
 
 
