@@ -7,7 +7,7 @@
 #include "mfem.hpp"
 #include "settings.hpp"
 
-// TODO: Make this a classthat 
+// TODO: Make this a class that extends 
 struct LevelSet {
     int dim; 
     int nx, ny, nz;

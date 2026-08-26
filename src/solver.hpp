@@ -8,7 +8,6 @@
 
 // Classes like solver, exporter, and optimizer should be stateless
 
-namespace App {
     class Solver {
 
     public:
@@ -22,10 +21,10 @@ namespace App {
 
         ~Solver();
 
-        bool setup();
-        bool setMesh(int nx, int ny = 0, int nz = 0, mfem::real_t sx = 1.0, mfem::real_t sy = 1.0, mfem::real_t sz = 1.0);
-        bool assembleSolutionSpace();
-        bool solve();
+        void setup();
+        void setMesh(int nx, int ny = 0, int nz = 0, mfem::real_t sx = 1.0, mfem::real_t sy = 1.0, mfem::real_t sz = 1.0);
+        void assembleSolutionSpace();
+        void solve();
         bool bindToGlvis(std::string host, int port);
         void setSimDuration(float val);
         float getSimDuration();
@@ -70,4 +69,3 @@ namespace App {
 
 
     };
-};

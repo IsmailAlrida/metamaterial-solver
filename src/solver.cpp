@@ -12,7 +12,7 @@ using namespace mfem;
 // move this later outside?
 // TODO: Make comments doxygen-style with math and all to explain ur stuff
 
-
+// TODO: Namespace all classes to App please, because here solver is ambigous, so let;s generalize it
 App::Solver::Solver( 
             LevelSet& lset, 
             SolverResult& result, 

@@ -3,6 +3,7 @@
 #include <map> 
 #include <utility>
 #include <stdexcept>
+#include <memory>
 #include "global_types.hpp"
 #include "renderer.hpp"
 #include "optimizer.hpp"
@@ -17,12 +18,13 @@ int main() {
     // Construct with default settings.
     // TODO: Make App settings construct defaults
     // TODO: Also instantiate these objects as unique pointers
-    AppSettings settings; 
-    SolverResult result;
+    auto settings = std::make_unique<AppSettings>(); 
+    auto result   = std::make_unique<SolverResult>();
 
     // TODO: This needs an initial guess constructor to construct the first lset guess
     // Probably an equally spaced square grid of cylinders/circles with some radius each; basically a sonic crystal whose shape we can weakly try to guess from the bandgap. Or just hardocde a single crystal structure. how about that?
-    LevelSet lset;
+    auto lset     = std::make_unique<LevelSet>();
+
 
     Renderer renderer = Renderer(settings);
     renderer.setup();

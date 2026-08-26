@@ -25,6 +25,7 @@
             void setup();
             void displayFrame();
             void GlvisPanel();
+            void log(std::string msg);
 
             
 

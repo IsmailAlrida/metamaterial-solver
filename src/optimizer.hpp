@@ -3,5 +3,7 @@
 class Optimizer {
     public:
 
+
+        void optimize();
     private:
 };
