@@ -7,10 +7,13 @@ namespace App {
 class Exporter {
     
     public:
-        Exporter();
-        bool export(const LevelSet& geometry, std::string targetPlatform);
+        Exporter(const ExporterSettings& settings,
+                 const LevelSet& geometry);
+        bool exportMesh();
 
     private:
+        const ExporterSettings& settings;
+        const LevelSet& geometry;
 
 };
 

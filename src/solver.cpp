@@ -1,10 +1,6 @@
-#include <mfem.hpp>
 #include <cmath>
 #include <iostream>
-#include <vector>
-#include <string> 
 #include "solver.hpp"
-#include "coeffs.hpp"
 
 
 using namespace mfem;
@@ -12,23 +8,15 @@ using namespace mfem;
 // move this later outside?
 // TODO: Make comments doxygen-style with math and all to explain ur stuff
 
-// TODO: Namespace all classes to App please, because here solver is ambigous, so let;s generalize it
 App::Solver::Solver( 
+            const App::SolverSettings& settings,
             App::LevelSet& lset,
-            App::SolverResult& result,
-            const App::PhysicsProblem& problem,
-            int nx, int ny, int nz,
-            std::string solverAlgo
+            App::SolverResult& result
             )
             : 
-            duration(0.2),
-            dt(duration/1000),
-            nx(nx),
-            ny(ny),
-            nz(nz),
+            settings(settings),
             lset(lset),
             result(result),
-            problem(problem),
             mesh(nullptr),
             fec(nullptr),
             pressure_fes(nullptr),
@@ -36,30 +24,24 @@ App::Solver::Solver(
             level_set_fes(nullptr),
             fe_order(0),
             level_set_order(0),
-            cut_integration_order(0),
-            sx(1.0),
-            sy(1.0),
-            sz(1.0)
+            cut_integration_order(0)
             {
-
-                setMesh(nx, ny, nz);
-                (void)solverAlgo;
             }
 
 App::Solver::~Solver() = default;
 
-//todo: do something about the mixed camelCase and snake_case. Choose one.
-// todo: but better, you do realize we can just call set mesh reading from the same settings object? 
-// I want the functions of the solvers to be argumentless, as we will extract all the necessary infromation
-// Directly from the settings.
+// TODO: Do something about the mixed camelCase and snake_case. Choose one.
 // Given for this iteration we will run the following sequentially
 /* setMesh --> assembleSolutionSpace --> solve*/
-// We can think later about setters/getters from the UI so we incrementally change different parts of it?
-// Its unnecessary, a lot of these functions are unncessary beyond internal orchestration. Fine we'll go with sequentially doing everything one at a time
 // i doubt the bottleneck is in setting the mesh as much as it is in the actual forward solves
-// Chatgpt please refactor it so that the solver consumes SolverSettings reference from the AppSettings, and we decompose the solver settings to replace 
-// What we normally pass as arguments. Please make sure every sister class like this follows the same pattern
-bool App::Solver::setMesh(int nx, int ny, int nz, mfem::real_t sx, mfem::real_t sy, mfem::real_t sz) {
+bool App::Solver::setMesh() {
+
+    const int nx = settings.nx;
+    const int ny = settings.ny;
+    const int nz = settings.nz;
+    const mfem::real_t sx = settings.sx;
+    const mfem::real_t sy = settings.sy;
+    const mfem::real_t sz = settings.sz;
 
     if (nx <= 0 || ny < 0 || nz < 0 || sx <= 0.0 || sy <= 0.0 || sz <= 0.0) {
         return false;
@@ -86,12 +68,6 @@ bool App::Solver::setMesh(int nx, int ny, int nz, mfem::real_t sx, mfem::real_t 
         mesh = std::make_unique<Mesh>(Mesh::MakeCartesian2D(nx, ny, Element::QUADRILATERAL, true, sx, sy));
     }
 
-    this->nx = nx;
-    this->ny = ny;
-    this->nz = nz;
-    this->sx = sx;
-    this->sy = sy;
-    this->sz = sz;
     fe_order = 1;
     level_set_order = 1;
     cut_integration_order = 4;
@@ -101,7 +77,7 @@ bool App::Solver::setMesh(int nx, int ny, int nz, mfem::real_t sx, mfem::real_t 
 
 bool App::Solver::assembleSolutionSpace(){
 
-    if (!mesh || fe_order <= 0) {
+    if (!mesh || fe_order <= 0 || settings.dt <= 0.0) {
         return false;
     }
 
@@ -131,7 +107,7 @@ bool App::Solver::assembleSolutionSpace(){
 
 
     // TODO: Here is where we adapt the LevelSet lset into the phi_h grid function
-    phi_h.ProjectCoefficient();
+    // phi_h.ProjectCoefficient(/* LevelSet coefficient */);
 
     // because algoimintegrationrules takes the level set as a coefficient
     GridFunctionCoefficient phi_coeff(&phi_h);
@@ -141,27 +117,33 @@ bool App::Solver::assembleSolutionSpace(){
     // Fictitious domain, we want just a spatially varying coeff that is either real or fict
     // Depending on where it is in the cut
 
-    // Material settings, these should be gotten from the data type structs
-    double epsilon_f; // fictitious contrast
+    const auto* physics = std::get_if<App::VibroacousticSettings>(&settings.physics);
+    if (physics == nullptr) {
+        return false;
+    }
+
+    // Material settings
+    const double epsilon_f = physics->epsilon; // fictitious contrast
 
     // Structural domain stuff
-    double rho_s; // Solid Density kg/m^3
-    double E; // Young modulus Pa
-    double nu; // Poisson ratio, which is the weird-looking V you see
-    double mu = E / (2*(1 + nu));    // Shear modulus
-    double lame_ps = (E * nu) / (1 - std::pow(nu, 2));
-    double lame_3D = (E * nu) / ((1 + nu)*(1 - 2*nu));
+    const double rho_s = physics->rho_s; // Solid Density kg/m^3
+    const double E = physics->youngs_modulus; // Young modulus Pa
+    const double nu = physics->poisson_ratio; // Poisson ratio, which is the weird-looking V you see
+    const double mu = E / (2*(1 + nu));    // Shear modulus
+    const double lame_ps = (E * nu) / (1 - std::pow(nu, 2));
+    const double lame_3D = (E * nu) / ((1 + nu)*(1 - 2*nu));
 
     // Acoustic domain stuff
-    double rho_a; // Fluid Density kg/m^3
-    double c_a; // sound speed, m/s
-    // FIXME: Use std::pow here
-    double K_a = rho_a * std::pow(c_a, 2); // acoustic bulk modulus
+    const double rho_a = physics->rho_a; // Fluid Density kg/m^3
+    const double c_a = physics->c_a; // sound speed, m/s
+    const double K_a = rho_a * std::pow(c_a, 2); // acoustic bulk modulus
     
     // Only holds if the zeta is equal at both frequencies omega 1 and omega 2
     // We'll make these configurable from the UI
-    double alpha_d = (2 * zeta * omega_1 * omega_2)/(omega_1 + omega_2); // Rayleigh mass factor, 1/s
-    double beta_d  = (2 * zeta) * (omega_1 + omega_2); // Rayleigh stiffness factor, s
+    const double omega_1 = 2.0 * std::acos(-1.0) * physics->f1;
+    const double omega_2 = 2.0 * std::acos(-1.0) * physics->f2;
+    const double alpha_d = (2 * physics->zeta * omega_1 * omega_2)/(omega_1 + omega_2); // Rayleigh mass factor, 1/s
+    const double beta_d  = (2 * physics->zeta) / (omega_1 + omega_2); // Rayleigh stiffness factor, s
 
 
     // Rayleigh Params
@@ -173,11 +155,11 @@ bool App::Solver::assembleSolutionSpace(){
     double gamma_nm = 0.5;
 
     double a1 = 1.0 - gamma_nm/beta_nm;
-    double a2 = (1.0 - gamma_nm/(2*beta_nm)) * dt;
-    double a3 = gamma_nm/(beta_nm * dt);
-    double a4 = 1.0 / (beta_nm * dt);
+    double a2 = (1.0 - gamma_nm/(2*beta_nm)) * settings.dt;
+    double a3 = gamma_nm/(beta_nm * settings.dt);
+    double a4 = 1.0 / (beta_nm * settings.dt);
     double a5 = 1/(2*beta_nm) - 1.0;
-    double a6 = 1 / (beta_nm * dt * dt);
+    double a6 = 1 / (beta_nm * settings.dt * settings.dt);
 
     
     // Weak form matrix blocks
@@ -230,26 +212,12 @@ bool App::Solver::solve(){
     return false;
 }
 
-bool App::Solver::bindToGlvis(std::string host, int port){
+bool App::Solver::bindToGlvis(){
+    const std::string& host = settings.glvisHost;
+    const int port = settings.glvisPort;
+    (void)host;
+    (void)port;
     return false;
-}
-
-void App::Solver::setSimDuration(float val){
-}
-
-float App::Solver::getSimDuration(){
-    float val = 0.0;
-    return val;
-}
-
-void App::Solver::setProblem(std::string prob){
-    (void)prob;
-}
-
-std::string App::Solver::getProblem(){
-    std::string prob = "hi";
-    
-    return prob;
 }
 
 bool App::Solver::setup(){

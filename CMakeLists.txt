@@ -50,20 +50,18 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(Eigen3)
 
-# 2. Fetch GLFW
-set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
-set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+# 2. Fetch SDL2
+set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+set(SDL_STATIC ON CACHE BOOL "" FORCE)
+set(SDL_TEST OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
-  glfw
-  GIT_REPOSITORY https://github.com/glfw/glfw.git
-  GIT_TAG        3.4
-  SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/glfw-src"
-  BINARY_DIR     "${CMAKE_BINARY_DIR}/deps/glfw-build"
-  OVERRIDE_FIND_PACKAGE
+  SDL2
+  GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+  GIT_TAG        release-2.32.10
+  SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/sdl2-src"
+  BINARY_DIR     "${CMAKE_BINARY_DIR}/deps/sdl2-build"
 )
-FetchContent_MakeAvailable(glfw)
+FetchContent_MakeAvailable(SDL2)
 
 # 3. Fetch Assimp
 set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -220,7 +218,7 @@ endif()
 
 add_executable(metamaterial_app 
     ${sources} 
-    ${IMGUI_DIR}/backends/imgui_impl_glfw.cpp 
+    ${IMGUI_DIR}/backends/imgui_impl_sdl2.cpp
     ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp 
     ${IMGUI_DIR}/imgui.cpp 
     ${IMGUI_DIR}/imgui_draw.cpp 
@@ -243,13 +241,17 @@ target_include_directories(metamaterial_app PRIVATE
 # Link all targets cleanly
 # MFEM injects its internal include paths automatically when linked as PRIVATE
 target_link_libraries(metamaterial_app PRIVATE 
-    glfw 
+    SDL2::SDL2
     OpenGL::GL
     assimp
     Eigen3::Eigen
     fftw3
     mfem         # Enforces direct linkage to the compiled MFEM static library
 )
+
+if(TARGET SDL2::SDL2main)
+  target_link_libraries(metamaterial_app PRIVATE SDL2::SDL2main)
+endif()
 
 if(METAMATERIAL_MFEM_BACKEND MATCHES "parallel-cpu" AND TARGET fftw3_omp)
   target_link_libraries(metamaterial_app PRIVATE fftw3_omp)

@@ -1,12 +1,9 @@
 #pragma once
 #include <memory>
-#include <string> 
-#include <vector>
 #include "global_types.hpp"
 #include "mfem.hpp"
-#include "coeffs.hpp"
 
-// Classes like solver, exporter, and optimizer should be stateless
+// Business objects retain references to top-level app data instead of owning snapshots.
 
 namespace App {
 
@@ -14,24 +11,17 @@ namespace App {
 
     public:
 
-        Solver( LevelSet& lset,
-                SolverResult& result,
-                const PhysicsProblem& problem,
-                int nx, int ny = 0, int nz = 0, 
-                std::string solverAlgo = "newmark"
-            );
+        Solver(const SolverSettings& settings,
+               LevelSet& lset,
+               SolverResult& result);
 
         ~Solver();
 
-        void setup();
-        void setMesh(int nx, int ny = 0, int nz = 0, mfem::real_t sx = 1.0, mfem::real_t sy = 1.0, mfem::real_t sz = 1.0);
-        void assembleSolutionSpace();
-        void solve();
-        bool bindToGlvis(std::string host, int port);
-        void setSimDuration(float val);
-        float getSimDuration();
-        void setProblem(std::string prob);
-        std::string getProblem();
+        bool setup();
+        bool setMesh();
+        bool assembleSolutionSpace();
+        bool solve();
+        bool bindToGlvis();
 
 
 
@@ -39,15 +29,10 @@ namespace App {
         // TODO: Come up with better return types for these
 
 
-        // these are settings derived from the UI, and lset is the global data structure key to the app
-        double duration;
-        double dt;
-        int nx;
-        int ny;
-        int nz;
+        // Settings are edited by the UI and read at the start of each sequential solver step.
+        const SolverSettings& settings;
         LevelSet& lset;
         SolverResult& result;
-        const PhysicsProblem& problem;
 
         std::unique_ptr<mfem::Mesh> mesh;
         std::unique_ptr<mfem::H1_FECollection> fec;
@@ -58,9 +43,6 @@ namespace App {
         int fe_order;
         int level_set_order;
         int cut_integration_order;
-        mfem::real_t sx;
-        mfem::real_t sy;
-        mfem::real_t sz;
 
         // Newmark discrete matrices. What else should be classwide? the state vectors?
         std::unique_ptr<mfem::SparseMatrix> M;

@@ -191,6 +191,7 @@ void Renderer::displayFrame()
     ImGui::NewFrame();
 
     ImGui::DockSpaceOverViewport();
+    GlvisPanel();
     LogPanel();
 
     ImGui::Render();
@@ -213,6 +214,18 @@ void Renderer::displayFrame()
     }
 
     SDL_GL_SwapWindow(window);
+}
+
+void Renderer::GlvisPanel()
+{
+    if (!ImGui::Begin("Visualization")) {
+        ImGui::End();
+        return;
+    }
+
+    // TODO: Embed GLVis here while preserving its existing network stream API.
+    ImGui::TextDisabled("GLVis visualization is not connected yet.");
+    ImGui::End();
 }
 
 void Renderer::applyGlobalStyle(float scale)
