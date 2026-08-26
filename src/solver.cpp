@@ -115,10 +115,15 @@ bool App::Solver::assembleSolutionSpace(){
     level_set_fes->GetBoundaryTrueDofs(level_set_boundary_dofs);
 
 
-    auto design = lset.design;
-    const real_t he = std::min({hx, hy, hz});
-    auto mapped_design = (design.operator+=(5.0)).operator*=(he);
-    
+    const real_t he = mesh->GetElementSize(0, 1);
+
+    Vector mapped_design(lset.design);
+    mapped_design -= 0.5;
+    mapped_design *= he;
+
+    GridFunction mapped_design_h(level_set_fes.get());
+    mapped_design_h.SetFromTrueDofs(mapped_design);
+
     // Sample code for how we can get center DOFs
     Vector center_design_values(mesh->GetNE());
     for (int element = 0; element < mesh->GetNE(); element++){
@@ -128,7 +133,7 @@ bool App::Solver::assembleSolutionSpace(){
         // Get the point in the center of the shape
         const IntegrationPoint& center = Geometries.GetCenter(geometry);
         // Let the GridFunction of the shifted design variable inter
-        center_design_values[element] = mapped_design.GetValue(element, center);
+        center_design_values[element] = mapped_design_h.GetValue(element, center);
 
     };
 

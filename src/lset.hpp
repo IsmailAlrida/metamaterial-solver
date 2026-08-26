@@ -15,11 +15,21 @@ namespace App {
 class LevelSet {
 
     public:
+
+        // Apparenlty the member initilaizer constructs the members with the args passed to it as you see
+
+        explicit LevelSet(mfem::FiniteElementSpace& fes)
+        :
+        design(fes.GetTrueVSize()),
+        phi(&fes)
+        {
+
+        }
         
         mfem::Vector design;
         mfem::GridFunction phi;
 
-        
+
 };
 
 
