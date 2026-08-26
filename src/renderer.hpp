@@ -98,10 +98,15 @@ namespace App {
                 rho_s
                 rho_a
                 nx, ny, nz
+                sx, sy, sz
                 Short text telling ppl that making nz = 0 makes it 2D
                 smoothing filter radius
                 Hanning window FFT settings
                 Physics problem selection
+                and basically all you see in teh current app settings that is tunable
+                would be nice to have a checkbox to toggle between isotropic and an
+                for isotropic, we can just put only s and n instead of the xyz,
+                for anisotropic, we can just unlock the UI and let them edit the nx,ny,nz,sx,sy,sz
                 
 
             */

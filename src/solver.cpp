@@ -82,6 +82,14 @@ bool App::Solver::setMesh() {
 
 bool App::Solver::assembleSolutionSpace(){
 
+    // TODO: Fix the inconsistent use of floats, doubles, and mfem real_ts in the codebase.
+    const real_t sx = settings.sx;
+    const real_t sy = settings.sy;
+    const real_t sz = settings.sz;
+    const double hx = settings.sx / settings.nx;
+    const double hy = settings.sy / settings.ny;
+    const double hz = settings.sz / settings.nz;
+
     if (!mesh || fe_order <= 0 || settings.dt <= 0.0) {
         log(App::LogLevel::Error, "Cannot assemble the solution space: mesh, finite-element order, or time step is invalid.");
         return false;
@@ -105,6 +113,25 @@ bool App::Solver::assembleSolutionSpace(){
     pressure_fes->GetBoundaryTrueDofs(pressure_boundary_dofs);
     displacement_fes->GetBoundaryTrueDofs(displacment_boundary_dofs);
     level_set_fes->GetBoundaryTrueDofs(level_set_boundary_dofs);
+
+
+    auto design = lset.design;
+    const real_t he = std::min({hx, hy, hz});
+    auto mapped_design = (design.operator+=(5.0)).operator*=(he);
+    
+    // Sample code for how we can get center DOFs
+    Vector center_design_values(mesh->GetNE());
+    for (int element = 0; element < mesh->GetNE(); element++){
+        
+        // Get the base shape of the cell
+        const Geometry::Type geometry = mesh->GetElementBaseGeometry(element);
+        // Get the point in the center of the shape
+        const IntegrationPoint& center = Geometries.GetCenter(geometry);
+        // Let the GridFunction of the shifted design variable inter
+        center_design_values[element] = mapped_design.GetValue(element, center);
+
+    };
+
 
     // TODO: ALl needs to be unique_pointered and set as class variables
     GridFunction phi_h(level_set_fes.get());
@@ -138,25 +165,23 @@ bool App::Solver::assembleSolutionSpace(){
     const double nu = physics->poisson_ratio; // Poisson ratio, which is the weird-looking V you see
     const double mu = E / (2*(1 + nu));    // Shear modulus
     const double lame_ps = (E * nu) / (1 - std::pow(nu, 2));
-    const double lame_3D = (E * nu) / ((1 + nu)*(1 - 2*nu));
+    const double lame_3D = (E * nu) / ((1 + nu)*(1 - 2*nu)); // FIXME: If-gate the lame coefficient
 
     // Acoustic domain stuff
     const double rho_a = physics->rho_a; // Fluid Density kg/m^3
     const double c_a = physics->c_a; // sound speed, m/s
     const double K_a = rho_a * std::pow(c_a, 2); // acoustic bulk modulus
-    
-    // Only holds if the zeta is equal at both frequencies omega 1 and omega 2
-    // We'll make these configurable from the UI
+
+    // Funny how C++ 17 doesnt have PI. Like how do you not have PI for 20 generations of C++?
+    // Rayleigh Parameters
     const double omega_1 = 2.0 * std::acos(-1.0) * physics->f1;
     const double omega_2 = 2.0 * std::acos(-1.0) * physics->f2;
     const double alpha_d = (2 * physics->zeta * omega_1 * omega_2)/(omega_1 + omega_2); // Rayleigh mass factor, 1/s
     const double beta_d  = (2 * physics->zeta) / (omega_1 + omega_2); // Rayleigh stiffness factor, s
 
 
-    // Rayleigh Params
 
     // Newmark constants 
-
     // These are selected to keep the algo UNCONDITIONALLY STABLE
     double beta_nm = 0.25;
     double gamma_nm = 0.5;
