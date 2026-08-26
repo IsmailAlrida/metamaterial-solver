@@ -2,7 +2,11 @@
 
 namespace App {
 
-Executor::Executor() = default;
+Executor::Executor(const LogFunction& log)
+    : log(log)
+{
+}
+
 Executor::~Executor() = default;
 
 } // namespace App

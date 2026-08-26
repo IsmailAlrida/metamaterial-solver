@@ -1,5 +1,4 @@
 #pragma once
-#include <iostream>
 #include <stdexcept>
 #include <utility>
 #include <variant>
@@ -11,7 +10,7 @@
 #include "exporter.hpp"  
 #include "executor.hpp"  
 #include "error.hpp"
-#include "renderer.hpp"
+#include "logging.hpp"
 
 namespace App {
 
@@ -29,7 +28,7 @@ class Dispatcher {
             Optimizer& optimizer, 
             Exporter& exporter, 
             ErrorHandler& error_handler, 
-            Callback& log
+            const LogFunction& log
         );
         ~Dispatcher();
 
@@ -38,19 +37,13 @@ class Dispatcher {
         Exporter& exporter;
         Executor& executor;
         ErrorHandler& error_handler;
-        Callback& log;
+        const LogFunction& log;
 
         // FYI: We get the pair bad boys from the utility module
         // TODO: Switch this to a flat array later for less memory fragmentation cuz like... maps be everywhere in the ram
 
         std::map<std::pair<State, Event>, std::pair<State, Callback>> transitions = {
             {{State::Idle, Event::Start}, {State::Solving, [this](){
-                //TODO: Idea, let's NOT make these voids, we can do log() whatever comes
-                // out of them. Or even better yet it wont it be nice to have a streaming handle
-                // To pass to the solver/opt/etc.... on init where they can stream to a dockable imgui terminal monitor?
-                // you get me? So internally all the boys can just do something like log(message). We dont need to pass the whole renderer
-                // Just the log function. I know we SHOULD do queues if this were a proper logger, but we're executing stuff sequentially 
-                // So i think we can get away with direct publications to some message vector thing the imgui terminal can iterate over
                 solver.setMesh();
                 solver.assembleSolutionSpace();
                 solver.solve();
@@ -75,8 +68,6 @@ class Dispatcher {
 
             }}},
             {{State::Optimizing, Event::OptConverged}, {State::Solving, [this](){
-                // At this point we really need to find a way to post messages 
-                // To the renderer. You know what let's pass it in
             }}},
             {{State::Optimizing, Event::OptSuccess}, {State::Done, [this](){
 
@@ -116,8 +107,7 @@ class Dispatcher {
                 executor.execute(sf.second);
                 return sf.first;
             } catch(const std::exception& err) {
-                // Fixed \n to be inside quotes
-                std::cerr << err.what() << "\n";
+                log(LogLevel::Error, err.what());
                 return State::Error;
             }
         } 

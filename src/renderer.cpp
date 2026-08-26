@@ -366,12 +366,11 @@ void Renderer::loadFonts()
     io.FontDefault = uiFont;
 }
 
-void Renderer::log(std::string msg)
+void Renderer::log(LogLevel level, std::string msg)
 {
     // I mean cool mutex, tho i want a ring buffer, lock-free and threadsafe
     std::lock_guard<std::mutex> lock(logMutex);
-    logBuffer.append(std::move(msg));
-    logBuffer.push_back('\n');
+    logEntries.push_back({level, std::move(msg)});
     logScrollToBottom = true;
 }
 
@@ -384,12 +383,11 @@ void Renderer::LogPanel()
 
     if (ImGui::Button("Clear")) {
         std::lock_guard<std::mutex> lock(logMutex);
-        logBuffer.clear();
+        logEntries.clear();
     }
 
     ImGui::Separator();
     ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(0, 0, 0, 255));
-    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(230, 230, 230, 255));
 
     if (ImGui::BeginChild("##console-output", ImVec2(0, 0), false,
                           ImGuiWindowFlags_HorizontalScrollbar)) {
@@ -397,8 +395,21 @@ void Renderer::LogPanel()
         bool scrollToBottom = false;
         {
             std::lock_guard<std::mutex> lock(logMutex);
-            ImGui::TextUnformatted(logBuffer.c_str(),
-                                   logBuffer.c_str() + logBuffer.size());
+            for (const LogEntry& entry : logEntries) {
+                const char* label = "MESSAGE";
+                ImVec4 color(0.82f, 0.86f, 0.92f, 1.0f);
+
+                if (entry.level == LogLevel::Warning) {
+                    label = "WARNING";
+                    color = ImVec4(0.95f, 0.72f, 0.28f, 1.0f);
+                }
+                else if (entry.level == LogLevel::Error) {
+                    label = "ERROR";
+                    color = ImVec4(1.0f, 0.38f, 0.38f, 1.0f);
+                }
+
+                ImGui::TextColored(color, "[%s] %s", label, entry.message.c_str());
+            }
             scrollToBottom = logScrollToBottom;
             logScrollToBottom = false;
         }
@@ -410,7 +421,7 @@ void Renderer::LogPanel()
     }
 
     ImGui::EndChild();
-    ImGui::PopStyleColor(2);
+    ImGui::PopStyleColor();
     ImGui::End();
 }
 

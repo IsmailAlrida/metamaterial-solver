@@ -2,10 +2,12 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include "executor.hpp"
 #include "exporter.hpp"
 #include "global_types.hpp"
+#include "logging.hpp"
 #include "optimizer.hpp"
 #include "renderer.hpp"
 #include "solver.hpp"
@@ -43,23 +45,29 @@ int main(int, char**)
 
         // Keep the renderer alive longer than the computers that will publish to it.
         auto renderer = std::make_unique<App::Renderer>(appSettings);
+        App::LogFunction log = [&renderer](App::LogLevel level, std::string message) {
+            renderer->log(level, std::move(message));
+        };
 
         // in opt, result is const, not edited.
         auto optimizer = std::make_unique<App::Optimizer>(
             optimizerSettings,
             geometry,
-            solverResult);
+            solverResult,
+            log);
         auto solver = std::make_unique<App::Solver>(
             solverSettings,
             geometry,
-            solverResult);
+            solverResult,
+            log);
         auto exporter = std::make_unique<App::Exporter>(
             exporterSettings,
-            geometry);
-        auto executor = std::make_unique<App::Executor>();
+            geometry,
+            log);
+        auto executor = std::make_unique<App::Executor>(log);
 
         renderer->setup();
-        renderer->log("Renderer initialized");
+        log(App::LogLevel::Message, "Renderer initialized");
 
         // For now, the visualization panel stays in the normal ImGui frame.
         // TODO: Bind GLVis through the existing network stream before embedding it natively.

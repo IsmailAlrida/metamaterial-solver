@@ -2,10 +2,12 @@
 
 #include <mutex>
 #include <string>
+#include <vector>
 #include "imgui.h"
 // TODO: im kind of leaning more towards nfd
 #include "imfilebrowser.h"
 #include "implot.h"
+#include "logging.hpp"
 
 struct SDL_Window;
 using SDL_GLContext = void*;
@@ -33,7 +35,7 @@ namespace App {
             void displayFrame();
             void GlvisPanel();
             void LogPanel();
-            void log(std::string msg);
+            void log(LogLevel level, std::string msg);
 
             
 
@@ -53,8 +55,13 @@ namespace App {
             bool sdlBackendInitialized = false;
             bool openglBackendInitialized = false;
 
+            struct LogEntry {
+                LogLevel level;
+                std::string message;
+            };
+
             std::mutex logMutex;
-            std::string logBuffer;
+            std::vector<LogEntry> logEntries;
             bool logScrollToBottom = false;
 
             void applyGlobalStyle(float scale);

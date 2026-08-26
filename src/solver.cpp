@@ -11,12 +11,14 @@ using namespace mfem;
 App::Solver::Solver( 
             const App::SolverSettings& settings,
             App::LevelSet& lset,
-            App::SolverResult& result
+            App::SolverResult& result,
+            const App::LogFunction& log
             )
             : 
             settings(settings),
             lset(lset),
             result(result),
+            log(log),
             mesh(nullptr),
             fec(nullptr),
             pressure_fes(nullptr),
@@ -44,15 +46,17 @@ bool App::Solver::setMesh() {
     const mfem::real_t sz = settings.sz;
 
     if (nx <= 0 || ny < 0 || nz < 0 || sx <= 0.0 || sy <= 0.0 || sz <= 0.0) {
+        log(App::LogLevel::Error, "Mesh element counts and extents must be positive.");
         return false;
     }
 
     if (ny == 0 && nz == 0) {
-        std::cout << "1D not yet lol." << std::endl;
+        log(App::LogLevel::Warning, "1D meshes are not supported yet.");
         return false;
     }
 
     if (nz > 0 && ny == 0) {
+        log(App::LogLevel::Error, "A 3D mesh requires a positive y element count.");
         return false;
     }
 
@@ -72,12 +76,14 @@ bool App::Solver::setMesh() {
     level_set_order = 1;
     cut_integration_order = 4;
 
+    log(App::LogLevel::Message, nz > 0 ? "Created 3D Cartesian mesh." : "Created 2D Cartesian mesh.");
     return true;
 }
 
 bool App::Solver::assembleSolutionSpace(){
 
     if (!mesh || fe_order <= 0 || settings.dt <= 0.0) {
+        log(App::LogLevel::Error, "Cannot assemble the solution space: mesh, finite-element order, or time step is invalid.");
         return false;
     }
 
@@ -119,6 +125,7 @@ bool App::Solver::assembleSolutionSpace(){
 
     const auto* physics = std::get_if<App::VibroacousticSettings>(&settings.physics);
     if (physics == nullptr) {
+        log(App::LogLevel::Error, "The selected physics model is not supported by the vibroacoustic solver.");
         return false;
     }
 
@@ -204,11 +211,13 @@ bool App::Solver::assembleSolutionSpace(){
     // Here, phi_degree is the polynomial degree of which we project the level set coefficient to a gridfunction
     mfem::AlgoimIntegrationRules solid_rules(cut_integration_order, phi_coeff, level_set_order);
 
+    log(App::LogLevel::Message, "Assembled the vibroacoustic solution space.");
     return true;
 }
 
 
 bool App::Solver::solve(){
+    log(App::LogLevel::Warning, "The forward solve is not implemented yet.");
     return false;
 }
 
@@ -217,6 +226,7 @@ bool App::Solver::bindToGlvis(){
     const int port = settings.glvisPort;
     (void)host;
     (void)port;
+    log(App::LogLevel::Warning, "GLVis binding is not implemented yet.");
     return false;
 }
 

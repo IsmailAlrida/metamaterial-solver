@@ -5,6 +5,7 @@
 #include <functional>
 #include <thread>
 #include <stdexcept>
+#include "logging.hpp"
 
 namespace App {
 
@@ -12,7 +13,7 @@ class Executor {
 
     public:
 
-        Executor();
+        Executor(const LogFunction& log);
         ~Executor();
 
         // I need a way to propagate errors from lower level solvers 
@@ -22,6 +23,7 @@ class Executor {
         }
 
     private:
+        const LogFunction& log;
 
 };
 

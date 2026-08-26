@@ -1,6 +1,7 @@
 #pragma once
 #include <memory>
 #include "global_types.hpp"
+#include "logging.hpp"
 #include "mfem.hpp"
 
 // Business objects retain references to top-level app data instead of owning snapshots.
@@ -13,7 +14,8 @@ namespace App {
 
         Solver(const SolverSettings& settings,
                LevelSet& lset,
-               SolverResult& result);
+               SolverResult& result,
+               const LogFunction& log);
 
         ~Solver();
 
@@ -33,6 +35,7 @@ namespace App {
         const SolverSettings& settings;
         LevelSet& lset;
         SolverResult& result;
+        const LogFunction& log;
 
         std::unique_ptr<mfem::Mesh> mesh;
         std::unique_ptr<mfem::H1_FECollection> fec;
