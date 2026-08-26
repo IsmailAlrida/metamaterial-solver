@@ -44,11 +44,12 @@ struct VibroacousticSettings {
     float rho_a;
 
     // Rayleigh damping
-    float alpha_d;
-    float beta_d;
+    float zeta;
+    float f1;
+    float f2;
 
     // Epsilon
-    float epsilon
+    float epsilon;
     
 
 };

@@ -23,7 +23,14 @@ class Dispatcher {
         enum class State{Idle, Solving, Optimizing, Diverged, Done, Exporting, Error};
         enum class Event{Reset, Cancel, Start, OptFail, SolveFail, SolveConverged, OptConverged, OptSuccess, Export, Error, HandleError, ExportDone};
 
-        Dispatcher(Executor& executor, Solver& solver, Optimizer& optimizer, Exporter& exporter, Renderer& renderer, ErrorHandler& error_handler);
+        Dispatcher(
+            Executor& executor, 
+            Solver& solver, 
+            Optimizer& optimizer, 
+            Exporter& exporter, 
+            ErrorHandler& error_handler, 
+            Callback& log
+        );
         ~Dispatcher();
 
         Solver& solver;
@@ -31,14 +38,14 @@ class Dispatcher {
         Exporter& exporter;
         Executor& executor;
         ErrorHandler& error_handler;
-
+        Callback& log;
 
         // FYI: We get the pair bad boys from the utility module
         // TODO: Switch this to a flat array later for less memory fragmentation cuz like... maps be everywhere in the ram
 
         std::map<std::pair<State, Event>, std::pair<State, Callback>> transitions = {
             {{State::Idle, Event::Start}, {State::Solving, [this](){
-                //TODO: Idea, let's NOT make these voids, we can do renderer.log() whatever comes
+                //TODO: Idea, let's NOT make these voids, we can do log() whatever comes
                 // out of them. Or even better yet it wont it be nice to have a streaming handle
                 // To pass to the solver/opt/etc.... on init where they can stream to a dockable imgui terminal monitor?
                 // you get me? So internally all the boys can just do something like log(message). We dont need to pass the whole renderer
@@ -53,9 +60,12 @@ class Dispatcher {
             }}},
             {{State::Solving, Event::SolveConverged}, {State::Optimizing, [this](){
                 optimizer.optimize();
+                // FYI: doing this promises that the optimizer WILL change the global levelset implicitly
+                // And because in solver transition we reset the mesh on each forward solve, we guarantee to have the
+                // Latest mesh shape (the global one) for both the optimizer and solver
             }}},
             {{State::Solving, Event::SolveFail},{State::Diverged, [this](){
-                // dunno
+                // dunno, it's enough to log and do nothing
             }}},
             {{State::Solving, Event::Cancel}, {State::Idle, [this](){
                 // should NOT send another callback to executor, rather just 
@@ -101,6 +111,8 @@ class Dispatcher {
             std::pair<State, Event> p(s, e);
             try {
                 std::pair<State, Callback> sf = transitions.at(p);
+                // TODO: Somehow make execution atomic and async
+                // Something like await executor.execute() where you let the async 
                 executor.execute(sf.second);
                 return sf.first;
             } catch(const std::exception& err) {

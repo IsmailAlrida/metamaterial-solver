@@ -1,28 +1,32 @@
 #pragma once
 
-#include <iostream> 
-#include <map> 
 #include <mutex>
 #include <string>
-#include <utility>
-#include "global_types.hpp"
-#include "solver.hpp"
-#include "optimizer.hpp"
-#include "exporter.hpp" 
 #include "imgui.h"
 // TODO: im kind of leaning more towards nfd
 #include "imfilebrowser.h"
 #include "implot.h"
-#include "mfem.hpp"
+
+struct SDL_Window;
+using SDL_GLContext = void*;
 
 namespace App {
+
+    struct AppSettings;
+    struct Bandgap;
 
     class Renderer { 
         
         public:
-            bool shouldClose;
+            bool shouldClose = false;
             Renderer(AppSettings& settings);
             ~Renderer();
+
+            // Need to understand what c++ does with these
+            Renderer(const Renderer&) = delete;
+            Renderer& operator=(const Renderer&) = delete;
+            Renderer(Renderer&&) = delete;
+            Renderer& operator=(Renderer&&) = delete;
 
             // Does the boring imgui window setup and flags and stuff, App class should call this
             void setup();
@@ -34,19 +38,27 @@ namespace App {
             
 
         private:
-            App::Solver solver;
-            Optimizer optimizer;
-            Exporter exporter; 
-            LevelSet geometry; 
-            std::vector<Bandgap> designTargets;
-            //todo: maybe rename this to SolverOutput. Optimizer will directly modify the LevelSet, so no need for opt output
-            SolverResult result;
-            AppSettings settings;
-            State state;
+            AppSettings& settings;
+
+            SDL_Window* window = nullptr;
+            SDL_GLContext glContext = nullptr;
+            ImFont* uiFont = nullptr;
+            ImFont* consoleFont = nullptr;
+            const char* glslVersion = nullptr;
+            ImVec4 clearColor = ImVec4(0.035f, 0.047f, 0.067f, 1.0f);
+
+            bool sdlInitialized = false;
+            bool imguiContextCreated = false;
+            bool implotContextCreated = false;
+            bool sdlBackendInitialized = false;
+            bool openglBackendInitialized = false;
 
             std::mutex logMutex;
             std::string logBuffer;
             bool logScrollToBottom = false;
+
+            void applyGlobalStyle(float scale);
+            void loadFonts();
 
             //todo: maybe just pass refs to the class objects in each functions JUST to make the interface obvious.
             // Or be a devious dev and just do this in the implementation

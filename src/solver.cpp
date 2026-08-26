@@ -49,6 +49,16 @@ App::Solver::Solver(
 App::Solver::~Solver() = default;
 
 //todo: do something about the mixed camelCase and snake_case. Choose one.
+// todo: but better, you do realize we can just call set mesh reading from the same settings object? 
+// I want the functions of the solvers to be argumentless, as we will extract all the necessary infromation
+// Directly from the settings.
+// Given for this iteration we will run the following sequentially
+/* setMesh --> assembleSolutionSpace --> solve*/
+// We can think later about setters/getters from the UI so we incrementally change different parts of it?
+// Its unnecessary, a lot of these functions are unncessary beyond internal orchestration. Fine we'll go with sequentially doing everything one at a time
+// i doubt the bottleneck is in setting the mesh as much as it is in the actual forward solves
+// Chatgpt please refactor it so that the solver consumes SolverSettings reference from the AppSettings, and we decompose the solver settings to replace 
+// What we normally pass as arguments. Please make sure every sister class like this follows the same pattern
 bool App::Solver::setMesh(int nx, int ny, int nz, mfem::real_t sx, mfem::real_t sy, mfem::real_t sz) {
 
     if (nx <= 0 || ny < 0 || nz < 0 || sx <= 0.0 || sy <= 0.0 || sz <= 0.0) {
