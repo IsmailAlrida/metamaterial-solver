@@ -3,11 +3,24 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include "executor.hpp"
+#include "exporter.hpp"
+#include "global_types.hpp"
 #include "imgui.h"
 // TODO: im kind of leaning more towards nfd
 #include "imfilebrowser.h"
 #include "implot.h"
 #include "logging.hpp"
+#include "optimizer.hpp"
+#include "solver.hpp"
+
+#ifndef METAMATERIAL_DEMO_MODE
+#define METAMATERIAL_DEMO_MODE 0
+#endif
+
+#if METAMATERIAL_DEMO_MODE
+#include "demo/demos.hpp"
+#endif
 
 struct SDL_Window;
 using SDL_GLContext = void*;
@@ -17,11 +30,23 @@ namespace App {
     struct AppSettings;
     struct Bandgap;
 
+#if METAMATERIAL_DEMO_MODE
+    using solver_t = Demo::FakeSolver;
+    using optimizer_t = Demo::FakeOptimizer;
+    using exporter_t = Demo::FakeExporter;
+    using executor_t = Demo::FakeExecutor;
+#else
+    using solver_t = Solver;
+    using optimizer_t = Optimizer;
+    using exporter_t = Exporter;
+    using executor_t = Executor;
+#endif
+
     class Renderer { 
         
         public:
             bool shouldClose = false;
-            Renderer(AppSettings& settings);
+            Renderer(AppSettings& settings, SolverResult& result, LevelSet& geometry);
             ~Renderer();
 
             // Need to understand what c++ does with these
@@ -32,7 +57,10 @@ namespace App {
 
             // Does the boring imgui window setup and flags and stuff, App class should call this
             void setup();
-            void displayFrame();
+            void displayFrame(solver_t& solver,
+                              optimizer_t& optimizer,
+                              exporter_t& exporter,
+                              executor_t& executor);
             void GlvisPanel();
             void LogPanel();
             void log(LogLevel level, std::string msg);
@@ -41,6 +69,22 @@ namespace App {
 
         private:
             AppSettings& settings;
+            SolverResult& result;
+            LevelSet& geometry;
+
+            enum class RunState {
+                Idle,
+                Running,
+                Complete,
+                Exporting,
+                Error
+            };
+
+            RunState runState = RunState::Idle;
+            int completedIterations = 0;
+            int lastFreeformIndex = -1;
+            std::vector<float> objectiveFrequency;
+            std::vector<float> objectiveTarget;
 
             SDL_Window* window = nullptr;
             SDL_GLContext glContext = nullptr;
@@ -66,6 +110,9 @@ namespace App {
 
             void applyGlobalStyle(float scale);
             void loadFonts();
+            void setupInitialDockLayout(ImGuiID dockspaceId,
+                                        const ImGuiViewport& viewport);
+            void updateObjectiveCurve();
 
             //todo: maybe just pass refs to the class objects in each functions JUST to make the interface obvious.
             // Or be a devious dev and just do this in the implementation
@@ -181,7 +228,10 @@ namespace App {
                 
                 FYI: I will make a threadpool class called Executor
             */
-            void ActionPanel();
+            void ActionPanel(solver_t& solver,
+                             optimizer_t& optimizer,
+                             exporter_t& exporter,
+                             executor_t& executor);
             
     };
 

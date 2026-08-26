@@ -23,13 +23,6 @@ struct SimulationInfo {
     std::string body;
 };
 
-// Maybe add an ID for bandgap?
-struct Bandgap { 
-    float center;
-    float bandwidth;
-    float attenuationDb; 
-};
-
 struct SignalFFT {
     int size;
     std::vector<float> amplitude;
@@ -54,4 +47,3 @@ struct SolverInput {
 };
 
 } // namespace App
-

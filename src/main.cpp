@@ -36,35 +36,58 @@ int main(int, char**)
         // Probably an equally spaced square grid of cylinders/circles with some radius each; basically a sonic crystal whose shape we can weakly try to guess from the bandgap. Or just hardocde a single crystal structure. how about that?
         const int dimension = solverSettings.nz > 0 ? 3 : 2;
         const int nz = solverSettings.nz > 0 ? solverSettings.nz : 1;
-        auto lset = std::make_unique<App::LevelSet>(
-            dimension,
-            solverSettings.nx,
-            solverSettings.ny,
-            nz);
-        auto& geometry = *lset;
 
-        // Keep the renderer alive longer than the computers that will publish to it.
-        auto renderer = std::make_unique<App::Renderer>(appSettings);
+        // LevelSet's GridFunction borrows this finite-element space, so the mesh,
+        // collection, and space all remain top-level and outlive the LevelSet.
+        auto levelSetMesh = solverSettings.nz > 0
+            ? std::make_unique<mfem::Mesh>(mfem::Mesh::MakeCartesian3D(
+                solverSettings.nx,
+                solverSettings.ny,
+                nz,
+                mfem::Element::HEXAHEDRON,
+                solverSettings.sx,
+                solverSettings.sy,
+                solverSettings.sz))
+            : std::make_unique<mfem::Mesh>(mfem::Mesh::MakeCartesian2D(
+                solverSettings.nx,
+                solverSettings.ny,
+                mfem::Element::QUADRILATERAL,
+                true,
+                solverSettings.sx,
+                solverSettings.sy));
+        auto levelSetFec = std::make_unique<mfem::H1_FECollection>(1, dimension);
+        auto levelSetFes = std::make_unique<mfem::FiniteElementSpace>(
+            levelSetMesh.get(), levelSetFec.get());
+        auto lset = std::make_unique<App::LevelSet>(*levelSetFes);
+        auto& geometry = *lset;
+        geometry.design = 0.5;
+        geometry.phi.SetFromTrueDofs(geometry.design);
+
+        // Keep the renderer alive longer than the objects that will publish to it.
+        auto renderer = std::make_unique<App::Renderer>(
+            appSettings,
+            solverResult,
+            geometry);
         App::LogFunction log = [&renderer](App::LogLevel level, std::string message) {
             renderer->log(level, std::move(message));
         };
 
         // in opt, result is const, not edited.
-        auto optimizer = std::make_unique<App::Optimizer>(
+        auto optimizer = std::make_unique<App::optimizer_t>(
             optimizerSettings,
             geometry,
             solverResult,
             log);
-        auto solver = std::make_unique<App::Solver>(
+        auto solver = std::make_unique<App::solver_t>(
             solverSettings,
             geometry,
             solverResult,
             log);
-        auto exporter = std::make_unique<App::Exporter>(
+        auto exporter = std::make_unique<App::exporter_t>(
             exporterSettings,
             geometry,
             log);
-        auto executor = std::make_unique<App::Executor>(log);
+        auto executor = std::make_unique<App::executor_t>(log);
 
         renderer->setup();
         log(App::LogLevel::Message, "Renderer initialized");
@@ -72,7 +95,7 @@ int main(int, char**)
         // For now, the visualization panel stays in the normal ImGui frame.
         // TODO: Bind GLVis through the existing network stream before embedding it natively.
         while (!renderer->shouldClose) {
-            renderer->displayFrame();
+            renderer->displayFrame(*solver, *optimizer, *exporter, *executor);
         }
 
         // TODO: Executor should own and join its backend thread in its destructor.

@@ -30,6 +30,7 @@ if(CMAKE_CUDA_COMPILER)
 endif()
 
 option(METAMATERIAL_DEPS_ONLY "Configure dependencies without creating the app target" OFF)
+option(METAMATERIAL_DEMO_MODE "Use deterministic fake solver, optimizer, exporter, and executor classes" ON)
 
 # ---------------------------------------------------------
 # AUTOMATED DEPENDENCY MANAGEMENT
@@ -228,6 +229,11 @@ add_executable(metamaterial_app
     ${implot_SOURCE_DIR}/implot.cpp
     ${implot_SOURCE_DIR}/implot_items.cpp
 )
+
+target_compile_definitions(metamaterial_app PRIVATE
+    METAMATERIAL_DEMO_MODE=$<BOOL:${METAMATERIAL_DEMO_MODE}>
+)
+message(STATUS "Interactive demo mode: ${METAMATERIAL_DEMO_MODE}")
 
 # Target-specific paths
 target_include_directories(metamaterial_app PRIVATE

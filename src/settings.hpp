@@ -20,6 +20,11 @@ enum class PhysicsProblem {
     electromagnetic
 };
 
+enum class ObjectiveMode {
+    bandgap,
+    freeform
+};
+
 using Value = std::variant<int, float, double, long, bool, std::string>;
 using Number = std::variant<int, float>;
 
@@ -62,13 +67,32 @@ struct ElectromagneticSettings {
 
 };
 
+// Maybe add an ID for bandgap?
+struct Bandgap {
+    float center = 1500.0f;
+    float bandwidth = 400.0f;
+    float attenuationDb = -35.0f;
+};
+
 using PhysicsSettings = std::variant<
     VibroacousticSettings,
     ElectromagneticSettings
 >;
 
 struct OptimizerSettings {
-
+    float filterRadius = 0.0025f;
+    float frequencyMin = 0.0f;
+    float frequencyMax = 5000.0f;
+    float attenuationMinDb = -80.0f;
+    float attenuationMaxDb = 5.0f;
+    int frequencySamples = 256;
+    int maxIterations = 8;
+    ObjectiveMode objectiveMode = ObjectiveMode::bandgap;
+    std::vector<Bandgap> bandgaps{
+        {1450.0f, 500.0f, -32.0f},
+        {2850.0f, 700.0f, -44.0f}
+    };
+    std::vector<float> freeformTarget;
 };
 
 // TODO: For all settings, pick default app values.
@@ -82,6 +106,9 @@ struct SolverSettings {
     double duration = 0.2;
     double dt = duration / 1000.0;
     std::string algo = "newmark";
+    bool isotropicGrid = false;
+    bool useHannWindow = true;
+    int fftSamples = 2048;
     PhysicsSettings physics;
     SolverDevice device = SolverDevice::serial;
     std::string glvisHost = "localhost";
