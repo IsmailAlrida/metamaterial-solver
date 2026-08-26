@@ -26,33 +26,7 @@
             void displayFrame();
             void GlvisPanel();
 
-            //TODO: Add pause mechanism later to pause from either opt/solve
-            enum class State{Idle, Solving, Optimizing, Diverged, Done, Exporting, Error};
-            enum class Event{Reset, Cancel, Start, OptFail, SolveFail, SolveConverged, OptConverged, OptSuccess, Export, Error, HandleError, ExportDone};
-
-            std::map<std::pair<State, Event>, State> transitions = {
-                {{State::Idle, Event::Start}, State::Solving},
-                {{State::Idle, Event::Error}, State::Error},
-
-                {{State::Solving, Event::SolveConverged}, State::Optimizing},
-                {{State::Solving, Event::SolveFail}, State::Diverged},
-                {{State::Solving, Event::Cancel}, State::Idle},
-                {{State::Solving, Event::Error}, State::Error},
-
-                {{State::Optimizing, Event::OptConverged}, State::Solving},
-                {{State::Optimizing, Event::OptSuccess}, State::Done},
-                {{State::Optimizing, Event::OptFail}, State::Diverged},
-                {{State::Optimizing, Event::Cancel}, State::Idle},
-                {{State::Optimizing, Event::Error}, State::Error},
-
-                {{State::Diverged, Event::Reset}, State::Idle},
-
-                {{State::Done, Event::Export}, State::Exporting},
-                {{State::Exporting, Event::ExportDone}, State::Idle},
-                {{State::Exporting, Event::Error}, State::Error},
-
-                {{State::Error, Event::HandleError}, State::Idle},
-            };
+            
 
         private:
             App::Solver solver;
@@ -175,5 +149,5 @@
                 FYI: I will make a threadpool class called Executor
             */
             void ActionPanel();
-            void dispatch(Event);
+            
     };

@@ -1,11 +1,13 @@
 #include <string>
 #include <vector>
+#include <map> 
+#include <utility>
+#include <stdexcept>
 #include "global_types.hpp"
 #include "renderer.hpp"
 #include "optimizer.hpp"
 #include "solver.hpp"
 #include "exporter.hpp"
-
 
 
 int main() {
@@ -36,4 +38,6 @@ int main() {
     while (!renderer.shouldClose) {
         renderer.displayFrame();
     };
+
+    executor.thread.join()
 };
