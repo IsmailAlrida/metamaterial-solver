@@ -4,6 +4,8 @@
 #include <iostream>
 #include <string>
 
+namespace App {
+
 class LevelSetScaledCoefficient : public mfem::Coefficient
 {
 private:
@@ -45,5 +47,7 @@ public:
     }
 
 private:
-    Coefficient &source;
+    mfem::Coefficient &source;
 };
+
+} // namespace App

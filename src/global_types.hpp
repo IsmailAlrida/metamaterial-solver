@@ -8,6 +8,8 @@
 #include "coeffs.hpp"
 //TODO: Settings, lset, coeffs, etc... should be all folded into this global types, other files needn't reference it all indivudally
 
+namespace App {
+
 struct Result {
     int code;
     std::string msg;
@@ -48,5 +50,6 @@ struct SolverInput {
     
 };
 
+} // namespace App
 
 

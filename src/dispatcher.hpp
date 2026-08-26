@@ -12,6 +12,9 @@
 #include "executor.hpp"  
 #include "error.hpp"
 #include "renderer.hpp"
+
+namespace App {
+
 class Dispatcher {
         
     public:
@@ -98,7 +101,7 @@ class Dispatcher {
             std::pair<State, Event> p(s, e);
             try {
                 std::pair<State, Callback> sf = transitions.at(p);
-                Executor.execute(sf.second);
+                executor.execute(sf.second);
                 return sf.first;
             } catch(const std::exception& err) {
                 // Fixed \n to be inside quotes
@@ -109,3 +112,5 @@ class Dispatcher {
 
     private:
 };
+
+} // namespace App

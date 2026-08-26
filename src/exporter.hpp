@@ -2,6 +2,8 @@
 
 #include "global_types.hpp"
 
+namespace App {
+
 class Exporter {
     
     public:
@@ -11,3 +13,5 @@ class Exporter {
     private:
 
 };
+
+} // namespace App

@@ -1,4 +1,8 @@
+#pragma once
+
 #include <iostream>
+
+namespace App {
 
 class ErrorHandler{
 
@@ -8,4 +12,6 @@ class ErrorHandler{
         ~ErrorHandler();
 
         
-}
+};
+
+} // namespace App

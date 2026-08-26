@@ -13,6 +13,7 @@
 #include "implot.h"
 #include "mfem.hpp"
 
+namespace App {
 
     class Renderer { 
         
@@ -152,3 +153,5 @@
             void ActionPanel();
             
     };
+
+} // namespace App

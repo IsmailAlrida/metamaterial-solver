@@ -6,6 +6,8 @@
 #include <thread>
 #include <stdexcept>
 
+namespace App {
+
 class Executor {
 
     public:
@@ -22,3 +24,5 @@ class Executor {
     private:
 
 };
+
+} // namespace App

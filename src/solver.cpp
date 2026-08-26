@@ -14,9 +14,9 @@ using namespace mfem;
 
 // TODO: Namespace all classes to App please, because here solver is ambigous, so let;s generalize it
 App::Solver::Solver( 
-            LevelSet& lset, 
-            SolverResult& result, 
-            const PhysicsProblem& problem,
+            App::LevelSet& lset,
+            App::SolverResult& result,
+            const App::PhysicsProblem& problem,
             int nx, int ny, int nz,
             std::string solverAlgo
             )

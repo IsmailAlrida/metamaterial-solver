@@ -1,5 +1,7 @@
 #pragma once
 
+namespace App {
+
 class Optimizer {
     public:
 
@@ -7,3 +9,5 @@ class Optimizer {
         void optimize();
     private:
 };
+
+} // namespace App

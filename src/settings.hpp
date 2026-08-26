@@ -3,6 +3,8 @@
 #include <variant>
 #include <vector>
 
+namespace App {
+
 // If you really wanna get the int of
 // This enum class, you should do
 // int x = static_cast<int>(SolverDevice::Cuda);
@@ -92,3 +94,5 @@ struct AppSettings {
 struct DesignSettings {
 
 };
+
+} // namespace App

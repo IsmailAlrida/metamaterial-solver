@@ -7,6 +7,8 @@
 #include "mfem.hpp"
 #include "settings.hpp"
 
+namespace App {
+
 // TODO: Make this a class that extends 
 struct LevelSet {
     int dim; 
@@ -56,3 +58,5 @@ struct LevelSet {
         }
 
 };
+
+} // namespace App

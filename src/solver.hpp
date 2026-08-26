@@ -8,6 +8,8 @@
 
 // Classes like solver, exporter, and optimizer should be stateless
 
+namespace App {
+
     class Solver {
 
     public:
@@ -69,3 +71,5 @@
 
 
     };
+
+} // namespace App
