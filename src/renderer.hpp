@@ -2,6 +2,8 @@
 
 #include <iostream> 
 #include <map> 
+#include <mutex>
+#include <string>
 #include <utility>
 #include "global_types.hpp"
 #include "solver.hpp"
@@ -26,6 +28,7 @@ namespace App {
             void setup();
             void displayFrame();
             void GlvisPanel();
+            void LogPanel();
             void log(std::string msg);
 
             
@@ -40,6 +43,10 @@ namespace App {
             SolverResult result;
             AppSettings settings;
             State state;
+
+            std::mutex logMutex;
+            std::string logBuffer;
+            bool logScrollToBottom = false;
 
             //todo: maybe just pass refs to the class objects in each functions JUST to make the interface obvious.
             // Or be a devious dev and just do this in the implementation
