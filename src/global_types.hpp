@@ -38,8 +38,10 @@ struct SignalTD {
 };
 
 struct SolverResult {
-    int success;
+    int success = 0;
     SignalFFT materialImpulseResponse;
+    std::vector<mfem::Vector> U;
+    std::vector<mfem::Vector> R;
 };
 
 struct SolverInput {

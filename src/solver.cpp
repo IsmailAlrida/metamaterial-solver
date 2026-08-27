@@ -272,19 +272,6 @@ bool App::Solver::assembleSolutionSpace(){
     const double alpha_d = (2 * physics->zeta * omega_1 * omega_2)/(omega_1 + omega_2); // Rayleigh mass factor, 1/s
     const double beta_d  = (2 * physics->zeta) / (omega_1 + omega_2); // Rayleigh stiffness factor, s
 
-    // Newmark constants 
-    // These are selected to keep the algo UNCONDITIONALLY STABLE
-    double beta_nm = 0.25;
-    double gamma_nm = 0.5;
-
-    double a1 = 1.0 - gamma_nm/beta_nm;
-    double a2 = (1.0 - gamma_nm/(2*beta_nm)) * settings.dt;
-    double a3 = gamma_nm/(beta_nm * settings.dt);
-    double a4 = 1.0 / (beta_nm * settings.dt);
-    double a5 = 1/(2*beta_nm) - 1.0;
-    double a6 = 1 / (beta_nm * settings.dt * settings.dt);
-
-    
     // TODO: Multiplex 2D and 3D case
     double lambda;
     if (settings.nz > 0)
@@ -507,8 +494,171 @@ bool App::Solver::assembleSolutionSpace(){
 
 
 bool App::Solver::solve(){
-    log(App::LogLevel::Warning, "The forward solve is not implemented yet.");
-    return false;
+
+    result.success = 0;
+    result.U.clear();
+    result.R.clear();
+
+    if (!M || !C || !K) {
+        log(App::LogLevel::Error, "Cannot solve before assembling M, C, and K.");
+        return false;
+    }
+    if (settings.dt <= 0.0 || settings.duration <= 0.0) {
+        log(App::LogLevel::Error, "The Newmark time step and duration must be positive.");
+        return false;
+    }
+    if (M->Height() != M->Width()
+        || C->Height() != M->Height() || C->Width() != M->Width()
+        || K->Height() != M->Height() || K->Width() != M->Width()) {
+        log(App::LogLevel::Error, "M, C, and K must have matching square dimensions.");
+        return false;
+    }
+
+    // Newmark constants
+    // These are selected to keep the algo UNCONDITIONALLY STABLE
+    const double beta_nm = 0.25;
+    const double gamma_nm = 0.5;
+
+    const double a1 = 1.0 - gamma_nm/beta_nm;
+    const double a2 = (1.0 - gamma_nm/(2*beta_nm)) * settings.dt;
+    const double a3 = gamma_nm/(beta_nm * settings.dt);
+    const double a4 = 1.0 / (beta_nm * settings.dt);
+    const double a5 = 1/(2*beta_nm) - 1.0;
+    const double a6 = 1 / (beta_nm * settings.dt * settings.dt);
+
+    std::unique_ptr<SparseMatrix> mass_and_damping(
+        Add(a6, *M, a3, *C)
+    );
+    std::unique_ptr<SparseMatrix> effective_stiffness(
+        Add(1.0, *K, 1.0, *mass_and_damping)
+    );
+
+    if (effective_stiffness->CheckFinite() != 0) {
+        log(App::LogLevel::Error, "The Newmark effective stiffness matrix contains non-finite values.");
+        return false;
+    }
+
+    GSSmoother effective_preconditioner(*effective_stiffness);
+    GMRESSolver linear_solver;
+    linear_solver.SetPreconditioner(effective_preconditioner);
+    linear_solver.SetOperator(*effective_stiffness);
+    linear_solver.iterative_mode = true;
+    linear_solver.SetRelTol(1.0e-10);
+    linear_solver.SetAbsTol(1.0e-12);
+    linear_solver.SetMaxIter(1000);
+    linear_solver.SetPrintLevel(-1);
+
+    const int state_size = M->Height();
+    const int time_steps = static_cast<int>(std::ceil(settings.duration / settings.dt));
+
+    Vector v(state_size);
+    Vector v_dot(state_size);
+    Vector v_ddot(state_size);
+    v = 0.0;
+    v_dot = 0.0;
+    v_ddot = 0.0;
+
+    result.U.reserve(time_steps + 1);
+    result.R.reserve(time_steps + 1);
+
+    Vector U_n(3 * state_size);
+    Vector R_n(3 * state_size);
+    U_n = 0.0;
+    R_n = 0.0;
+    result.U.push_back(U_n);
+    result.R.push_back(R_n);
+
+    Vector h(state_size);
+    Vector h_hat(state_size);
+    Vector x_M(state_size);
+    Vector x_C(state_size);
+    Vector y_M(state_size);
+    Vector y_C(state_size);
+    Vector v_new(state_size);
+    Vector v_dot_new(state_size);
+    Vector v_ddot_new(state_size);
+    Vector delta_v(state_size);
+    Vector r1(state_size);
+    Vector r2(state_size);
+    Vector r3(state_size);
+
+    log(App::LogLevel::Warning,
+        "The incoming-wave load is not assembled yet; this solve uses h^n = 0.");
+
+    for (int n = 1; n <= time_steps; n++) {
+        // TODO: Assemble the incoming-wave boundary load g(t) into the pressure block.
+        h = 0.0;
+
+        x_M = 0.0;
+        x_M.Add(a4, v_dot);
+        x_M.Add(a5, v_ddot);
+        x_M.Add(a6, v);
+        M->Mult(x_M, y_M);
+
+        x_C = 0.0;
+        x_C.Add(-a1, v_dot);
+        x_C.Add(-a2, v_ddot);
+        x_C.Add(a3, v);
+        C->Mult(x_C, y_C);
+
+        h_hat = h;
+        h_hat += y_M;
+        h_hat += y_C;
+
+        v_new = v;
+        linear_solver.Mult(h_hat, v_new);
+        if (!linear_solver.GetConverged()) {
+            log(App::LogLevel::Error,
+                "The Newmark linear solve failed at time step " + std::to_string(n) + ".");
+            result.U.clear();
+            result.R.clear();
+            return false;
+        }
+
+        delta_v = v_new;
+        delta_v -= v;
+
+        v_dot_new = 0.0;
+        v_dot_new.Add(a1, v_dot);
+        v_dot_new.Add(a2, v_ddot);
+        v_dot_new.Add(a3, delta_v);
+
+        v_ddot_new = 0.0;
+        v_ddot_new.Add(-a4, v_dot);
+        v_ddot_new.Add(-a5, v_ddot);
+        v_ddot_new.Add(a6, delta_v);
+
+        effective_stiffness->Mult(v_new, r1);
+        r1 -= h_hat;
+
+        r2 = v_dot_new;
+        r2.Add(-a1, v_dot);
+        r2.Add(-a2, v_ddot);
+        r2.Add(-a3, delta_v);
+
+        r3 = v_ddot_new;
+        r3.Add(a4, v_dot);
+        r3.Add(a5, v_ddot);
+        r3.Add(-a6, delta_v);
+
+        U_n.SetVector(v_new, 0);
+        U_n.SetVector(v_dot_new, state_size);
+        U_n.SetVector(v_ddot_new, 2 * state_size);
+        R_n.SetVector(r1, 0);
+        R_n.SetVector(r2, state_size);
+        R_n.SetVector(r3, 2 * state_size);
+        result.U.push_back(U_n);
+        result.R.push_back(R_n);
+
+        v = v_new;
+        v_dot = v_dot_new;
+        v_ddot = v_ddot_new;
+    }
+
+    result.success = 1;
+    log(App::LogLevel::Message,
+        "Completed " + std::to_string(time_steps) + " Newmark time steps.");
+    return true;
 }
 
 bool App::Solver::bindToGlvis(){
