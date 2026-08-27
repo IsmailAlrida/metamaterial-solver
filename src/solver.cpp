@@ -123,6 +123,9 @@ bool App::Solver::assembleSolutionSpace(){
     }
 
     const int dim = mesh->Dimension();
+    M.reset();
+    C.reset();
+    K.reset();
 
     fec = std::make_unique<H1_FECollection>(fe_order, dim);
     pressure_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get());
@@ -351,6 +354,7 @@ bool App::Solver::assembleSolutionSpace(){
     );
     Muu_form.Assemble();
     Muu_form.Finalize();
+    std::unique_ptr<SparseMatrix> Muu(Muu_form.LoseMat());
 
     Kuu_form.AddDomainIntegrator(
         new ElasticityIntegrator(
@@ -360,6 +364,8 @@ bool App::Solver::assembleSolutionSpace(){
     );
     Kuu_form.Assemble();
     Kuu_form.Finalize();
+    std::unique_ptr<SparseMatrix> Kuu(Kuu_form.LoseMat());
+
 
     Cuu_form.AddDomainIntegrator(
         new VectorMassIntegrator(
@@ -374,6 +380,7 @@ bool App::Solver::assembleSolutionSpace(){
     );
     Cuu_form.Assemble();
     Cuu_form.Finalize();
+    std::unique_ptr<SparseMatrix> Cuu(Cuu_form.LoseMat());
 
     Kpp_form.AddDomainIntegrator(
         new DiffusionIntegrator(
@@ -382,6 +389,7 @@ bool App::Solver::assembleSolutionSpace(){
     );
     Kpp_form.Assemble();
     Kpp_form.Finalize();
+    std::unique_ptr<SparseMatrix> Kpp(Kpp_form.LoseMat());
 
     Mpp_form.AddDomainIntegrator(
         new MassIntegrator(
@@ -390,6 +398,7 @@ bool App::Solver::assembleSolutionSpace(){
     );
     Mpp_form.Assemble();
     Mpp_form.Finalize();
+    std::unique_ptr<SparseMatrix> Mpp(Mpp_form.LoseMat());
     
     // TODO: How do we make the absorbing boundary into a periodic one with ?
     // oh yeah mesh brd_attributes go 1,2,3,4
@@ -415,6 +424,7 @@ bool App::Solver::assembleSolutionSpace(){
     );
     Cpp_form.Assemble();
     Cpp_form.Finalize();
+    std::unique_ptr<SparseMatrix> Cpp(Cpp_form.LoseMat());
 
     // Kup: scalar pressure trial -> vector displacement test
     Kup_form.AddDomainIntegrator(
@@ -429,6 +439,7 @@ bool App::Solver::assembleSolutionSpace(){
     );
     Kup_form.Assemble();
     Kup_form.Finalize();
+    std::unique_ptr<SparseMatrix> Kup(Kup_form.LoseMat());
 
     // Mpu: vector displacement trial -> scalar pressure test
     Mpu_form.AddDomainIntegrator(
@@ -443,30 +454,52 @@ bool App::Solver::assembleSolutionSpace(){
     );
     Mpu_form.Assemble();
     Mpu_form.Finalize();
+    std::unique_ptr<SparseMatrix> Mpu(Mpu_form.LoseMat());
 
     std::unique_ptr<SparseMatrix> Kup_transpose(
-        Transpose(Kup_form.SpMat())
+        Transpose(*Kup)
     );
     std::unique_ptr<SparseMatrix> coupling_residual(
-        Add(1.0, Mpu_form.SpMat(), 1.0, *Kup_transpose)
+        Add(1.0, *Mpu, 1.0, *Kup_transpose)
     );
     const real_t coupling_scale = std::max(
         real_t{1.0},
-        std::max(Mpu_form.SpMat().MaxNorm(), Kup_transpose->MaxNorm())
+        std::max(Mpu->MaxNorm(), Kup_transpose->MaxNorm())
     );
     if (coupling_residual->MaxNorm() > 1.0e-10 * coupling_scale) {
         log(App::LogLevel::Error, "The implicit coupling matrices do not satisfy Mpu = -Kup^T.");
         return false;
     }
 
-    SparseMatrix M;
-    M.ad
+    mfem::Array<int> offsets(3);
+    offsets[0] = 0;
+    offsets[1] = displacement_fes->GetVSize();
+    offsets[2] = pressure_fes->GetVSize() + offsets[1];
 
+    BlockMatrix M_blocks(offsets);
+    M_blocks.SetBlock(0, 0, Muu.get());
+    M_blocks.SetBlock(1, 0, Mpu.get());
+    M_blocks.SetBlock(1, 1, Mpp.get());
+    M.reset(M_blocks.CreateMonolithic());
 
+    BlockMatrix C_blocks(offsets);
+    C_blocks.SetBlock(0, 0, Cuu.get());
+    C_blocks.SetBlock(1, 1, Cpp.get());
+    C.reset(C_blocks.CreateMonolithic());
 
-    mfem::Vector g;
-    mfem::BlockVector h;
+    BlockMatrix K_blocks(offsets);
+    K_blocks.SetBlock(0, 0, Kuu.get());
+    K_blocks.SetBlock(0, 1, Kup.get());
+    K_blocks.SetBlock(1, 1, Kpp.get());
+    K.reset(K_blocks.CreateMonolithic());
 
+    if (M->CheckFinite() != 0 || C->CheckFinite() != 0 || K->CheckFinite() != 0) {
+        log(App::LogLevel::Error, "The assembled global matrices contain non-finite values.");
+        M.reset();
+        C.reset();
+        K.reset();
+        return false;
+    }
 
     log(App::LogLevel::Message, "Assembled the vibroacoustic solution space.");
     return true;
