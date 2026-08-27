@@ -218,3 +218,4 @@ extern/
 build-*/
 build-glvis-*/
 tools/glvis-*/
+imgui.ini
