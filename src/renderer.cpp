@@ -440,30 +440,31 @@ void Renderer::SimulationSettingsPanel()
         ImGui::SameLine();
         ImGui::TextDisabled(is3D ? "3D hexahedral grid" : "nz = 0, 2D quadrilateral grid");
 
+        ImGui::SeparatorText("Duct regions along x");
+        ImGui::SetNextItemWidth(110.0f);
+        ImGui::InputDouble("Inlet (m)", &solver.inletLength, 0.01, 0.1, "%.4f");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(110.0f);
+        ImGui::InputDouble("Design (m)", &solver.designLength, 0.01, 0.1, "%.4f");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(110.0f);
+        ImGui::InputDouble("Outlet (m)", &solver.outletLength, 0.01, 0.1, "%.4f");
+
+        solver.inletLength = std::max(solver.inletLength, 1.0e-6);
+        solver.designLength = std::max(solver.designLength, 1.0e-6);
+        solver.outletLength = std::max(solver.outletLength, 1.0e-6);
+
+        const double sx = solver.inletLength
+            + solver.designLength
+            + solver.outletLength;
+        ImGui::TextDisabled("Total x extent: %.4f m", sx);
+
+        ImGui::SeparatorText("Mesh resolution");
         ImGui::Checkbox("Isotropic grid", &solver.isotropicGrid);
-        if (solver.isotropicGrid) {
-            int elements = solver.nx;
-            double extent = solver.sx;
-            if (ImGui::InputInt("Elements / axis", &elements)) {
-                elements = std::max(elements, 1);
-                solver.nx = elements;
-                solver.ny = elements;
-                if (is3D) {
-                    solver.nz = elements;
-                }
-            }
-            if (ImGui::InputDouble("Extent / axis (m)", &extent, 0.01, 0.1, "%.4f")) {
-                extent = std::max(extent, 1.0e-6);
-                solver.sx = extent;
-                solver.sy = extent;
-                if (is3D) {
-                    solver.sz = extent;
-                }
-            }
-        }
-        else {
-            ImGui::SetNextItemWidth(110.0f);
-            ImGui::InputInt("nx", &solver.nx);
+        ImGui::SetNextItemWidth(110.0f);
+        ImGui::InputInt("nx", &solver.nx);
+
+        if (!solver.isotropicGrid) {
             ImGui::SameLine();
             ImGui::SetNextItemWidth(110.0f);
             ImGui::InputInt("ny", &solver.ny);
@@ -473,23 +474,36 @@ void Renderer::SimulationSettingsPanel()
                 ImGui::InputInt("nz", &solver.nz);
             }
 
-            ImGui::SetNextItemWidth(110.0f);
-            ImGui::InputDouble("sx (m)", &solver.sx, 0.01, 0.1, "%.4f");
+        }
+
+        ImGui::SetNextItemWidth(110.0f);
+        ImGui::InputDouble("sy (m)", &solver.sy, 0.01, 0.1, "%.4f");
+        if (is3D) {
             ImGui::SameLine();
             ImGui::SetNextItemWidth(110.0f);
-            ImGui::InputDouble("sy (m)", &solver.sy, 0.01, 0.1, "%.4f");
-            if (is3D) {
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(110.0f);
-                ImGui::InputDouble("sz (m)", &solver.sz, 0.01, 0.1, "%.4f");
-            }
+            ImGui::InputDouble("sz (m)", &solver.sz, 0.01, 0.1, "%.4f");
+        }
 
-            solver.nx = std::max(solver.nx, 1);
+        solver.nx = std::max(solver.nx, 1);
+        solver.sy = std::max(solver.sy, 1.0e-6);
+        solver.sz = std::max(solver.sz, 1.0e-6);
+
+        if (solver.isotropicGrid) {
+            const double hx = sx / solver.nx;
+            solver.ny = std::max(1, static_cast<int>(std::lround(solver.sy / hx)));
+            solver.nz = is3D
+                ? std::max(1, static_cast<int>(std::lround(solver.sz / hx)))
+                : 0;
+            if (is3D) {
+                ImGui::TextDisabled("Derived grid: %d x %d x %d", solver.nx, solver.ny, solver.nz);
+            }
+            else {
+                ImGui::TextDisabled("Derived grid: %d x %d", solver.nx, solver.ny);
+            }
+        }
+        else {
             solver.ny = std::max(solver.ny, 1);
             solver.nz = is3D ? std::max(solver.nz, 1) : 0;
-            solver.sx = std::max(solver.sx, 1.0e-6);
-            solver.sy = std::max(solver.sy, 1.0e-6);
-            solver.sz = std::max(solver.sz, 1.0e-6);
         }
     }
 
@@ -558,9 +572,17 @@ void Renderer::SimulationInfoPanel()
     const long long timeSteps = solver.dt > 0.0
         ? static_cast<long long>(std::ceil(solver.duration / solver.dt))
         : 0;
+    const double sx = solver.inletLength
+        + solver.designLength
+        + solver.outletLength;
 
     ImGui::TextColored(ImVec4(0.35f, 0.69f, 1.0f, 1.0f), "%s ANALYSIS", is3D ? "3D" : "2D");
     ImGui::Text("%lld elements", elements);
+    ImGui::Text("Duct: %.4f m = %.4f m inlet + %.4f m design + %.4f m outlet",
+                sx,
+                solver.inletLength,
+                solver.designLength,
+                solver.outletLength);
     ImGui::Text("%lld time steps", timeSteps);
     ImGui::Text("FFT: %d samples%s", solver.fftSamples, solver.useHannWindow ? " + Hann" : "");
     ImGui::Separator();

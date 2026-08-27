@@ -5,6 +5,32 @@
 
 using namespace mfem;
 
+namespace {
+
+enum class DomainAttribute {
+    inlet = 1,
+    design = 2,
+    outlet = 3
+};
+
+enum class CartesianBoundary2D {
+    bottom = 1,
+    right = 2,
+    top = 3,
+    left = 4
+};
+
+enum class CartesianBoundary3D {
+    bottom = 1,
+    front = 2,
+    right = 3,
+    back = 4,
+    left = 5,
+    top = 6
+};
+
+}
+
 // move this later outside?
 // TODO: Make comments doxygen-style with math and all to explain ur stuff
 
@@ -41,11 +67,17 @@ bool App::Solver::setMesh() {
     const int nx = settings.nx;
     const int ny = settings.ny;
     const int nz = settings.nz;
-    const mfem::real_t sx = settings.sx;
+    const mfem::real_t sx = settings.inletLength
+        + settings.designLength
+        + settings.outletLength;
     const mfem::real_t sy = settings.sy;
     const mfem::real_t sz = settings.sz;
 
-    if (nx <= 0 || ny < 0 || nz < 0 || sx <= 0.0 || sy <= 0.0 || sz <= 0.0) {
+    if (nx <= 0 || ny < 0 || nz < 0
+        || settings.inletLength <= 0.0
+        || settings.designLength <= 0.0
+        || settings.outletLength <= 0.0
+        || sy <= 0.0 || sz <= 0.0) {
         log(App::LogLevel::Error, "Mesh element counts and extents must be positive.");
         return false;
     }
@@ -83,13 +115,6 @@ bool App::Solver::setMesh() {
 bool App::Solver::assembleSolutionSpace(){
 
     // TODO: Fix the inconsistent use of floats, doubles, and mfem real_ts in the codebase.
-    const real_t sx = settings.sx;
-    const real_t sy = settings.sy;
-    const real_t sz = settings.sz;
-    const double hx = settings.sx / settings.nx;
-    const double hy = settings.sy / settings.ny;
-    const double hz = settings.sz / settings.nz;
-
     if (!mesh || fe_order <= 0 || settings.dt <= 0.0) {
         log(App::LogLevel::Error, "Cannot assemble the solution space: mesh, finite-element order, or time step is invalid.");
         return false;
@@ -103,6 +128,64 @@ bool App::Solver::assembleSolutionSpace(){
 
     // TODO: How can we construct your mesh from the app levelset?
     level_set_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get());
+
+    // Domain regions along x
+    int inlet_element_count = 0;
+    int design_element_count = 0;
+    int outlet_element_count = 0;
+    const double design_start = settings.inletLength;
+    const double design_end = settings.inletLength + settings.designLength;
+    Vector element_center(dim);
+
+    for (int element = 0; element < mesh->GetNE(); element++) {
+        const Geometry::Type geometry = mesh->GetElementBaseGeometry(element);
+        const IntegrationPoint& center = Geometries.GetCenter(geometry);
+        ElementTransformation* transformation = mesh->GetElementTransformation(element);
+        transformation->Transform(center, element_center);
+
+        if (element_center[0] < design_start) {
+            mesh->SetAttribute(element, static_cast<int>(DomainAttribute::inlet));
+            inlet_element_count++;
+        }
+        else if (element_center[0] < design_end) {
+            mesh->SetAttribute(element, static_cast<int>(DomainAttribute::design));
+            design_element_count++;
+        }
+        else {
+            mesh->SetAttribute(element, static_cast<int>(DomainAttribute::outlet));
+            outlet_element_count++;
+        }
+    }
+    mesh->SetAttributes();
+
+    const int classified_element_count = inlet_element_count
+        + design_element_count
+        + outlet_element_count;
+    if (classified_element_count != mesh->GetNE()
+        || inlet_element_count == 0
+        || design_element_count == 0
+        || outlet_element_count == 0) {
+        log(App::LogLevel::Error,
+            "The inlet, design, and outlet lengths must each contain at least one mesh element center.");
+        return false;
+    }
+
+    Array<int> inlet_domain_marker(mesh->attributes.Max());
+    Array<int> design_domain_marker(mesh->attributes.Max());
+    Array<int> outlet_domain_marker(mesh->attributes.Max());
+    Array<int> air_domain_marker(mesh->attributes.Max());
+    inlet_domain_marker = 0;
+    design_domain_marker = 0;
+    outlet_domain_marker = 0;
+    air_domain_marker = 0;
+    inlet_domain_marker[static_cast<int>(DomainAttribute::inlet) - 1] = 1;
+    design_domain_marker[static_cast<int>(DomainAttribute::design) - 1] = 1;
+    outlet_domain_marker[static_cast<int>(DomainAttribute::outlet) - 1] = 1;
+    air_domain_marker[static_cast<int>(DomainAttribute::inlet) - 1] = 1;
+    air_domain_marker[static_cast<int>(DomainAttribute::outlet) - 1] = 1;
+
+    log(App::LogLevel::Message,
+        "Classified inlet, design, and outlet mesh regions along x.");
 
 
     //TODO: later make all below these comments persistent class members
@@ -187,12 +270,6 @@ bool App::Solver::assembleSolutionSpace(){
     const double alpha_d = (2 * physics->zeta * omega_1 * omega_2)/(omega_1 + omega_2); // Rayleigh mass factor, 1/s
     const double beta_d  = (2 * physics->zeta) / (omega_1 + omega_2); // Rayleigh stiffness factor, s
 
-    // TODO: Add these to the physics and settings later
-    double inletLength  = physics->inlet_length;
-    double designLength = physics->design_duct_length;
-    double outletLength = physics->outlet_length;
-
-
     // Newmark constants 
     // These are selected to keep the algo UNCONDITIONALLY STABLE
     double beta_nm = 0.25;
@@ -206,6 +283,35 @@ bool App::Solver::assembleSolutionSpace(){
     double a6 = 1 / (beta_nm * settings.dt * settings.dt);
 
     
+    // TODO: Multiplex 2D and 3D case
+    double lambda;
+    if (settings.nz > 0)
+    {
+        lambda = lame_3D;
+    }
+    else if (settings.nz == 0)
+    {
+        lambda = lame_ps;
+    }
+    else
+    {
+        // TODO: Get a better sense of humor
+        log(App::LogLevel::Warning, "Negative nz again?");
+        _sleep(200);
+        throw;
+    }
+
+    // Spatially varying material coefficients
+    LevelSetScaledCoefficient solid_rho(phi_h, rho_s, epsilon_f, true);
+    LevelSetScaledCoefficient solid_lambda(phi_h, lambda, epsilon_f, true);
+    LevelSetScaledCoefficient solid_mu(phi_h, mu, epsilon_f, true);
+    LevelSetScaledCoefficient damped_solid_rho(phi_h, rho_s * alpha_d, epsilon_f, true);
+    LevelSetScaledCoefficient damped_solid_lambda(phi_h, lambda * beta_d, epsilon_f, true);
+    LevelSetScaledCoefficient damped_solid_mu(phi_h, mu * beta_d, epsilon_f, true);
+    LevelSetScaledCoefficient acoustic_inv_rho(phi_h, 1/rho_a, epsilon_f, false);
+    LevelSetScaledCoefficient acoustic_inv_bulk(phi_h, 1/K_a, epsilon_f, false);
+    ConstantCoefficient acoustic_inv_impedance(1/(rho_a * c_a));
+
     // Weak form matrix blocks
     // All these should be unique_pointers initially null in the solver since their 
     // Construction is stateful
@@ -236,32 +342,12 @@ bool App::Solver::assembleSolutionSpace(){
         pressure_fes.get()
     );
 
-
-    // TODO: Multiplex 2D and 3D case 
-    double lambda;
-    if (settings.nz > 0) 
-    {
-        lambda = lame_3D;
-    } 
-    else if (settings.nz == 0)
-    {
-        lambda = lame_ps;
-    }
-    else 
-    {
-        // TODO: Get a better sense of humor
-        log(App::LogLevel::Warning, "Negative nz again?");
-        _sleep(200);
-        throw;
-    }
-
     // Note: with the way im calling state transitions, i would normally defer this assembly
     // And finalization to a later function, but since we do all this in one go, well.... doesnt really matter
     // Adding the integrators
     Muu_form.AddDomainIntegrator(
         new VectorMassIntegrator(
-            LevelSetScaledCoefficient(phi_h, rho_s, epsilon_f, true
-            )
+            solid_rho
         )
     );
     Muu_form.Assemble();
@@ -269,8 +355,8 @@ bool App::Solver::assembleSolutionSpace(){
 
     Kuu_form.AddDomainIntegrator(
         new ElasticityIntegrator(
-            LevelSetScaledCoefficient(phi_h, lambda, epsilon_f, true), 
-            LevelSetScaledCoefficient(phi_h, mu, epsilon_f, true)
+            solid_lambda,
+            solid_mu
         ) // For the elasticity integrator, how does thios work
     );
     Kuu_form.Assemble();
@@ -278,13 +364,13 @@ bool App::Solver::assembleSolutionSpace(){
 
     Cuu_form.AddDomainIntegrator(
         new VectorMassIntegrator(
-            LevelSetScaledCoefficient(phi_h, rho_s * alpha_d, epsilon_f, true)
+            damped_solid_rho
         )
     );
     Cuu_form.AddDomainIntegrator(
         new ElasticityIntegrator(
-            LevelSetScaledCoefficient(phi_h, lambda * beta_d, epsilon_f, true),
-            LevelSetScaledCoefficient(phi_h, mu * beta_d, epsilon_f, true)
+            damped_solid_lambda,
+            damped_solid_mu
         )
     );
     Cuu_form.Assemble();
@@ -292,7 +378,7 @@ bool App::Solver::assembleSolutionSpace(){
 
     Kpp_form.AddDomainIntegrator(
         new DiffusionIntegrator(
-            LevelSetScaledCoefficient(phi_h, 1/rho_a, epsilon_f, false)
+            acoustic_inv_rho
         )
     );
     Kpp_form.Assemble();
@@ -300,22 +386,36 @@ bool App::Solver::assembleSolutionSpace(){
 
     Mpp_form.AddDomainIntegrator(
         new MassIntegrator(
-            LevelSetScaledCoefficient(phi_h, 1/K_a, epsilon_f, false)
+            acoustic_inv_bulk
         )
     );
+    Mpp_form.Assemble();
+    Mpp_form.Finalize();
     
     // TODO: How do we make the absorbing boundary into a periodic one with ?
-    
+    // oh yeah mesh brd_attributes go 1,2,3,4
     mfem::Array<int> absorbing_marker(
-        mesh->bdr_attributes.Max() + 1
+        mesh->bdr_attributes.Max()
     );
     absorbing_marker = 0;
 
+    const int inlet_boundary_attribute = dim == 3
+        ? static_cast<int>(CartesianBoundary3D::left)
+        : static_cast<int>(CartesianBoundary2D::left);
+    const int outlet_boundary_attribute = dim == 3
+        ? static_cast<int>(CartesianBoundary3D::right)
+        : static_cast<int>(CartesianBoundary2D::right);
+    absorbing_marker[inlet_boundary_attribute - 1] = 1;
+    absorbing_marker[outlet_boundary_attribute - 1] = 1;
+
     Cpp_form.AddBoundaryIntegrator(
         new BoundaryMassIntegrator(
-            ConstantCoefficient(1/(rho_a * c_a))
+            acoustic_inv_impedance
         ),
+        absorbing_marker
     );
+    Cpp_form.Assemble();
+    Cpp_form.Finalize();
 
 
 

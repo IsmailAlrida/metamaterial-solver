@@ -29,7 +29,6 @@ if(CMAKE_CUDA_COMPILER)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 endif()
 
-option(METAMATERIAL_DEPS_ONLY "Configure dependencies without creating the app target" OFF)
 option(METAMATERIAL_DEMO_MODE "Use deterministic fake solver, optimizer, exporter, and executor classes" ON)
 
 # ---------------------------------------------------------
@@ -193,11 +192,6 @@ FetchContent_Declare(
 set(CMAKE_SKIP_INSTALL_RULES ON)
 FetchContent_MakeAvailable(mfem)
 set(CMAKE_SKIP_INSTALL_RULES OFF)
-
-if(METAMATERIAL_DEPS_ONLY)
-  message(STATUS "Configured dependencies only; skipping metamaterial_app target.")
-  return()
-endif()
 
 # ---------------------------------------------------------
 # IMGUI & OPENGL WORKSPACE

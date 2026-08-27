@@ -36,6 +36,9 @@ int main(int, char**)
         // Probably an equally spaced square grid of cylinders/circles with some radius each; basically a sonic crystal whose shape we can weakly try to guess from the bandgap. Or just hardocde a single crystal structure. how about that?
         const int dimension = solverSettings.nz > 0 ? 3 : 2;
         const int nz = solverSettings.nz > 0 ? solverSettings.nz : 1;
+        const double sx = solverSettings.inletLength
+            + solverSettings.designLength
+            + solverSettings.outletLength;
 
         // LevelSet's GridFunction borrows this finite-element space, so the mesh,
         // collection, and space all remain top-level and outlive the LevelSet.
@@ -45,7 +48,7 @@ int main(int, char**)
                 solverSettings.ny,
                 nz,
                 mfem::Element::HEXAHEDRON,
-                solverSettings.sx,
+                sx,
                 solverSettings.sy,
                 solverSettings.sz))
             : std::make_unique<mfem::Mesh>(mfem::Mesh::MakeCartesian2D(
@@ -53,7 +56,7 @@ int main(int, char**)
                 solverSettings.ny,
                 mfem::Element::QUADRILATERAL,
                 true,
-                solverSettings.sx,
+                sx,
                 solverSettings.sy));
         auto levelSetFec = std::make_unique<mfem::H1_FECollection>(1, dimension);
         auto levelSetFes = std::make_unique<mfem::FiniteElementSpace>(

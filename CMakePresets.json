@@ -8,8 +8,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_EXPORT_COMPILE_COMMANDS": true,
-        "CMAKE_POLICY_VERSION_MINIMUM": "3.5",
-        "METAMATERIAL_DEPS_ONLY": "OFF"
+        "CMAKE_POLICY_VERSION_MINIMUM": "3.5"
       }
     },
     {
@@ -48,31 +47,19 @@
     },
     {
       "name": "deps-serial",
-      "inherits": "serial",
-      "cacheVariables": {
-        "METAMATERIAL_DEPS_ONLY": "ON"
-      }
+      "inherits": "serial"
     },
     {
       "name": "deps-serial-cuda",
-      "inherits": "serial-cuda",
-      "cacheVariables": {
-        "METAMATERIAL_DEPS_ONLY": "ON"
-      }
+      "inherits": "serial-cuda"
     },
     {
       "name": "deps-parallel-cpu",
-      "inherits": "parallel-cpu",
-      "cacheVariables": {
-        "METAMATERIAL_DEPS_ONLY": "ON"
-      }
+      "inherits": "parallel-cpu"
     },
     {
       "name": "deps-parallel-cpu-cuda",
-      "inherits": "parallel-cpu-cuda",
-      "cacheVariables": {
-        "METAMATERIAL_DEPS_ONLY": "ON"
-      }
+      "inherits": "parallel-cpu-cuda"
     }
   ],
   "buildPresets": [

@@ -100,7 +100,9 @@ struct SolverSettings {
     int nx = 250;
     int ny = 50;
     int nz = 0;
-    double sx = 0.5;
+    double inletLength = 0.1;
+    double designLength = 0.3;
+    double outletLength = 0.1;
     double sy = 0.1;
     double sz = 1.0;
     double duration = 0.2;

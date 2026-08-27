@@ -41,7 +41,7 @@ cmake --preset "%PRESET%"
 if errorlevel 1 exit /b %errorlevel%
 
 if "%MODE%"=="deps" (
-    echo Dependency configure completed for %BACKEND%.
+    echo LSP configuration completed for %BACKEND%. The app was not built.
     exit /b 0
 )
 
