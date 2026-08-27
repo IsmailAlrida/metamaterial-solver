@@ -1,5 +1,7 @@
+#include <algorithm>
 #include <cmath>
 #include <iostream>
+#include "integrators.hpp"
 #include "solver.hpp"
 
 
@@ -232,9 +234,6 @@ bool App::Solver::assembleSolutionSpace(){
     // TODO: Here is where we adapt the LevelSet lset into the phi_h grid function
     // phi_h.ProjectCoefficient(/* LevelSet coefficient */);
 
-    // because algoimintegrationrules takes the level set as a coefficient
-    GridFunctionCoefficient phi_coeff(&phi_h);
-
     // All these doubles should be re-evaluted in later steps as mfem ConstantCoeffecients
     // Well, not CONSTANT coeffecient. We want to have a base coeff, then for the 
     // Fictitious domain, we want just a spatially varying coeff that is either real or fict
@@ -417,20 +416,57 @@ bool App::Solver::assembleSolutionSpace(){
     Cpp_form.Assemble();
     Cpp_form.Finalize();
 
+    // Kup: scalar pressure trial -> vector displacement test
+    Kup_form.AddDomainIntegrator(
+        new App::ImplicitSurfaceNormalIntegrator(
+            phi_h,
+            cut_integration_order,
+            level_set_order,
+            -1.0,
+            false
+        ),
+        design_domain_marker
+    );
+    Kup_form.Assemble();
+    Kup_form.Finalize();
 
+    // Mpu: vector displacement trial -> scalar pressure test
+    Mpu_form.AddDomainIntegrator(
+        new App::ImplicitSurfaceNormalIntegrator(
+            phi_h,
+            cut_integration_order,
+            level_set_order,
+            1.0,
+            true
+        ),
+        design_domain_marker
+    );
+    Mpu_form.Assemble();
+    Mpu_form.Finalize();
+
+    std::unique_ptr<SparseMatrix> Kup_transpose(
+        Transpose(Kup_form.SpMat())
+    );
+    std::unique_ptr<SparseMatrix> coupling_residual(
+        Add(1.0, Mpu_form.SpMat(), 1.0, *Kup_transpose)
+    );
+    const real_t coupling_scale = std::max(
+        real_t{1.0},
+        std::max(Mpu_form.SpMat().MaxNorm(), Kup_transpose->MaxNorm())
+    );
+    if (coupling_residual->MaxNorm() > 1.0e-10 * coupling_scale) {
+        log(App::LogLevel::Error, "The implicit coupling matrices do not satisfy Mpu = -Kup^T.");
+        return false;
+    }
+
+    SparseMatrix M;
+    M.ad
 
 
 
     mfem::Vector g;
     mfem::BlockVector h;
 
-
-    // we still need this bad boy to more accurately sample
-    // stuff even in a fictitious domain
-    // See, though we're doing physics on the whole thing, we're more able 
-    // to discern the geometry through cutting, rather than just sampling based on pos/neg
-    // Here, phi_degree is the polynomial degree of which we project the level set coefficient to a gridfunction
-    mfem::AlgoimIntegrationRules solid_rules(cut_integration_order, phi_coeff, level_set_order);
 
     log(App::LogLevel::Message, "Assembled the vibroacoustic solution space.");
     return true;
