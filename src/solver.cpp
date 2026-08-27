@@ -137,6 +137,8 @@ bool App::Solver::assembleSolutionSpace(){
 
     };
 
+    // TODO: Run a filtered solver for the PDE filter
+
 
     // TODO: ALl needs to be unique_pointered and set as class variables
     GridFunction phi_h(level_set_fes.get());
@@ -172,6 +174,7 @@ bool App::Solver::assembleSolutionSpace(){
     const double lame_ps = (E * nu) / (1 - std::pow(nu, 2));
     const double lame_3D = (E * nu) / ((1 + nu)*(1 - 2*nu)); // FIXME: If-gate the lame coefficient
 
+
     // Acoustic domain stuff
     const double rho_a = physics->rho_a; // Fluid Density kg/m^3
     const double c_a = physics->c_a; // sound speed, m/s
@@ -184,6 +187,10 @@ bool App::Solver::assembleSolutionSpace(){
     const double alpha_d = (2 * physics->zeta * omega_1 * omega_2)/(omega_1 + omega_2); // Rayleigh mass factor, 1/s
     const double beta_d  = (2 * physics->zeta) / (omega_1 + omega_2); // Rayleigh stiffness factor, s
 
+    // TODO: Add these to the physics and settings later
+    double inletLength  = physics->inlet_length;
+    double designLength = physics->design_duct_length;
+    double outletLength = physics->outlet_length;
 
 
     // Newmark constants 
@@ -213,7 +220,7 @@ bool App::Solver::assembleSolutionSpace(){
     // These bad boys can be ressambleed each time
     // FInal input of this function is that the final discrete system 
     // Is assembled and ready to go
-    BilinearForm muu_form(displacement_fes.get());
+    BilinearForm Muu_form(displacement_fes.get());
     BilinearForm Kuu_form(displacement_fes.get());
     BilinearForm Cuu_form(displacement_fes.get());
     BilinearForm Mpp_form(pressure_fes.get());
@@ -228,6 +235,90 @@ bool App::Solver::assembleSolutionSpace(){
         displacement_fes.get(), 
         pressure_fes.get()
     );
+
+
+    // TODO: Multiplex 2D and 3D case 
+    double lambda;
+    if (settings.nz > 0) 
+    {
+        lambda = lame_3D;
+    } 
+    else if (settings.nz == 0)
+    {
+        lambda = lame_ps;
+    }
+    else 
+    {
+        // TODO: Get a better sense of humor
+        log(App::LogLevel::Warning, "Negative nz again?");
+        _sleep(200);
+        throw;
+    }
+
+    // Note: with the way im calling state transitions, i would normally defer this assembly
+    // And finalization to a later function, but since we do all this in one go, well.... doesnt really matter
+    // Adding the integrators
+    Muu_form.AddDomainIntegrator(
+        new VectorMassIntegrator(
+            LevelSetScaledCoefficient(phi_h, rho_s, epsilon_f, true
+            )
+        )
+    );
+    Muu_form.Assemble();
+    Muu_form.Finalize();
+
+    Kuu_form.AddDomainIntegrator(
+        new ElasticityIntegrator(
+            LevelSetScaledCoefficient(phi_h, lambda, epsilon_f, true), 
+            LevelSetScaledCoefficient(phi_h, mu, epsilon_f, true)
+        ) // For the elasticity integrator, how does thios work
+    );
+    Kuu_form.Assemble();
+    Kuu_form.Finalize();
+
+    Cuu_form.AddDomainIntegrator(
+        new VectorMassIntegrator(
+            LevelSetScaledCoefficient(phi_h, rho_s * alpha_d, epsilon_f, true)
+        )
+    );
+    Cuu_form.AddDomainIntegrator(
+        new ElasticityIntegrator(
+            LevelSetScaledCoefficient(phi_h, lambda * beta_d, epsilon_f, true),
+            LevelSetScaledCoefficient(phi_h, mu * beta_d, epsilon_f, true)
+        )
+    );
+    Cuu_form.Assemble();
+    Cuu_form.Finalize();
+
+    Kpp_form.AddDomainIntegrator(
+        new DiffusionIntegrator(
+            LevelSetScaledCoefficient(phi_h, 1/rho_a, epsilon_f, false)
+        )
+    );
+    Kpp_form.Assemble();
+    Kpp_form.Finalize();
+
+    Mpp_form.AddDomainIntegrator(
+        new MassIntegrator(
+            LevelSetScaledCoefficient(phi_h, 1/K_a, epsilon_f, false)
+        )
+    );
+    
+    // TODO: How do we make the absorbing boundary into a periodic one with ?
+    
+    mfem::Array<int> absorbing_marker(
+        mesh->bdr_attributes.Max() + 1
+    );
+    absorbing_marker = 0;
+
+    Cpp_form.AddBoundaryIntegrator(
+        new BoundaryMassIntegrator(
+            ConstantCoefficient(1/(rho_a * c_a))
+        ),
+    );
+
+
+
 
 
     mfem::Vector g;

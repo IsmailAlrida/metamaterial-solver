@@ -37,6 +37,7 @@ public:
     }
 };
 
+// TODO: Figure out what final and explicit do
 class NegatedCoefficient final : public mfem::Coefficient {
 public:
     explicit NegatedCoefficient(mfem::Coefficient &source) : source(source) {}

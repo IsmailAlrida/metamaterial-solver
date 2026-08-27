@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <utility>
 
+#include "icons.hpp"
 #include "imgui_internal.h"
 #include "imgui_impl_opengl3.h"
 #include "imgui_impl_sdl2.h"
@@ -359,31 +360,33 @@ void Renderer::StartMenu()
         return;
     }
 
+    // TODO: Increase size and bottom padding a little here
+
     ImGui::TextColored(ImVec4(0.39f, 0.70f, 1.0f, 1.0f), "METAMATERIAL LAB");
     ImGui::Separator();
 
-    if (ImGui::BeginMenu("File")) {
-        if (ImGui::MenuItem("Exit", "Alt+F4")) {
-            shouldClose = true;
-        }
-        ImGui::EndMenu();
-    }
+    // if (ImGui::BeginMenu("File")) {
+    //     if (ImGui::MenuItem("Exit", "Alt+F4")) {
+    //         shouldClose = true;
+    //     }
+    //     ImGui::EndMenu();
+    // }
 
-    if (ImGui::BeginMenu("View")) {
-        if (ImGui::MenuItem("Simulation Settings")) {
-            ImGui::SetWindowFocus("Simulation Settings");
-        }
-        if (ImGui::MenuItem("Visualization")) {
-            ImGui::SetWindowFocus("Visualization");
-        }
-        if (ImGui::MenuItem("Frequency Response")) {
-            ImGui::SetWindowFocus("Frequency Response");
-        }
-        if (ImGui::MenuItem("Console")) {
-            ImGui::SetWindowFocus("Console");
-        }
-        ImGui::EndMenu();
-    }
+    // if (ImGui::BeginMenu("View")) {
+    //     if (ImGui::MenuItem("Simulation Settings")) {
+    //         ImGui::SetWindowFocus("Simulation Settings");
+    //     }
+    //     if (ImGui::MenuItem("Visualization")) {
+    //         ImGui::SetWindowFocus("Visualization");
+    //     }
+    //     if (ImGui::MenuItem("Frequency Response")) {
+    //         ImGui::SetWindowFocus("Frequency Response");
+    //     }
+    //     if (ImGui::MenuItem("Console")) {
+    //         ImGui::SetWindowFocus("Console");
+    //     }
+    //     ImGui::EndMenu();
+    // }
 
     const char* state = "IDLE";
     ImVec4 stateColor(0.52f, 0.61f, 0.72f, 1.0f);
@@ -518,7 +521,7 @@ void Renderer::SimulationSettingsPanel()
         }
     }
 
-    if (ImGui::CollapsingHeader("Time integration & FFT", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ImGui::CollapsingHeader("Fourier Transform & Solver Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::InputDouble("Duration (s)", &solver.duration, 0.001, 0.01, "%.5f");
         ImGui::InputDouble("Time step dt (s)", &solver.dt, 1.0e-6, 1.0e-5, "%.7f");
         ImGui::InputInt("FFT samples", &solver.fftSamples, 128, 1024);
@@ -529,21 +532,13 @@ void Renderer::SimulationSettingsPanel()
         ImGui::TextDisabled("Newmark beta: 0.25    gamma: 0.50");
     }
 
-    if (ImGui::CollapsingHeader("Optimization")) {
+    if (ImGui::CollapsingHeader("Optimizer Settings")) {
         ImGui::InputFloat("Smoothing radius (m)", &optimizer.filterRadius, 0.0001f, 0.001f, "%.5f");
         ImGui::InputInt("Maximum iterations", &optimizer.maxIterations);
         optimizer.filterRadius = std::max(optimizer.filterRadius, 0.0f);
         optimizer.maxIterations = std::clamp(optimizer.maxIterations, 1, 10000);
     }
 
-    if (ImGui::CollapsingHeader("Backend")) {
-        ImGui::Text("Execution");
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.35f, 0.69f, 1.0f, 1.0f), "SERIAL");
-        ImGui::TextDisabled("The CMake backend controls parallel and CUDA availability.");
-        ImGui::Text("GLVis host  %s", solver.glvisHost.c_str());
-        ImGui::InputInt("GLVis port", &solver.glvisPort);
-    }
     ImGui::EndDisabled();
     ImGui::End();
 }
@@ -823,11 +818,9 @@ void Renderer::bandgapGroup(Bandgap* bandgap)
         return;
     }
 
-    ImGui::SetNextItemWidth(-1.0f);
     ImGui::InputFloat("Center (Hz)", &bandgap->center, 10.0f, 100.0f, "%.1f");
-    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::SameLine();
     ImGui::InputFloat("Bandwidth (Hz)", &bandgap->bandwidth, 10.0f, 100.0f, "%.1f");
-    ImGui::SetNextItemWidth(-1.0f);
     ImGui::InputFloat("Attenuation (dB)", &bandgap->attenuationDb, 1.0f, 5.0f, "%.1f");
     bandgap->bandwidth = std::max(bandgap->bandwidth, 0.0f);
 }
@@ -868,7 +861,7 @@ void Renderer::ActionPanel(solver_t& solver,
         1.0f);
     const std::string progressLabel = std::to_string(completedIterations)
         + " / " + std::to_string(maximumIterations) + " iterations";
-    ImGui::ProgressBar(progress, ImVec2(-1.0f, 0.0f), progressLabel.c_str());
+    ImGui::ProgressBar(progress, ImVec2(-1.0f, 2.0f), progressLabel.c_str());
     ImGui::Spacing();
 
 #if METAMATERIAL_DEMO_MODE
@@ -1105,6 +1098,9 @@ void Renderer::loadFonts()
     }
     if (consoleFont == nullptr) {
         consoleFont = uiFont;
+    }
+    if (!Icons::load(io, uiFont, 18.0f)) {
+        log(LogLevel::Warning, "Material Symbols icon font could not be loaded.");
     }
     io.FontDefault = uiFont;
 }
