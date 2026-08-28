@@ -32,7 +32,7 @@ class FakeOptimizer {
                 geometry.design[i] = std::clamp(
                     0.5 + 0.34 * std::sin(position * 18.0 + phase), 0.0, 1.0);
             }
-            geometry.phi.SetFromTrueDofs(geometry.design);
+            geometry.phi->SetFromTrueDofs(geometry.design);
             log(LogLevel::Message,
                 "Demo optimizer updated the shared level-set design.");
         }

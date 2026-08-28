@@ -1,4 +1,5 @@
 #pragma once
+#include <memory>
 #include <vector>
 #include <array>
 #include <string>
@@ -18,16 +19,36 @@ class LevelSet {
 
         // Apparenlty the member initilaizer constructs the members with the args passed to it as you see
 
-        explicit LevelSet(mfem::FiniteElementSpace& fes)
-        :
-        design(fes.GetTrueVSize()),
-        phi(&fes)
+        LevelSet()
+        : phi(std::make_unique<mfem::GridFunction>())
         {
+        }
 
+        explicit LevelSet(mfem::FiniteElementSpace& fes)
+        : LevelSet()
+        {
+            setSpace(fes);
+        }
+
+        void setSpace(mfem::FiniteElementSpace& fes)
+        {
+            const bool initialize_design = design.Size() != fes.GetTrueVSize();
+            design.SetSize(fes.GetTrueVSize());
+            if (initialize_design) {
+                design = 0.5;
+            }
+
+            phi = std::make_unique<mfem::GridFunction>(&fes);
+            phi->SetFromTrueDofs(design);
+        }
+
+        void detach()
+        {
+            phi = std::make_unique<mfem::GridFunction>();
         }
         
         mfem::Vector design;
-        mfem::GridFunction phi;
+        std::unique_ptr<mfem::GridFunction> phi;
 
 
 };

@@ -49,16 +49,18 @@ App::Solver::Solver(
             log(log),
             mesh(nullptr),
             fec(nullptr),
-            pressure_fes(nullptr),
+            scalar_fes(nullptr),
             displacement_fes(nullptr),
-            level_set_fes(nullptr),
             fe_order(0),
             level_set_order(0),
             cut_integration_order(0)
             {
             }
 
-App::Solver::~Solver() = default;
+App::Solver::~Solver()
+{
+    lset.detach();
+}
 
 // TODO: Do something about the mixed camelCase and snake_case. Choose one.
 // Given for this iteration we will run the following sequentially
@@ -94,7 +96,8 @@ bool App::Solver::setMesh() {
         return false;
     }
 
-    pressure_fes.reset();
+    lset.detach();
+    scalar_fes.reset();
     displacement_fes.reset();
     fec.reset();
 
@@ -128,11 +131,9 @@ bool App::Solver::assembleSolutionSpace(){
     K.reset();
 
     fec = std::make_unique<H1_FECollection>(fe_order, dim);
-    pressure_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get());
+    scalar_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get());
     displacement_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get(), dim, Ordering::byVDIM);
-
-    // TODO: How can we construct your mesh from the app levelset?
-    level_set_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get());
+    lset.setSpace(*scalar_fes);
 
     // Domain regions along x
     int inlet_element_count = 0;
@@ -196,11 +197,9 @@ bool App::Solver::assembleSolutionSpace(){
     //TODO: later make all below these comments persistent class members
     Array<int> pressure_boundary_dofs;
     Array<int> displacment_boundary_dofs;
-    Array<int> level_set_boundary_dofs;
 
-    pressure_fes->GetBoundaryTrueDofs(pressure_boundary_dofs);
+    scalar_fes->GetBoundaryTrueDofs(pressure_boundary_dofs);
     displacement_fes->GetBoundaryTrueDofs(displacment_boundary_dofs);
-    level_set_fes->GetBoundaryTrueDofs(level_set_boundary_dofs);
 
 
     const real_t he = mesh->GetElementSize(0, 1);
@@ -209,8 +208,9 @@ bool App::Solver::assembleSolutionSpace(){
     mapped_design -= 0.5;
     mapped_design *= he;
 
-    GridFunction mapped_design_h(level_set_fes.get());
+    GridFunction mapped_design_h(scalar_fes.get());
     mapped_design_h.SetFromTrueDofs(mapped_design);
+    lset.phi->SetFromTrueDofs(mapped_design);
 
     // Sample code for how we can get center DOFs
     Vector center_design_values(mesh->GetNE());
@@ -229,13 +229,8 @@ bool App::Solver::assembleSolutionSpace(){
 
 
     // TODO: ALl needs to be unique_pointered and set as class variables
-    GridFunction phi_h(level_set_fes.get());
-    GridFunction pressure(pressure_fes.get());
+    GridFunction pressure(scalar_fes.get());
     GridFunction displacement(displacement_fes.get());
-
-
-    // TODO: Here is where we adapt the LevelSet lset into the phi_h grid function
-    // phi_h.ProjectCoefficient(/* LevelSet coefficient */);
 
     // All these doubles should be re-evaluted in later steps as mfem ConstantCoeffecients
     // Well, not CONSTANT coeffecient. We want to have a base coeff, then for the 
@@ -291,14 +286,14 @@ bool App::Solver::assembleSolutionSpace(){
     }
 
     // Spatially varying material coefficients
-    LevelSetScaledCoefficient solid_rho(phi_h, rho_s, epsilon_f, true);
-    LevelSetScaledCoefficient solid_lambda(phi_h, lambda, epsilon_f, true);
-    LevelSetScaledCoefficient solid_mu(phi_h, mu, epsilon_f, true);
-    LevelSetScaledCoefficient damped_solid_rho(phi_h, rho_s * alpha_d, epsilon_f, true);
-    LevelSetScaledCoefficient damped_solid_lambda(phi_h, lambda * beta_d, epsilon_f, true);
-    LevelSetScaledCoefficient damped_solid_mu(phi_h, mu * beta_d, epsilon_f, true);
-    LevelSetScaledCoefficient acoustic_inv_rho(phi_h, 1/rho_a, epsilon_f, false);
-    LevelSetScaledCoefficient acoustic_inv_bulk(phi_h, 1/K_a, epsilon_f, false);
+    LevelSetScaledCoefficient solid_rho(*lset.phi, rho_s, epsilon_f, true);
+    LevelSetScaledCoefficient solid_lambda(*lset.phi, lambda, epsilon_f, true);
+    LevelSetScaledCoefficient solid_mu(*lset.phi, mu, epsilon_f, true);
+    LevelSetScaledCoefficient damped_solid_rho(*lset.phi, rho_s * alpha_d, epsilon_f, true);
+    LevelSetScaledCoefficient damped_solid_lambda(*lset.phi, lambda * beta_d, epsilon_f, true);
+    LevelSetScaledCoefficient damped_solid_mu(*lset.phi, mu * beta_d, epsilon_f, true);
+    LevelSetScaledCoefficient acoustic_inv_rho(*lset.phi, 1/rho_a, epsilon_f, false);
+    LevelSetScaledCoefficient acoustic_inv_bulk(*lset.phi, 1/K_a, epsilon_f, false);
     ConstantCoefficient acoustic_inv_impedance(1/(rho_a * c_a));
 
     // Weak form matrix blocks
@@ -318,17 +313,17 @@ bool App::Solver::assembleSolutionSpace(){
     BilinearForm Muu_form(displacement_fes.get());
     BilinearForm Kuu_form(displacement_fes.get());
     BilinearForm Cuu_form(displacement_fes.get());
-    BilinearForm Mpp_form(pressure_fes.get());
-    BilinearForm Kpp_form(pressure_fes.get());
-    BilinearForm Cpp_form(pressure_fes.get());
+    BilinearForm Mpp_form(scalar_fes.get());
+    BilinearForm Kpp_form(scalar_fes.get());
+    BilinearForm Cpp_form(scalar_fes.get());
 
     MixedBilinearForm Kup_form(
-        pressure_fes.get(), 
+        scalar_fes.get(), 
         displacement_fes.get()
     );
     MixedBilinearForm Mpu_form(
         displacement_fes.get(), 
-        pressure_fes.get()
+        scalar_fes.get()
     );
 
     // Note: with the way im calling state transitions, i would normally defer this assembly
@@ -416,7 +411,7 @@ bool App::Solver::assembleSolutionSpace(){
     // Kup: scalar pressure trial -> vector displacement test
     Kup_form.AddDomainIntegrator(
         new App::ImplicitSurfaceNormalIntegrator(
-            phi_h,
+            *lset.phi,
             cut_integration_order,
             level_set_order,
             -1.0,
@@ -431,7 +426,7 @@ bool App::Solver::assembleSolutionSpace(){
     // Mpu: vector displacement trial -> scalar pressure test
     Mpu_form.AddDomainIntegrator(
         new App::ImplicitSurfaceNormalIntegrator(
-            phi_h,
+            *lset.phi,
             cut_integration_order,
             level_set_order,
             1.0,
@@ -461,7 +456,7 @@ bool App::Solver::assembleSolutionSpace(){
     mfem::Array<int> offsets(3);
     offsets[0] = 0;
     offsets[1] = displacement_fes->GetVSize();
-    offsets[2] = pressure_fes->GetVSize() + offsets[1];
+    offsets[2] = scalar_fes->GetVSize() + offsets[1];
 
     BlockMatrix M_blocks(offsets);
     M_blocks.SetBlock(0, 0, Muu.get());

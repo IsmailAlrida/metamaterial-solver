@@ -19,9 +19,24 @@ class FakeSolver {
             : settings(settings),
               lset(lset),
               result(result),
-              log(log)
+              log(log),
+              mesh(mfem::Mesh::MakeCartesian2D(
+                  32,
+                  16,
+                  mfem::Element::QUADRILATERAL,
+                  true,
+                  2.0,
+                  1.0)),
+              fec(1, mesh.Dimension()),
+              fespace(&mesh, &fec)
         {
+            lset.setSpace(fespace);
             populateResponse();
+        }
+
+        ~FakeSolver()
+        {
+            lset.detach();
         }
 
         bool setup()
@@ -47,17 +62,6 @@ class FakeSolver {
         bool solve()
         {
             // MFEM Example 1: solve -Delta u = 1 with homogeneous Dirichlet data.
-            mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(
-                32,
-                16,
-                mfem::Element::QUADRILATERAL,
-                true,
-                2.0,
-                1.0);
-            const int dimension = mesh.Dimension();
-            mfem::H1_FECollection fec(1, dimension);
-            mfem::FiniteElementSpace fespace(&mesh, &fec);
-
             mfem::Array<int> essentialTrueDofs;
             if (mesh.bdr_attributes.Size()) {
                 mfem::Array<int> essentialBoundary(mesh.bdr_attributes.Max());
@@ -162,6 +166,9 @@ class FakeSolver {
         LevelSet& lset;
         SolverResult& result;
         const LogFunction& log;
+        mfem::Mesh mesh;
+        mfem::H1_FECollection fec;
+        mfem::FiniteElementSpace fespace;
         int solveCount = 0;
 };
 

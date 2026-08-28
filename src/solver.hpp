@@ -39,9 +39,8 @@ namespace App {
 
         std::unique_ptr<mfem::Mesh> mesh;
         std::unique_ptr<mfem::H1_FECollection> fec;
-        std::unique_ptr<mfem::FiniteElementSpace> pressure_fes;
+        std::unique_ptr<mfem::FiniteElementSpace> scalar_fes;
         std::unique_ptr<mfem::FiniteElementSpace> displacement_fes;
-        std::unique_ptr<mfem::FiniteElementSpace> level_set_fes;
 
         int fe_order;
         int level_set_order;

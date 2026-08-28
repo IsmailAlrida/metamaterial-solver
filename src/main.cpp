@@ -27,43 +27,11 @@ int main(int, char**)
         auto result = std::make_unique<App::SolverResult>();
         auto& solverResult = *result;
 
-        // TODO: Fold all this setup code into the levelset class, this shouldnt be here.
         // TODO: This needs an initial guess constructor to construct the first lset guess
         // Probably an equally spaced square grid of cylinders/circles with some radius each; basically a sonic crystal whose shape we can weakly try to guess from the bandgap. Or just hardocde a single crystal structure. how about that?
-        const int dimension = solverSettings.nz > 0 ? 3 : 2;
-        const int nz = solverSettings.nz > 0 ? solverSettings.nz : 1;
-        const double sx = solverSettings.inletLength
-            + solverSettings.designLength
-            + solverSettings.outletLength;
-
-        // LevelSet's GridFunction borrows this finite-element space, so the mesh,
-        // collection, and space all remain top-level and outlive the LevelSet.
-        // We shouldnt have a second mesh for the levelset, we should find a way to 
-        
-        auto levelSetMesh = solverSettings.nz > 0
-            ? std::make_unique<mfem::Mesh>(mfem::Mesh::MakeCartesian3D(
-                solverSettings.nx,
-                solverSettings.ny,
-                nz,
-                mfem::Element::HEXAHEDRON,
-                sx,
-                solverSettings.sy,
-                solverSettings.sz))
-            : std::make_unique<mfem::Mesh>(mfem::Mesh::MakeCartesian2D(
-                solverSettings.nx,
-                solverSettings.ny,
-                mfem::Element::QUADRILATERAL,
-                true,
-                sx,
-                solverSettings.sy));
-        auto levelSetFec = std::make_unique<mfem::H1_FECollection>(1, dimension);
-        auto levelSetFes = std::make_unique<mfem::FiniteElementSpace>(
-            levelSetMesh.get(), levelSetFec.get());
-        auto lset = std::make_unique<App::LevelSet>(*levelSetFes);
+        auto lset = std::make_unique<App::LevelSet>();
         auto& geometry = *lset;
         // TODO: Make the initial design guess the same shape as the paper has
-        geometry.design = 0.5;
-        geometry.phi.SetFromTrueDofs(geometry.design);
 
         // Keep the renderer alive longer than the objects that will publish to it.
         auto renderer = std::make_unique<App::Renderer>(
