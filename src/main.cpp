@@ -15,9 +15,6 @@
 int main(int, char**)
 {
     try {
-        const std::string glvisHost = "localhost";
-        const int glvisPort = 19916;
-
         // Construct the top-level data. Everyone below receives references to these.
         // TODO: Make App settings construct defaults
         auto settings = std::make_unique<App::AppSettings>();
@@ -25,9 +22,6 @@ int main(int, char**)
         auto& solverSettings = appSettings.solverSettings;
         auto& optimizerSettings = appSettings.optSettings;
         auto& exporterSettings = appSettings.exporterSettings;
-
-        solverSettings.glvisHost = glvisHost;
-        solverSettings.glvisPort = glvisPort;
 
         auto result = std::make_unique<App::SolverResult>();
         auto& solverResult = *result;
@@ -95,8 +89,6 @@ int main(int, char**)
         renderer->setup();
         log(App::LogLevel::Message, "Renderer initialized");
 
-        // For now, the visualization panel stays in the normal ImGui frame.
-        // TODO: Bind GLVis through the existing network stream before embedding it natively.
         while (!renderer->shouldClose) {
             renderer->displayFrame(*solver, *optimizer, *exporter, *executor);
         }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -29,6 +30,7 @@ namespace App {
 
     struct AppSettings;
     struct Bandgap;
+    class GlvisAdapter;
 
 #if METAMATERIAL_DEMO_MODE
     using solver_t = Demo::FakeSolver;
@@ -61,7 +63,6 @@ namespace App {
                               optimizer_t& optimizer,
                               exporter_t& exporter,
                               executor_t& executor);
-            void GlvisPanel();
             void LogPanel();
             void log(LogLevel level, std::string msg);
 
@@ -98,6 +99,7 @@ namespace App {
             bool implotContextCreated = false;
             bool sdlBackendInitialized = false;
             bool openglBackendInitialized = false;
+            std::unique_ptr<GlvisAdapter> glvis;
 
             struct LogEntry {
                 LogLevel level;

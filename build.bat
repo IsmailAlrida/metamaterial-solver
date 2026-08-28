@@ -3,6 +3,7 @@ setlocal EnableExtensions
 
 set "MODE=build"
 set "BACKEND=%~1"
+set "GLVIS_REVISION=1b9988ade7b78f125377a3be5c2b8514eafbcf0c"
 
 if /I "%BACKEND%"=="deps" (
     set "MODE=deps"
@@ -37,7 +38,12 @@ if "%MODE%"=="deps" (
     if errorlevel 1 exit /b 1
 )
 
+call :patch_glvis
+if errorlevel 1 exit /b 1
+
 cmake --preset "%PRESET%"
+if errorlevel 1 exit /b %errorlevel%
+copy /Y "%BUILD_DIR%\compile_commands.json" "%~dp0compile_commands.json" >nul
 if errorlevel 1 exit /b %errorlevel%
 
 if "%MODE%"=="deps" (
@@ -66,11 +72,32 @@ exit /b 0
 if not exist extern mkdir extern
 if exist extern\glvis (
     echo GLVis source already exists at extern\glvis.
-    exit /b 0
+) else (
+    echo Fetching GLVis source into extern\glvis...
+    call git.exe clone https://github.com/GLVis/glvis.git extern\glvis
+    if errorlevel 1 exit /b 1
 )
 
-echo Fetching GLVis source into extern\glvis...
-call git.exe clone https://github.com/GLVis/glvis.git extern\glvis
-if errorlevel 1 exit /b 1
 if not exist extern\glvis\.git exit /b 1
+git.exe -C extern\glvis checkout --detach %GLVIS_REVISION%
+if errorlevel 1 exit /b 1
 exit /b 0
+
+:patch_glvis
+if not exist extern\glvis\.git (
+    echo GLVis source is missing. Run build.bat deps %BACKEND% first.
+    exit /b 1
+)
+
+set "GLVIS_PATCH=%~dp0patches\glvis-embedded-window.patch"
+git.exe -C extern\glvis apply --reverse --check "%GLVIS_PATCH%" >nul 2>nul
+if not errorlevel 1 exit /b 0
+
+git.exe -C extern\glvis apply --check "%GLVIS_PATCH%"
+if errorlevel 1 (
+    echo GLVis host-window patch does not apply to the downloaded revision.
+    exit /b 1
+)
+
+git.exe -C extern\glvis apply "%GLVIS_PATCH%"
+exit /b %errorlevel%

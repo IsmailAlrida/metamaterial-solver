@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <cmath>
 
+#include "glvis_adapter.hpp"
 #include "global_types.hpp"
 #include "logging.hpp"
+#include "mfem.hpp"
 
 namespace App::Demo {
 
@@ -32,35 +34,96 @@ class FakeSolver {
 
         bool setMesh()
         {
-            log(LogLevel::Message,
-                settings.nz > 0
-                    ? "Demo solver prepared a synthetic 3D mesh."
-                    : "Demo solver prepared a synthetic 2D mesh.");
+            log(LogLevel::Message, "MFEM Example 1 prepared its Cartesian mesh.");
             return true;
         }
 
         bool assembleSolutionSpace()
         {
-            log(LogLevel::Message,
-                "Demo solver assembled the synthetic vibroacoustic system.");
+            log(LogLevel::Message, "MFEM Example 1 prepared the Poisson problem.");
             return true;
         }
 
         bool solve()
         {
+            // MFEM Example 1: solve -Delta u = 1 with homogeneous Dirichlet data.
+            mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(
+                32,
+                16,
+                mfem::Element::QUADRILATERAL,
+                true,
+                2.0,
+                1.0);
+            const int dimension = mesh.Dimension();
+            mfem::H1_FECollection fec(1, dimension);
+            mfem::FiniteElementSpace fespace(&mesh, &fec);
+
+            mfem::Array<int> essentialTrueDofs;
+            if (mesh.bdr_attributes.Size()) {
+                mfem::Array<int> essentialBoundary(mesh.bdr_attributes.Max());
+                essentialBoundary = 0;
+                mesh.MarkExternalBoundaries(essentialBoundary);
+                fespace.GetEssentialTrueDofs(essentialBoundary, essentialTrueDofs);
+            }
+
+            mfem::ConstantCoefficient one(1.0);
+            mfem::LinearForm rightHandSide(&fespace);
+            rightHandSide.AddDomainIntegrator(new mfem::DomainLFIntegrator(one));
+            rightHandSide.Assemble();
+
+            mfem::GridFunction solution(&fespace);
+            solution = 0.0;
+
+            mfem::BilinearForm poisson(&fespace);
+            poisson.AddDomainIntegrator(new mfem::DiffusionIntegrator(one));
+            poisson.Assemble();
+
+            mfem::OperatorPtr system;
+            mfem::Vector systemRightHandSide;
+            mfem::Vector systemSolution;
+            poisson.FormLinearSystem(
+                essentialTrueDofs,
+                solution,
+                rightHandSide,
+                system,
+                systemSolution,
+                systemRightHandSide);
+
+            mfem::GSSmoother smoother(static_cast<mfem::SparseMatrix&>(*system));
+            mfem::PCG(
+                *system,
+                smoother,
+                systemRightHandSide,
+                systemSolution,
+                0,
+                200,
+                1e-12,
+                0.0);
+            poisson.RecoverFEMSolution(
+                systemSolution,
+                rightHandSide,
+                solution);
+
+            char host[] = "127.0.0.1";
+            mfem::socketstream stream(host, GlvisAdapter::Port);
+            if (!stream.good()) {
+                log(LogLevel::Error, "MFEM Example 1 could not connect to the GLVis adapter.");
+                return false;
+            }
+            stream.precision(8);
+            stream << "solution\n" << mesh << solution << std::flush;
+
             ++solveCount;
             populateResponse();
             result.success = 1;
-            log(LogLevel::Message,
-                "Demo forward solve updated the shared FFT response.");
+            log(LogLevel::Message, "MFEM Example 1 solved and streamed its solution to GLVis.");
             return true;
         }
 
         bool bindToGlvis()
         {
-            log(LogLevel::Warning,
-                "GLVis remains on the network-stream integration track.");
-            return false;
+            log(LogLevel::Message, "MFEM Example 1 streams to the embedded GLVis adapter.");
+            return true;
         }
 
     private:

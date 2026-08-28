@@ -1,0 +1,161 @@
+diff --git a/lib/aux_vis.cpp b/lib/aux_vis.cpp
+index 5aa0b5a..de91421 100644
+--- a/lib/aux_vis.cpp
++++ b/lib/aux_vis.cpp
+@@ -116,7 +116,7 @@ void MyExpose(GLsizei w, GLsizei h);
+ void MyExpose();
+ 
+ GLWindow* InitVisualization(const char name[], int x, int y, int w, int h,
+-                            bool headless)
++                            bool headless, GLWindow *host_window)
+ {
+ #ifdef GLVIS_DEBUG
+    if (!headless) { cout << "OpenGL Visualization" << endl; }
+@@ -132,7 +132,17 @@ GLWindow* InitVisualization(const char name[], int x, int y, int w, int h,
+    }
+ #endif
+ 
+-   if (!headless)
++   if (host_window)
++   {
++      wnd = host_window;
++      sdl_wnd = nullptr;
++      if (!wnd->createWindow(name, x, y, w, h, wndLegacyGl))
++      {
++         wnd = nullptr;
++         return NULL;
++      }
++   }
++   else if (!headless)
+    {
+       if (!sdl_wnd)
+       {
+@@ -269,6 +279,17 @@ GLWindow* InitVisualization(const char name[], int x, int y, int w, int h,
+    return wnd;
+ }
+ 
++void ReleaseVisualization(GLWindow *window)
++{
++   if (wnd != window) { return; }
++
++   visualize = 0;
++   locscene = nullptr;
++   glvis_command = nullptr;
++   wnd = nullptr;
++   sdl_wnd = nullptr;
++}
++
+ void SendKeySequence(const char *seq)
+ {
+    for (const char* key = seq; *key != '\0'; key++)
+diff --git a/lib/aux_vis.hpp b/lib/aux_vis.hpp
+index 7df7fdb..137a023 100644
+--- a/lib/aux_vis.hpp
++++ b/lib/aux_vis.hpp
+@@ -28,7 +28,11 @@ void SetGLVisCommand(GLVisCommand *cmd);
+ 
+ /// Initializes the visualization and some keys.
+ GLWindow* InitVisualization(const char name[], int x, int y, int w, int h,
+-                            bool headless = false);
++                            bool headless = false,
++                            GLWindow *host_window = nullptr);
++
++/// Clear the thread-local visualization state owned by the given window.
++void ReleaseVisualization(GLWindow *window);
+ 
+ void SetVisualizationScene(VisualizationScene * scene,
+                            int view = 3, const char *keys = NULL);
+diff --git a/lib/gl/renderer.cpp b/lib/gl/renderer.cpp
+index bb601a5..1f9c8c6 100644
+--- a/lib/gl/renderer.cpp
++++ b/lib/gl/renderer.cpp
+@@ -110,6 +110,9 @@ void MeshRenderer::init()
+ 
+ void MeshRenderer::render(const RenderQueue& queue)
+ {
++   GLint output_fbo = 0;
++   glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &output_fbo);
++
+    // elements containing opaque objects should be rendered first
+    RenderQueue sorted_queue = queue;
+    std::stable_partition(sorted_queue.begin(), sorted_queue.end(),
+@@ -285,7 +288,7 @@ void MeshRenderer::render(const RenderQueue& queue)
+ #ifndef __EMSCRIPTEN__
+       glDisable(GL_MULTISAMPLE);
+ #endif
+-      glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
++      glBindFramebuffer(GL_DRAW_FRAMEBUFFER, output_fbo);
+       glBindFramebuffer(GL_READ_FRAMEBUFFER, resolveFb);
+       glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+       glBlitFramebuffer(0, 0, width, height,
+diff --git a/lib/window.cpp b/lib/window.cpp
+index 6930f6f..7998d2a 100644
+--- a/lib/window.cpp
++++ b/lib/window.cpp
+@@ -12,6 +12,10 @@
+ #include "window.hpp"
+ #include "visual.hpp"
+ 
++Window::Window() = default;
++Window::~Window() = default;
++Window::Window(Window &&w) { *this = std::move(w); }
++
+ Window &Window::operator=(Window &&w)
+ {
+    internal = std::move(w.internal);
+@@ -32,6 +36,12 @@ Window &Window::operator=(Window &&w)
+ 
+ // Visualize the data in the global variables mesh, sol/grid_f, etc
+ bool Window::GLVisInitVis(StreamCollection input_streams)
++{
++   return GLVisInitVis(std::move(input_streams), nullptr);
++}
++
++bool Window::GLVisInitVis(StreamCollection input_streams,
++                          std::unique_ptr<GLWindow> host_window)
+ {
+    DataState::FieldType field_type = data_state.GetType();
+ 
+@@ -49,9 +59,17 @@ bool Window::GLVisInitVis(StreamCollection input_streams)
+    const char *win_title = (window_title == nullptr) ?
+                            window_titles[(int)field_type] : window_title;
+ 
++   GLWindow *host = host_window.get();
+    GLWindow *new_wnd = InitVisualization(win_title, window_x, window_y, window_w,
+-                                         window_h, headless);
+-   if (new_wnd != wnd.get()) { internal.wnd.reset(new_wnd); }
++                                         window_h, headless, host);
++   if (new_wnd == host)
++   {
++      internal.wnd = std::move(host_window);
++   }
++   else if (new_wnd != wnd.get())
++   {
++      internal.wnd.reset(new_wnd);
++   }
+    if (!wnd)
+    {
+       std::cerr << "Initializing the visualization failed." << std::endl;
+diff --git a/lib/window.hpp b/lib/window.hpp
+index 6943251..49622a4 100644
+--- a/lib/window.hpp
++++ b/lib/window.hpp
+@@ -49,12 +49,16 @@ public:
+    std::string plot_caption;
+    std::string extra_caption;
+ 
+-   Window() = default;
++   Window();
++   ~Window();
+-   Window(Window &&w) { *this = std::move(w); }
++   Window(Window &&w);
+    Window& operator=(Window &&w);
+ 
+    /// Visualize the data in the global variables mesh, sol/grid_f, etc
+    bool GLVisInitVis(StreamCollection input_streams);
++   /// Visualize using a caller-provided OpenGL window implementation.
++   bool GLVisInitVis(StreamCollection input_streams,
++                     std::unique_ptr<GLWindow> host_window);
+    void GLVisStartVis();
+ 
+    /// Switch the complex function representation and update the visualization

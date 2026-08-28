@@ -192,6 +192,77 @@ FetchContent_Declare(
 set(CMAKE_SKIP_INSTALL_RULES ON)
 FetchContent_MakeAvailable(mfem)
 set(CMAKE_SKIP_INSTALL_RULES OFF)
+find_package(OpenGL REQUIRED)
+
+# GLVis is a library internally, but its standalone build expects system copies
+# of these three rendering dependencies. Keep them in the shared dependency tree
+# with the rest of the application instead.
+set(ONLY_LIBS ON CACHE BOOL "" FORCE)
+set(glew-cmake_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(glew-cmake_BUILD_STATIC ON CACHE BOOL "" FORCE)
+FetchContent_Declare(
+  glew
+  GIT_REPOSITORY https://github.com/Perlmint/glew-cmake.git
+  GIT_TAG        glew-cmake-2.2.0
+  SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/glew-src"
+  BINARY_DIR     "${CMAKE_BINARY_DIR}/deps/glew-build"
+)
+FetchContent_MakeAvailable(glew)
+
+set(GLM_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+  glm
+  GIT_REPOSITORY https://github.com/g-truc/glm.git
+  GIT_TAG        1.0.1
+  SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/glm-src"
+  BINARY_DIR     "${CMAKE_BINARY_DIR}/deps/glm-build"
+)
+FetchContent_MakeAvailable(glm)
+
+set(FT_DISABLE_ZLIB ON CACHE BOOL "" FORCE)
+set(FT_DISABLE_BZIP2 ON CACHE BOOL "" FORCE)
+set(FT_DISABLE_PNG ON CACHE BOOL "" FORCE)
+set(FT_DISABLE_HARFBUZZ ON CACHE BOOL "" FORCE)
+set(FT_DISABLE_BROTLI ON CACHE BOOL "" FORCE)
+FetchContent_Declare(
+  freetype
+  GIT_REPOSITORY https://gitlab.freedesktop.org/freetype/freetype.git
+  GIT_TAG        VER-2-13-3
+  SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/freetype-src"
+  BINARY_DIR     "${CMAKE_BINARY_DIR}/deps/freetype-build"
+)
+FetchContent_MakeAvailable(freetype)
+
+set(GLVIS_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/extern/glvis")
+if(NOT EXISTS "${GLVIS_SOURCE_DIR}/lib/window.cpp")
+  message(FATAL_ERROR "GLVis source is missing. Run build.bat deps ${METAMATERIAL_MFEM_BACKEND} first.")
+endif()
+
+set(_glvis_compile_defs
+  GLVIS_MULTISAMPLE=4
+  GLVIS_MS_LINEWIDTH=1.4
+  GLVIS_FONT_SIZE=12
+  GLEW_NO_GLU
+  GLEW_STATIC
+  $<$<PLATFORM_ID:Windows>:_USE_MATH_DEFINES>
+)
+set(_glvis_compile_opts)
+set(_glvis_include_dirs
+  "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  "${GLVIS_SOURCE_DIR}/lib"
+)
+set(_glvis_libraries
+  SDL2::SDL2
+  OpenGL::GL
+  libglew_static
+  glm::glm
+  freetype
+  mfem
+)
+add_subdirectory(
+  "${GLVIS_SOURCE_DIR}/lib"
+  "${CMAKE_BINARY_DIR}/deps/glvis-build"
+)
 
 # ---------------------------------------------------------
 # IMGUI & OPENGL WORKSPACE
@@ -199,7 +270,6 @@ set(CMAKE_SKIP_INSTALL_RULES OFF)
 set(IMGUI_DIR "${imgui_SOURCE_DIR}")
 
 # Find native system OpenGL
-find_package(OpenGL REQUIRED)
 if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
   find_package(CUDAToolkit REQUIRED)
 endif()
@@ -247,6 +317,7 @@ target_link_libraries(metamaterial_app PRIVATE
     Eigen3::Eigen
     fftw3
     mfem         # Enforces direct linkage to the compiled MFEM static library
+    glvis
 )
 
 if(TARGET SDL2::SDL2main)

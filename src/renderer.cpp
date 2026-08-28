@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "icons.hpp"
+#include "glvis_adapter.hpp"
 #include "imgui_internal.h"
 #include "imgui_impl_opengl3.h"
 #include "imgui_impl_sdl2.h"
@@ -39,6 +40,8 @@ Renderer::~Renderer()
     if (window != nullptr && glContext != nullptr) {
         SDL_GL_MakeCurrent(window, glContext);
     }
+
+    glvis.reset();
 
     if (openglBackendInitialized) {
         ImGui_ImplOpenGL3_Shutdown();
@@ -163,6 +166,7 @@ void Renderer::setup()
         throw std::runtime_error("ImGui_ImplOpenGL3_Init() failed");
     }
     openglBackendInitialized = true;
+    glvis = std::make_unique<GlvisAdapter>();
 }
 
 void Renderer::displayFrame(solver_t& solver,
@@ -177,6 +181,7 @@ void Renderer::displayFrame(solver_t& solver,
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
         ImGui_ImplSDL2_ProcessEvent(&event);
+        glvis->processEvent(event);
         if (event.type == SDL_QUIT) {
             shouldClose = true;
         }
@@ -208,7 +213,7 @@ void Renderer::displayFrame(solver_t& solver,
 
     SimulationSettingsPanel();
     SimulationInfoPanel();
-    GlvisPanel();
+    glvis->draw();
     OptimizerDesignPanel();
     ActionPanel(solver, optimizer, exporter, executor);
     LogPanel();
@@ -275,83 +280,6 @@ void Renderer::setupInitialDockLayout(ImGuiID dockspaceId,
     ImGui::DockBuilderDockWindow("Run Control", runControl);
     ImGui::DockBuilderDockWindow("Console", bottom);
     ImGui::DockBuilderFinish(dockspaceId);
-}
-
-void Renderer::GlvisPanel()
-{
-    if (!ImGui::Begin("Visualization")) {
-        ImGui::End();
-        return;
-    }
-
-    // TODO: Embed GLVis here while preserving its existing network stream API.
-    // TODO: Codex watch out, i dont want a fake visualizer like this. You either do your research into the glvis source code
-    // To see what we can import BECAUSE we have
-    ImGui::TextColored(ImVec4(0.35f, 0.69f, 1.0f, 1.0f), "SYNTHETIC PREVIEW");
-    ImGui::SameLine();
-    ImGui::TextDisabled("GLVis network view will replace this canvas");
-    ImGui::Separator();
-
-    const ImVec2 available = ImGui::GetContentRegionAvail();
-    const ImVec2 canvasPosition = ImGui::GetCursorScreenPos();
-    const ImVec2 canvasSize(std::max(available.x, 120.0f), std::max(available.y, 120.0f));
-    ImDrawList* drawList = ImGui::GetWindowDrawList();
-
-    drawList->AddRectFilled(
-        canvasPosition,
-        ImVec2(canvasPosition.x + canvasSize.x, canvasPosition.y + canvasSize.y),
-        IM_COL32(7, 12, 22, 255),
-        7.0f);
-    drawList->AddRect(
-        canvasPosition,
-        ImVec2(canvasPosition.x + canvasSize.x, canvasPosition.y + canvasSize.y),
-        IM_COL32(39, 55, 79, 255),
-        7.0f);
-
-    const int columns = std::clamp(settings.solverSettings.nx / 14, 8, 24);
-    const int rows = std::clamp(settings.solverSettings.ny / 8, 5, 14);
-    const float padding = 30.0f;
-    const float cellWidth = (canvasSize.x - 2.0f * padding) / static_cast<float>(columns);
-    const float cellHeight = (canvasSize.y - 2.0f * padding) / static_cast<float>(rows);
-    const int designSize = geometry.design.Size();
-
-    for (int row = 0; row < rows; ++row) {
-        for (int column = 0; column < columns; ++column) {
-            const int cell = row * columns + column;
-            const double design = designSize > 0
-                ? geometry.design[cell % designSize]
-                : 0.5;
-            const float value = static_cast<float>(std::clamp(design, 0.0, 1.0));
-            const ImVec2 center(
-                canvasPosition.x + padding + (static_cast<float>(column) + 0.5f) * cellWidth,
-                canvasPosition.y + padding + (static_cast<float>(row) + 0.5f) * cellHeight);
-            const float radius = std::min(cellWidth, cellHeight) * (0.14f + 0.25f * value);
-            const ImU32 fill = ImGui::ColorConvertFloat4ToU32(ImVec4(
-                0.10f + 0.13f * value,
-                0.35f + 0.38f * value,
-                0.58f + 0.35f * value,
-                0.96f));
-
-            drawList->AddLine(
-                ImVec2(center.x - cellWidth * 0.5f, center.y),
-                ImVec2(center.x + cellWidth * 0.5f, center.y),
-                IM_COL32(22, 42, 65, 130));
-            drawList->AddLine(
-                ImVec2(center.x, center.y - cellHeight * 0.5f),
-                ImVec2(center.x, center.y + cellHeight * 0.5f),
-                IM_COL32(22, 42, 65, 130));
-            drawList->AddCircleFilled(center, radius, fill, 24);
-            drawList->AddCircle(center, radius, IM_COL32(114, 188, 255, 150), 24, 1.0f);
-        }
-    }
-
-    const char* dimension = settings.solverSettings.nz > 0 ? "EXTRUDED 3D" : "2D CELL FIELD";
-    drawList->AddText(
-        ImVec2(canvasPosition.x + 16.0f, canvasPosition.y + 14.0f),
-        IM_COL32(136, 157, 185, 255),
-        dimension);
-    ImGui::InvisibleButton("##preview-canvas", canvasSize);
-    ImGui::End();
 }
 
 void Renderer::StartMenu()

@@ -113,8 +113,6 @@ struct SolverSettings {
     int fftSamples = 2048;
     PhysicsSettings physics;
     SolverDevice device = SolverDevice::serial;
-    std::string glvisHost = "localhost";
-    int glvisPort = 19916;
     
 };
 
