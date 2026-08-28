@@ -495,6 +495,8 @@ bool App::Solver::assembleSolutionSpace(){
 
 bool App::Solver::solve(){
 
+    //TODO: We probably need to make a SolverResults array (sizeof the number of maxiterations) intiailly empty so at the app layer we can append results
+    // Actually no that would suck, then we would have to deal with ballooning memory
     result.success = 0;
     result.U.clear();
     result.R.clear();
@@ -546,6 +548,7 @@ bool App::Solver::solve(){
     linear_solver.SetRelTol(1.0e-10);
     linear_solver.SetAbsTol(1.0e-12);
     linear_solver.SetMaxIter(1000);
+    // TODO: Capture prints to the imgui terminal (would be nice)
     linear_solver.SetPrintLevel(-1);
 
     const int state_size = M->Height();
@@ -662,10 +665,6 @@ bool App::Solver::solve(){
 }
 
 bool App::Solver::bindToGlvis(){
-    const std::string& host = settings.glvisHost;
-    const int port = settings.glvisPort;
-    (void)host;
-    (void)port;
     log(App::LogLevel::Warning, "GLVis binding is not implemented yet.");
     return false;
 }

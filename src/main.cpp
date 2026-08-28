@@ -11,6 +11,7 @@
 #include "optimizer.hpp"
 #include "renderer.hpp"
 #include "solver.hpp"
+#include "dispatcher.hpp"
 
 int main(int, char**)
 {
@@ -26,6 +27,7 @@ int main(int, char**)
         auto result = std::make_unique<App::SolverResult>();
         auto& solverResult = *result;
 
+        // TODO: Fold all this setup code into the levelset class, this shouldnt be here.
         // TODO: This needs an initial guess constructor to construct the first lset guess
         // Probably an equally spaced square grid of cylinders/circles with some radius each; basically a sonic crystal whose shape we can weakly try to guess from the bandgap. Or just hardocde a single crystal structure. how about that?
         const int dimension = solverSettings.nz > 0 ? 3 : 2;
@@ -36,6 +38,8 @@ int main(int, char**)
 
         // LevelSet's GridFunction borrows this finite-element space, so the mesh,
         // collection, and space all remain top-level and outlive the LevelSet.
+        // We shouldnt have a second mesh for the levelset, we should find a way to 
+        
         auto levelSetMesh = solverSettings.nz > 0
             ? std::make_unique<mfem::Mesh>(mfem::Mesh::MakeCartesian3D(
                 solverSettings.nx,
@@ -57,6 +61,7 @@ int main(int, char**)
             levelSetMesh.get(), levelSetFec.get());
         auto lset = std::make_unique<App::LevelSet>(*levelSetFes);
         auto& geometry = *lset;
+        // TODO: Make the initial design guess the same shape as the paper has
         geometry.design = 0.5;
         geometry.phi.SetFromTrueDofs(geometry.design);
 
@@ -86,11 +91,13 @@ int main(int, char**)
             log);
         auto executor = std::make_unique<App::executor_t>(log);
 
+        auto dispatcher = std::make_unique<App::Dispatcher>(*solver, *optimizer,*exporter, log);
         renderer->setup();
         log(App::LogLevel::Message, "Renderer initialized");
 
         while (!renderer->shouldClose) {
-            renderer->displayFrame(*solver, *optimizer, *exporter, *executor);
+            dispatcher->dispatch();
+            renderer->displayFrame(*dispatcher);
         }
 
         // TODO: Executor should own and join its backend thread in its destructor.
