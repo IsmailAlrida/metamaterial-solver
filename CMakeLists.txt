@@ -29,7 +29,7 @@ if(CMAKE_CUDA_COMPILER)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 endif()
 
-option(METAMATERIAL_DEMO_MODE "Use deterministic fake solver, optimizer, and exporter classes" ON)
+option(METAMATERIAL_DEMO_MODE "Use deterministic fake solver, optimizer, and exporter classes" OFF)
 
 # ---------------------------------------------------------
 # AUTOMATED DEPENDENCY MANAGEMENT
@@ -115,7 +115,93 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(fftw)
 
-# 7. Fetch MFEM's CutFEM dependencies
+# 7. Fetch NLopt
+set(NLOPT_PYTHON OFF CACHE BOOL "" FORCE)
+set(NLOPT_OCTAVE OFF CACHE BOOL "" FORCE)
+set(NLOPT_MATLAB OFF CACHE BOOL "" FORCE)
+set(NLOPT_GUILE OFF CACHE BOOL "" FORCE)
+set(NLOPT_JAVA OFF CACHE BOOL "" FORCE)
+set(NLOPT_SWIG OFF CACHE BOOL "" FORCE)
+set(NLOPT_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+  nlopt
+  GIT_REPOSITORY https://github.com/stevengj/nlopt.git
+  GIT_TAG        v2.11.0
+  SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/nlopt-src"
+  BINARY_DIR     "${CMAKE_BINARY_DIR}/deps/nlopt-build"
+)
+FetchContent_MakeAvailable(nlopt)
+
+# 8. Fetch ParOpt and its METIS dependency. ParOpt requires a system MPI SDK
+# and BLAS/LAPACK implementation; setup.bat installs MS-MPI and oneMKL.
+find_package(MPI REQUIRED COMPONENTS CXX)
+if(WIN32 AND NOT DEFINED BLA_VENDOR)
+  set(BLA_VENDOR Intel10_64lp_seq CACHE STRING "BLAS/LAPACK implementation" FORCE)
+endif()
+find_package(BLAS REQUIRED)
+find_package(LAPACK REQUIRED)
+
+FetchContent_Declare(
+  gklib
+  GIT_REPOSITORY https://github.com/KarypisLab/GKlib.git
+  GIT_TAG        8bd6bad750b2b0d90800c632cf18e8ee93ad72d7
+  SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/gklib-src"
+  SOURCE_SUBDIR  _source-only
+)
+FetchContent_MakeAvailable(gklib)
+
+set(GKLIB_PATH "${gklib_SOURCE_DIR}" CACHE PATH "" FORCE)
+set(SHARED OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+  metis
+  GIT_REPOSITORY https://github.com/KarypisLab/METIS.git
+  GIT_TAG        v5.2.1
+  SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/metis-src"
+  BINARY_DIR     "${CMAKE_BINARY_DIR}/deps/metis-build"
+)
+FetchContent_MakeAvailable(metis)
+
+# ParOpt is source-only upstream, so expose only its C++ core as a static target.
+FetchContent_Declare(
+  paropt
+  GIT_REPOSITORY https://github.com/smdogroup/paropt.git
+  GIT_TAG        v2.1.5
+  SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/paropt-src"
+  SOURCE_SUBDIR  _source-only
+)
+FetchContent_MakeAvailable(paropt)
+
+add_library(paropt STATIC
+  "${paropt_SOURCE_DIR}/src/ParOptOptions.cpp"
+  "${paropt_SOURCE_DIR}/src/ParOptInteriorPoint.cpp"
+  "${paropt_SOURCE_DIR}/src/ParOptVec.cpp"
+  "${paropt_SOURCE_DIR}/src/ParOptQuasiNewton.cpp"
+  "${paropt_SOURCE_DIR}/src/ParOptMMA.cpp"
+  "${paropt_SOURCE_DIR}/src/ParOptTrustRegion.cpp"
+  "${paropt_SOURCE_DIR}/src/ParOptProblem.cpp"
+  "${paropt_SOURCE_DIR}/src/ParOptOptimizer.cpp"
+  "${paropt_SOURCE_DIR}/src/ParOptSparseMat.cpp"
+  "${paropt_SOURCE_DIR}/src/ParOptCompactEigenvalueApprox.cpp"
+  "${paropt_SOURCE_DIR}/src/ParOptAMD.cpp"
+  "${paropt_SOURCE_DIR}/src/ParOptSparseCholesky.cpp"
+  "${paropt_SOURCE_DIR}/src/ParOptSparseUtils.cpp"
+)
+add_library(ParOpt::paropt ALIAS paropt)
+target_include_directories(paropt PUBLIC
+  "${paropt_SOURCE_DIR}/src"
+  "${metis_BINARY_DIR}/build/xinclude"
+)
+target_link_libraries(paropt PUBLIC
+  MPI::MPI_CXX
+  LAPACK::LAPACK
+  BLAS::BLAS
+  metis
+)
+if(MSVC)
+  target_compile_definitions(paropt PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
+endif()
+
+# 9. Fetch MFEM's CutFEM dependencies
 FetchContent_Declare(
   blitz
   GIT_REPOSITORY https://github.com/blitzpp/blitz.git
@@ -160,7 +246,7 @@ set(BLITZ_INCLUDE_DIRS "${blitz_BINARY_DIR};${blitz_SOURCE_DIR}" CACHE STRING ""
 set(BLITZ_LIBRARIES "" CACHE STRING "" FORCE)
 set(ALGOIM_DIR "${algoim_SOURCE_DIR}" CACHE PATH "" FORCE)
 
-# 8. Fetch MFEM (Finite Element Method Library)
+# 10. Fetch MFEM (Finite Element Method Library)
 set(MFEM_USE_MPI OFF CACHE BOOL "" FORCE)
 set(MFEM_FETCH_TPLS OFF CACHE BOOL "" FORCE)
 set(MFEM_USE_METIS OFF CACHE BOOL "" FORCE)
@@ -316,6 +402,8 @@ target_link_libraries(metamaterial_app PRIVATE
     assimp
     Eigen3::Eigen
     fftw3
+    nlopt
+    ParOpt::paropt
     mfem         # Enforces direct linkage to the compiled MFEM static library
     glvis
 )

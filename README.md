@@ -50,7 +50,29 @@ Main author has an RTX 5060 GPU and thought it's a shame not to use it. CUDA is 
 
 ## Building
 
-Use the Visual Studio 2022 x64 toolchain from the repository root:
+On a fresh Windows 11 machine, run the setup wrapper once from the repository
+root. It installs the Visual Studio C++ tools, Git, CMake, Ninja, the Microsoft
+MPI runtime and SDK, and Intel oneMKL through their normal Windows installers:
+
+```bat
+setup.bat
+```
+
+Open a new terminal afterward and verify the native prerequisites:
+
+```bat
+setup.bat check
+```
+
+The setup script does not install CUDA because its version must match the GPU
+driver. CUDA builds require the [NVIDIA CUDA Toolkit](https://developer.nvidia.com/cuda-downloads)
+and `nvcc.exe` on `PATH`. The native packages come from the official
+[Microsoft MPI 10.1.3](https://www.microsoft.com/en-us/download/details.aspx?id=105289)
+and [Intel oneMKL](https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl-download.html)
+distributions.
+
+`build.bat` remains a thin wrapper around the Ninja CMake presets and activates
+the installed x64 Visual C++ environment when the current terminal has not:
 
 ```bat
 build.bat
@@ -71,11 +93,12 @@ build.bat parallel-cpu
 build.bat parallel-cpu-cuda
 ```
 
-CUDA presets target the GPU detected during configuration. Override the target
-with CMake's standard architecture switch when building for another GPU:
+CUDA presets target the GPU detected during configuration. Pass CMake's CUDA
+architecture as the optional second argument when targeting another GPU:
 
 ```bat
-cmake --preset serial-cuda -DCMAKE_CUDA_ARCHITECTURES=89
+build.bat serial-cuda 120
+build.bat deps parallel-cpu-cuda 120
 ```
 
 For example: `86` targets Ampere, `89` targets Ada, and `120` targets Blackwell.
@@ -112,12 +135,9 @@ build.bat deps parallel-cpu
 build.bat deps parallel-cpu-cuda
 ```
 
-You can also configure CMake directly:
-
-```bat
-cmake -S . -B build/parallel-cpu-cuda -G "Visual Studio 17 2022" -A x64 -DMETAMATERIAL_MFEM_BACKEND=parallel-cpu-cuda -DMETAMATERIAL_DEPS_ONLY=OFF
-cmake --build build/parallel-cpu-cuda --config Debug
-```
+This configures the selected build and writes `compile_commands.json` for the
+LSP without building the application. CMake fetches and prepares NLopt,
+ParOpt, METIS, MFEM, and the remaining source dependencies under `build/deps`.
 
 Valid `METAMATERIAL_MFEM_BACKEND` values are:
 
@@ -137,10 +157,7 @@ parallel-cpu        OpenMP CPU backend
 parallel-cpu-cuda   OpenMP CPU backend plus CUDA device backend
 ```
 
-For GLVis, build the matching MFEM backend first, then run:
-
-```bat
-scripts\install_glvis.bat serial
-```
-
-or replace `serial` with another backend. Native Windows GLVis builds need `vcpkg`; set `VCPKG_ROOT` if `vcpkg.exe` is not on `PATH`.
+`parallel-cpu` currently means MFEM/OpenMP inside one process. MS-MPI is used by
+ParOpt (with `MPI_COMM_SELF`) and leaves the machine ready for a later true
+distributed MFEM `ParMesh`/HYPRE backend; the current solver does not pretend to
+be distributed merely because MPI is installed.
