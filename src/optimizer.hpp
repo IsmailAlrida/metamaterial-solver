@@ -1,6 +1,8 @@
 #pragma once
 
 #include <atomic>
+#include <complex>
+#include <vector>
 #include "global_types.hpp"
 #include "logging.hpp"
 #include "solver.hpp"
@@ -27,6 +29,22 @@ class Optimizer {
         double get_mma_bound() const;
 
     private:
+        class Problem;
+
+        struct ObjectiveEvaluation {
+            double pass = 0.0;
+            double stop = 0.0;
+            bool has_pass = false;
+            bool has_stop = false;
+
+            // Each complex entry stores dPhi/dRe + i*dPhi/dIm for the
+            // corresponding unnormalized outlet FFT coefficient.
+            std::vector<std::complex<double>> pass_spectrum_derivative;
+            std::vector<std::complex<double>> stop_spectrum_derivative;
+        };
+
+        bool evaluateObjectives(ObjectiveEvaluation& objective) const;
+
         const OptimizerSettings& settings;
         Solver& solver;
         LevelSet& geometry;

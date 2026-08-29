@@ -108,9 +108,11 @@ set(ENABLE_THREADS OFF CACHE BOOL "" FORCE)
 set(WITH_COMBINED_THREADS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
   fftw
-  GIT_REPOSITORY https://github.com/FFTW/fftw3.git
-  GIT_TAG        fftw-3.3.10
-  SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/fftw3-src"
+  # The Git repository omits generated scalar codelets required by the
+  # library. The official release tarball includes them.
+  URL            https://www.fftw.org/fftw-3.3.10.tar.gz
+  URL_HASH       SHA256=56c932549852cddcfafdab3820b0200c7742675be92179e59e6215b340e26467
+  SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/fftw3-release-src"
   BINARY_DIR     "${CMAKE_BINARY_DIR}/deps/fftw3-build"
 )
 FetchContent_MakeAvailable(fftw)
@@ -150,16 +152,56 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(gklib)
 
-set(GKLIB_PATH "${gklib_SOURCE_DIR}" CACHE PATH "" FORCE)
-set(SHARED OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
   metis
   GIT_REPOSITORY https://github.com/KarypisLab/METIS.git
   GIT_TAG        v5.2.1
   SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/metis-src"
   BINARY_DIR     "${CMAKE_BINARY_DIR}/deps/metis-build"
+  SOURCE_SUBDIR  _source-only
 )
 FetchContent_MakeAvailable(metis)
+
+# METIS 5.2.1's CMake assumes it is the top-level project and that its
+# Makefile has already generated build/xinclude/metis.h. Build the two small
+# static libraries directly instead of patching fetched dependency sources.
+file(GLOB _gklib_sources CONFIGURE_DEPENDS "${gklib_SOURCE_DIR}/*.c")
+if(WIN32)
+  list(APPEND _gklib_sources "${gklib_SOURCE_DIR}/win32/adapt.c")
+endif()
+add_library(GKlib STATIC ${_gklib_sources})
+target_include_directories(GKlib PUBLIC "${gklib_SOURCE_DIR}")
+set_target_properties(GKlib PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON)
+if(MSVC)
+  target_compile_definitions(GKlib PUBLIC
+    WIN32
+    MSC
+    _CRT_SECURE_NO_DEPRECATE
+    USE_GKREGEX
+    NDEBUG
+    NDEBUG2
+    "__thread=__declspec(thread)"
+  )
+endif()
+if(UNIX)
+  target_link_libraries(GKlib PUBLIC m)
+endif()
+
+set(_metis_include_dir "${metis_BINARY_DIR}/include")
+file(MAKE_DIRECTORY "${_metis_include_dir}")
+file(READ "${metis_SOURCE_DIR}/include/metis.h" _metis_header)
+file(WRITE "${_metis_include_dir}/metis.h"
+  "#define IDXTYPEWIDTH 32\n#define REALTYPEWIDTH 32\n${_metis_header}")
+file(GLOB _metis_sources CONFIGURE_DEPENDS
+  "${metis_SOURCE_DIR}/libmetis/*.c"
+)
+add_library(metis STATIC ${_metis_sources})
+target_include_directories(metis
+  PUBLIC "${_metis_include_dir}"
+  PRIVATE "${metis_SOURCE_DIR}/libmetis"
+)
+target_link_libraries(metis PUBLIC GKlib)
+set_target_properties(metis PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON)
 
 # ParOpt is source-only upstream, so expose only its C++ core as a static target.
 FetchContent_Declare(
@@ -189,7 +231,7 @@ add_library(paropt STATIC
 add_library(ParOpt::paropt ALIAS paropt)
 target_include_directories(paropt PUBLIC
   "${paropt_SOURCE_DIR}/src"
-  "${metis_BINARY_DIR}/build/xinclude"
+  "${_metis_include_dir}"
 )
 target_link_libraries(paropt PUBLIC
   MPI::MPI_CXX
@@ -199,6 +241,14 @@ target_link_libraries(paropt PUBLIC
 )
 if(MSVC)
   target_compile_definitions(paropt PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
+  # ParOptInteriorPoint.cpp gives min2/max2 external linkage while three
+  # other translation units define the same inline helpers. Keep the fetched
+  # source untouched and give only the strong MSVC definitions local names.
+  set_source_files_properties(
+    "${paropt_SOURCE_DIR}/src/ParOptInteriorPoint.cpp"
+    PROPERTIES COMPILE_DEFINITIONS
+      "min2=paropt_interior_min2;max2=paropt_interior_max2"
+  )
 endif()
 
 # 9. Fetch MFEM's CutFEM dependencies
@@ -432,3 +482,33 @@ target_include_directories(dispatcher_backend_check PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 target_link_libraries(dispatcher_backend_check PRIVATE mfem)
+
+add_executable(paropt_smoke_check
+    tests/paropt_smoke_check.cpp
+)
+target_link_libraries(paropt_smoke_check PRIVATE ParOpt::paropt)
+
+add_executable(solver_adjoint_check
+    tests/solver_adjoint_check.cpp
+    src/solver.cpp
+)
+target_include_directories(solver_adjoint_check PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${fftw_SOURCE_DIR}/api"
+)
+target_link_libraries(solver_adjoint_check PRIVATE fftw3 mfem)
+
+add_executable(paper_optimizer_miniapp
+    tests/paper_optimizer_miniapp.cpp
+    src/optimizer.cpp
+    src/solver.cpp
+)
+target_include_directories(paper_optimizer_miniapp PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${fftw_SOURCE_DIR}/api"
+)
+target_link_libraries(paper_optimizer_miniapp PRIVATE
+    ParOpt::paropt
+    fftw3
+    mfem
+)

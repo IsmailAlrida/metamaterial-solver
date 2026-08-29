@@ -1,5 +1,6 @@
 #pragma once
 #include <atomic>
+#include <complex>
 #include <memory>
 #include <vector>
 #include "global_types.hpp"
@@ -9,6 +10,13 @@
 // Business objects retain references to top-level app data instead of owning snapshots.
 
 namespace App {
+
+    struct FrequencyResponse {
+        std::vector<double> frequency;
+        std::vector<std::complex<double>> outlet;
+        std::vector<std::complex<double>> reference;
+        std::vector<unsigned char> valid;
+    };
 
     class Solver {
 
@@ -26,6 +34,10 @@ namespace App {
         bool assembleSolutionSpace();
         bool solve();
         SolverStatus get_status() const;
+        const FrequencyResponse& frequencyResponse() const;
+        bool differentiateFrequencyResponse(
+            const std::vector<std::complex<double>>& spectrum_derivative,
+            mfem::Vector& design_gradient);
 
 
 
@@ -54,13 +66,24 @@ namespace App {
         std::unique_ptr<mfem::SparseMatrix> M;
         std::unique_ptr<mfem::SparseMatrix> C;
         std::unique_ptr<mfem::SparseMatrix> K;
+        std::unique_ptr<mfem::SparseMatrix> effective_matrix_transpose;
+        std::unique_ptr<mfem::SparseMatrix> initial_matrix_transpose;
+        std::unique_ptr<mfem::SparseMatrix> design_to_cell;
+        std::unique_ptr<mfem::SparseMatrix> cell_to_level_set;
+        std::unique_ptr<mfem::SparseMatrix> filter_matrix;
         mfem::Vector inlet_load;
         mfem::Vector outlet_functional;
+        mfem::DenseMatrix element_centers;
+        mfem::Vector cell_volumes;
         mfem::Array<int> displacement_essential_tdofs;
         std::vector<double> source_pressure;
         std::vector<double> source_pressure_derivative;
         std::vector<double> outlet_pressure;
         std::vector<double> reference_outlet_pressure;
+        std::vector<double> fft_window;
+        std::vector<mfem::Vector> adjoint_history;
+        FrequencyResponse frequency_response;
+        double level_set_scale = 0.0;
         int pressure_offset = 0;
         bool design_initialized = false;
         bool reference_ready = false;
@@ -68,11 +91,7 @@ namespace App {
 
         bool smooth_level_set(
             const mfem::GridFunction& level_set,
-            mfem::GridFunction& smoothed_level_set,
-            const mfem::SparseMatrix& design_to_cell,
-            const mfem::SparseMatrix& cell_to_level_set,
-            const mfem::DenseMatrix& element_centers,
-            const mfem::Vector& cell_volumes);
+            mfem::GridFunction& smoothed_level_set);
         bool postprocessFourierResponse();
 
 

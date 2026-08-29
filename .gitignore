@@ -221,3 +221,4 @@ build-*/
 build-glvis-*/
 tools/glvis-*/
 imgui.ini
+test-results/

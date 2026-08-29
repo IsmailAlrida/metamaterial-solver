@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Paper Optimizer Report</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+      background: #07101f;
+      color: #dbe8ff;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: radial-gradient(circle at top, #132742, #07101f 45%); }
+    header { padding: 24px clamp(18px, 4vw, 56px) 14px; border-bottom: 1px solid #243b5a; }
+    h1 { margin: 0 0 7px; font-size: clamp(24px, 4vw, 38px); }
+    header p, #status { margin: 0; color: #8fa9ca; }
+    .toolbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 16px; }
+    input[type=file] { padding: 9px; border: 1px solid #31527b; border-radius: 8px; background: #0b192c; }
+    main { padding: 22px clamp(18px, 4vw, 56px) 50px; }
+    h2 { margin: 30px 0 14px; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 18px; }
+    .card, .panel { background: rgba(10, 24, 42, .92); border: 1px solid #243f61; border-radius: 12px; box-shadow: 0 12px 30px #02071366; }
+    .card { padding: 14px 16px; }
+    .label { color: #87a3c6; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+    .value { margin-top: 5px; font-size: 22px; font-variant-numeric: tabular-nums; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .panel { min-height: 390px; overflow: hidden; }
+    .panel-heading { padding: 15px 18px 0; font-weight: 700; }
+    .panel-note { padding: 5px 18px 0; color: #8fa9ca; font-size: 13px; }
+    .reference { display: flex; min-height: 390px; flex-direction: column; }
+    .paper-figure { width: 100%; min-height: 0; flex: 1; object-fit: contain; padding: 18px; background: #fff; margin-top: 12px; }
+    a { color: #77b7ff; }
+    .plot { width: 100%; height: 430px; }
+    .table-wrap { overflow-x: auto; border: 1px solid #243f61; border-radius: 12px; background: rgba(10, 24, 42, .92); }
+    table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    th, td { padding: 13px 16px; border-bottom: 1px solid #243f61; text-align: right; white-space: nowrap; }
+    th:first-child, td:first-child { text-align: left; }
+    th { color: #87a3c6; font-size: 12px; text-transform: uppercase; letter-spacing: .07em; }
+    tbody tr:last-child td { border-bottom: 0; }
+    .pass { color: #71e6a1; }
+    .fail { color: #ff748c; }
+    @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>2D Vibroacoustic Topology Optimization</h1>
+    <p>Real MFEM forward solve · fully discrete adjoint · ParOpt MMA</p>
+    <div class="toolbar">
+      <input id="file" type="file" accept="application/json,.json">
+      <span id="status">Loading the default quick result…</span>
+    </div>
+  </header>
+  <main>
+    <section id="cards" class="cards"></section>
+    <h2>Plot comparisons</h2>
+    <section class="grid">
+      <div class="panel reference">
+        <div class="panel-heading">Paper geometry — Fig. 6(a)</div>
+        <div class="panel-note">Exact low-pass reference for b = 10⁻².</div>
+        <img class="paper-figure" src="assets/paper-lowpass-b1e-2-geometry.png" alt="Paper Figure 6(a) optimized low-pass geometry">
+      </div>
+      <div class="panel"><div id="geometry" class="plot"></div></div>
+      <div class="panel reference">
+        <div class="panel-heading">Paper transmission — Fig. 6(d)</div>
+        <div class="panel-note">The blue curve is the b = 10⁻² reference.</div>
+        <img class="paper-figure" src="assets/paper-lowpass-b1e-2-response.png" alt="Paper Figure 6(d) low-pass transmission curves">
+      </div>
+      <div class="panel"><div id="response" class="plot"></div></div>
+    </section>
+    <p class="panel-note">Reference: Dilgen &amp; Aage, <a href="../docs/golden-paper.pdf#page=13">Fig. 6(a,d), page 13</a>. The paper does not publish raw geometry/spectrum arrays or wall-clock runtime, so visual comparison and the reported final objective values are the honest available reference.</p>
+
+    <h2>Numerical comparison</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Quantity</th><th>Paper</th><th>Implementation</th><th>Absolute difference</th><th>Relative difference</th></tr></thead>
+        <tbody id="numerical-comparison"></tbody>
+      </table>
+    </div>
+
+    <h2>Execution time</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Measurement</th><th>Paper</th><th>Implementation</th></tr></thead>
+        <tbody id="execution-time"></tbody>
+      </table>
+    </div>
+  </main>
+  <script>
+    const colors = { paper: '#dbe8ff', grid: '#274160', panel: '#0a182a' };
+    const defaultData = new URLSearchParams(location.search).get('data')
+      || '../test-results/paper-optimizer/quick.json';
+    const status = document.getElementById('status');
+    const scientific = value => Number.isFinite(value) ? Number(value).toExponential(4) : 'n/a';
+    const seconds = value => Number.isFinite(value) ? `${value.toFixed(2)} s` : 'n/a';
+    const layout = title => ({
+      title: { text: title, font: { color: colors.paper, size: 16 } },
+      paper_bgcolor: colors.panel,
+      plot_bgcolor: colors.panel,
+      font: { color: colors.paper },
+      margin: { l: 66, r: 28, t: 56, b: 58 },
+      xaxis: { gridcolor: colors.grid, zerolinecolor: colors.grid },
+      yaxis: { gridcolor: colors.grid, zerolinecolor: colors.grid },
+      legend: { orientation: 'h', y: 1.12 }
+    });
+    const config = { responsive: true, displaylogo: false };
+
+    function addCard(label, value, className = '') {
+      const card = document.createElement('div');
+      card.className = 'card';
+      const labelElement = document.createElement('div');
+      labelElement.className = 'label';
+      labelElement.textContent = label;
+      const valueElement = document.createElement('div');
+      valueElement.className = `value ${className}`;
+      valueElement.textContent = value;
+      card.append(labelElement, valueElement);
+      document.getElementById('cards').append(card);
+    }
+
+    function renderGeometry(data) {
+      const points = data.geometry.points;
+      const xs = [...new Set(points.map(point => point.x))].sort((a, b) => a - b);
+      const ys = [...new Set(points.map(point => point.y))].sort((a, b) => a - b);
+      const values = new Map(points.map(point => [`${point.x}|${point.y}`, point]));
+      const phi = ys.map(y => xs.map(x => values.get(`${x}|${y}`)?.phi ?? null));
+      const solid = ys.map(y => xs.map(x => values.get(`${x}|${y}`)?.solid ? 1 : 0));
+      const geometryLayout = layout('Implementation geometry — gray is solid');
+      geometryLayout.xaxis.title = 'x [m]';
+      geometryLayout.yaxis.title = 'y [m]';
+      geometryLayout.yaxis.scaleanchor = 'x';
+      geometryLayout.shapes = [
+        data.settings.inlet_length_m,
+        data.settings.inlet_length_m + data.settings.design_length_m
+      ].map(x => ({ type: 'line', x0: x, x1: x, y0: 0, y1: data.settings.height_m,
+        line: { color: '#f7c66b', width: 1, dash: 'dot' } }));
+      Plotly.newPlot('geometry', [
+        { type: 'heatmap', x: xs, y: ys, z: solid, zmin: 0, zmax: 1,
+          colorscale: [[0, '#ffffff'], [1, '#595959']], showscale: false },
+        { type: 'contour', x: xs, y: ys, z: phi, autocontour: false,
+          contours: { start: 0, end: 0, size: 1, coloring: 'none' },
+          line: { color: '#05070a', width: 3 }, showscale: false, hoverinfo: 'skip' }
+      ], geometryLayout, config);
+    }
+
+    function renderResponse(data) {
+      const valid = data.frequency_response.filter(point => point.valid && point.transmission > 0);
+      const traces = [{
+        x: valid.map(point => point.frequency_hz),
+        y: valid.map(point => point.transmission),
+        name: 'Optimized transmission',
+        mode: 'lines',
+        line: { color: '#77b7ff', width: 2 }
+      }];
+      for (const band of data.bands) {
+        traces.push({
+          x: [band.start_hz, band.end_hz],
+          y: [band.target_transmission, band.target_transmission],
+          name: `${band.type} target`,
+          mode: 'lines',
+          line: { color: band.type === 'pass' ? '#68d9a0' : '#ff8b78', width: 4, dash: 'dash' }
+        });
+      }
+      const responseLayout = layout('Implementation transmission');
+      responseLayout.xaxis.title = 'Frequency [Hz]';
+      responseLayout.xaxis.range = [
+        Math.min(...data.bands.map(band => band.start_hz)),
+        Math.max(...data.bands.map(band => band.end_hz))
+      ];
+      responseLayout.yaxis = {
+        title: 'S(f)', type: 'log', range: [-5, 0.3], gridcolor: colors.grid
+      };
+      Plotly.newPlot('response', traces, responseLayout, config);
+    }
+
+    function appendCells(row, values) {
+      for (const value of values) {
+        const cell = document.createElement('td');
+        cell.textContent = value;
+        row.append(cell);
+      }
+    }
+
+    function comparisonRow(label, paper, implementation, format = scientific) {
+      const row = document.createElement('tr');
+      const difference = Math.abs(implementation - paper);
+      const relative = paper === 0 ? NaN : 100 * difference / Math.abs(paper);
+      appendCells(row, [
+        label,
+        format(paper),
+        format(implementation),
+        format(difference),
+        Number.isFinite(relative) ? `${relative.toFixed(4)}%` : 'n/a'
+      ]);
+      document.getElementById('numerical-comparison').append(row);
+    }
+
+    function renderNumericalComparison(data) {
+      const body = document.getElementById('numerical-comparison');
+      body.replaceChildren();
+      const reference = data.paper_reference;
+      const integer = value => String(Math.round(value));
+      comparisonRow('Mesh elements nx', reference.settings.nx, data.settings.nx, integer);
+      comparisonRow('Mesh elements ny', reference.settings.ny, data.settings.ny, integer);
+      comparisonRow('Duration [s]', reference.settings.duration_s, data.settings.duration_s);
+      comparisonRow('Time step [s]', reference.settings.dt_s, data.settings.dt_s);
+      comparisonRow('MMA iterations', reference.settings.maximum_iterations,
+        data.settings.maximum_iterations, integer);
+      comparisonRow('Final pass objective Φ₁', reference.objectives.final_pass,
+        data.objectives.final_pass);
+      comparisonRow('Final stop objective Φ₂', reference.objectives.final_stop,
+        data.objectives.final_stop);
+      comparisonRow('Final worst objective',
+        Math.max(reference.objectives.final_pass, reference.objectives.final_stop),
+        data.objectives.final_worst);
+    }
+
+    function renderExecutionTime(data) {
+      const body = document.getElementById('execution-time');
+      body.replaceChildren();
+      const rows = [
+        ['Complete optimization', data.runtime.optimizer_wall_seconds],
+        ['Initial empty + designed forward pair', data.runtime.initial_reference_and_design_seconds],
+        ['Mean completed MMA iteration', data.runtime.average_iteration_seconds]
+      ];
+      for (const [label, implementation] of rows) {
+        const row = document.createElement('tr');
+        appendCells(row, [label, data.runtime.paper_runtime_note, seconds(implementation)]);
+        body.append(row);
+      }
+    }
+
+    function render(data) {
+      document.getElementById('cards').replaceChildren();
+      const paper = data.paper_reference.objectives;
+      const improved = data.objectives.initial_worst / data.objectives.final_worst;
+      const referenceSettings = data.paper_reference.settings;
+      const paperMode = data.settings.nx === referenceSettings.nx
+        && data.settings.ny === referenceSettings.ny
+        && data.settings.duration_s === referenceSettings.duration_s
+        && data.settings.dt_s === referenceSettings.dt_s
+        && data.settings.maximum_iterations === referenceSettings.maximum_iterations;
+      const relativeObjectiveDistance = Math.sqrt((
+        ((data.objectives.final_pass - paper.final_pass) / paper.final_pass) ** 2
+        + ((data.objectives.final_stop - paper.final_stop) / paper.final_stop) ** 2
+      ) / 2) * 100;
+      addCard('Mode', data.mode);
+      addCard('Gate', data.gate_passed ? 'Passed' : 'Failed', data.gate_passed ? 'pass' : 'fail');
+      addCard('Identical settings', paperMode ? 'Yes' : 'No — use --paper', paperMode ? 'pass' : 'fail');
+      addCard('Improvement', Number.isFinite(improved) ? `${improved.toFixed(3)}×` : 'n/a');
+      addCard('Objective distance', paperMode && Number.isFinite(relativeObjectiveDistance)
+        ? `${relativeObjectiveDistance.toFixed(2)}%` : 'paper mode only');
+      renderGeometry(data);
+      renderResponse(data);
+      renderNumericalComparison(data);
+      renderExecutionTime(data);
+      status.textContent = paperMode
+        ? `Loaded paper-equivalent result · ${data.optimizer_status}`
+        : `Loaded quick result · rerun with --paper for an identical-setting comparison`;
+    }
+
+    document.getElementById('file').addEventListener('change', async event => {
+      const file = event.target.files[0];
+      if (!file) return;
+      try {
+        render(JSON.parse(await file.text()));
+      } catch (error) {
+        status.textContent = `Could not read ${file.name}: ${error.message}`;
+      }
+    });
+
+    fetch(defaultData)
+      .then(response => {
+        if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+        return response.json();
+      })
+      .then(render)
+      .catch(() => {
+        status.textContent = 'Choose quick.json or paper.json above. Direct file:// fetch is blocked by most browsers.';
+      });
+  </script>
+</body>
+</html>

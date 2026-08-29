@@ -69,9 +69,9 @@ struct ElectromagneticSettings {
 
 struct FrequencyBand {
     FrequencyBandType type = FrequencyBandType::stop;
-    float startHz = 2500.0f;
-    float endHz = 4000.0f;
-    float targetDb = -40.0f;
+    double startHz = 2500.0;
+    double endHz = 4000.0;
+    double targetTransmission = 1.0e-2;
 };
 
 using PhysicsSettings = std::variant<
@@ -94,8 +94,8 @@ struct OptimizerSettings {
     double cutDerivativeRelativeStep = 1.0e-4;
     bool displayTargetInDb = true;
     std::vector<FrequencyBand> frequencyBands{
-        {FrequencyBandType::pass, 1000.0f, 2500.0f, 0.0f},
-        {FrequencyBandType::stop, 2500.0f, 4000.0f, -40.0f}
+        {FrequencyBandType::pass, 1000.0, 2500.0, 1.0},
+        {FrequencyBandType::stop, 2500.0, 4000.0, 1.0e-2}
     };
 };
 

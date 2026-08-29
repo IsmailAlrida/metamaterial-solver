@@ -68,6 +68,11 @@ App::SolverStatus App::Solver::get_status() const
     return status.load();
 }
 
+const App::FrequencyResponse& App::Solver::frequencyResponse() const
+{
+    return frequency_response;
+}
+
 // TODO: Do something about the mixed camelCase and snake_case. Choose one.
 bool App::Solver::setMesh()
 {
@@ -103,9 +108,33 @@ bool App::Solver::setMesh()
     M.reset();
     C.reset();
     K.reset();
+    effective_matrix_transpose.reset();
+    initial_matrix_transpose.reset();
+    design_to_cell.reset();
+    cell_to_level_set.reset();
+    filter_matrix.reset();
+    inlet_load.SetSize(0);
+    outlet_functional.SetSize(0);
+    element_centers.SetSize(0, 0);
+    cell_volumes.SetSize(0);
+    displacement_essential_tdofs.SetSize(0);
+    source_pressure.clear();
+    source_pressure_derivative.clear();
+    level_set_scale = 0.0;
     design_initialized = false;
     reference_ready = false;
     reference_outlet_pressure.clear();
+    fft_window.clear();
+    frequency_response = {};
+    result.success = 0;
+    std::atomic_store(
+        &result.inletPressure, std::shared_ptr<const SignalTD>{});
+    std::atomic_store(
+        &result.outletPressure, std::shared_ptr<const SignalTD>{});
+    std::atomic_store(
+        &result.referenceOutletPressure, std::shared_ptr<const SignalTD>{});
+    std::atomic_store(
+        &result.materialImpulseResponse, std::shared_ptr<const SignalFFT>{});
     log(LogLevel::Message,
         nz > 0 ? "Created 3D Cartesian mesh." : "Created 2D Cartesian mesh.");
     return true;
@@ -154,51 +183,128 @@ bool App::Solver::assembleSolutionSpace()
     M.reset();
     C.reset();
     K.reset();
-    lset.detach();
-    level_set_fes.reset();
-    scalar_fes.reset();
-    displacement_fes.reset();
-    fec.reset();
-    fec = std::make_unique<H1_FECollection>(fe_order, dim);
-    level_set_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get());
-    scalar_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get());
-    displacement_fes = std::make_unique<FiniteElementSpace>(
-        mesh.get(), fec.get(), dim, Ordering::byVDIM);
-    lset.setSpace(*level_set_fes);
+    effective_matrix_transpose.reset();
+    initial_matrix_transpose.reset();
+    if (!level_set_fes) {
+        fec = std::make_unique<H1_FECollection>(fe_order, dim);
+        level_set_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get());
+        scalar_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get());
+        displacement_fes = std::make_unique<FiniteElementSpace>(
+            mesh.get(), fec.get(), dim, Ordering::byVDIM);
+        lset.setSpace(*level_set_fes);
 
-    // Domain regions along x
-    const double design_start = settings.inletLength;
-    const double design_end = settings.inletLength + settings.designLength;
-    const int cell_count = mesh->GetNE();
-    int inlet_count = 0;
-    int design_count = 0;
-    int outlet_count = 0;
-    DenseMatrix element_centers(cell_count, dim);
-    Vector cell_volumes(cell_count);
-    Vector center(dim);
-    for (int element = 0; element < cell_count; ++element) {
-        mesh->GetElementCenter(element, center);
-        element_centers.SetRow(element, center);
-        cell_volumes[element] = mesh->GetElementVolume(element);
-        if (center[0] < design_start) {
-            mesh->SetAttribute(element, static_cast<int>(DomainAttribute::inlet));
-            ++inlet_count;
+        // Domain regions along x
+        const double design_start = settings.inletLength;
+        const double design_end = settings.inletLength + settings.designLength;
+        const int cell_count = mesh->GetNE();
+        int inlet_count = 0;
+        int design_count = 0;
+        int outlet_count = 0;
+        element_centers.SetSize(cell_count, dim);
+        cell_volumes.SetSize(cell_count);
+        Vector center(dim);
+        for (int element = 0; element < cell_count; ++element) {
+            mesh->GetElementCenter(element, center);
+            element_centers.SetRow(element, center);
+            cell_volumes[element] = mesh->GetElementVolume(element);
+            if (center[0] < design_start) {
+                mesh->SetAttribute(element, static_cast<int>(DomainAttribute::inlet));
+                ++inlet_count;
+            }
+            else if (center[0] < design_end) {
+                mesh->SetAttribute(element, static_cast<int>(DomainAttribute::design));
+                ++design_count;
+            }
+            else {
+                mesh->SetAttribute(element, static_cast<int>(DomainAttribute::outlet));
+                ++outlet_count;
+            }
         }
-        else if (center[0] < design_end) {
-            mesh->SetAttribute(element, static_cast<int>(DomainAttribute::design));
-            ++design_count;
+        mesh->SetAttributes();
+        if (inlet_count + design_count + outlet_count != cell_count
+            || inlet_count == 0 || design_count == 0 || outlet_count == 0) {
+            log(LogLevel::Error,
+                "Each duct region must contain at least one mesh element center.");
+            return false;
         }
-        else {
-            mesh->SetAttribute(element, static_cast<int>(DomainAttribute::outlet));
-            ++outlet_count;
+
+        // Only DOFs exclusively supported by design elements are editable.
+        Array<int> design_incidence(level_set_fes->GetVSize());
+        Array<int> fixed_incidence(level_set_fes->GetVSize());
+        design_incidence = 0;
+        fixed_incidence = 0;
+        const int level_set_size = level_set_fes->GetTrueVSize();
+        design_to_cell = std::make_unique<SparseMatrix>(
+            cell_count, level_set_size);
+        cell_to_level_set = std::make_unique<SparseMatrix>(
+            level_set_size, cell_count);
+        Array<int> element_dofs;
+        Vector shape;
+        for (int element = 0; element < cell_count; ++element) {
+            level_set_fes->GetElementDofs(element, element_dofs);
+            const FiniteElement* finite_element = level_set_fes->GetFE(element);
+            const IntegrationPoint& reference_center =
+                Geometries.GetCenter(mesh->GetElementBaseGeometry(element));
+            shape.SetSize(finite_element->GetDof());
+            finite_element->CalcShape(reference_center, shape);
+            Array<int>& incidence = mesh->GetAttribute(element)
+                    == static_cast<int>(DomainAttribute::design)
+                ? design_incidence
+                : fixed_incidence;
+            for (int i = 0; i < element_dofs.Size(); ++i) {
+                const int dof = element_dofs[i];
+                ++incidence[dof];
+                design_to_cell->Add(element, dof, shape[i]);
+                cell_to_level_set->Add(dof, element, 1.0);
+            }
         }
-    }
-    mesh->SetAttributes();
-    if (inlet_count + design_count + outlet_count != cell_count
-        || inlet_count == 0 || design_count == 0 || outlet_count == 0) {
-        log(LogLevel::Error,
-            "Each duct region must contain at least one mesh element center.");
-        return false;
+        design_to_cell->Finalize();
+        cell_to_level_set->Finalize();
+        const int* cell_to_level_set_rows = cell_to_level_set->GetI();
+        real_t* cell_to_level_set_values = cell_to_level_set->GetData();
+        for (int dof = 0; dof < level_set_size; ++dof) {
+            const int incidence = design_incidence[dof] + fixed_incidence[dof];
+            for (int entry = cell_to_level_set_rows[dof];
+                 entry < cell_to_level_set_rows[dof + 1];
+                 ++entry) {
+                cell_to_level_set_values[entry] /= incidence;
+            }
+        }
+        Array<int> active_dofs;
+        for (int dof = 0; dof < design_incidence.Size(); ++dof) {
+            if (design_incidence[dof] > 0 && fixed_incidence[dof] == 0) {
+                active_dofs.Append(dof);
+            }
+        }
+        if (active_dofs.Size() == 0
+            || active_dofs.Size() == level_set_fes->GetTrueVSize()) {
+            log(LogLevel::Error,
+                "The level-set space must contain active design and fixed-air DOFs.");
+            return false;
+        }
+        lset.setActiveDesignDofs(active_dofs);
+        if (!design_initialized) {
+            FunctionCoefficient paper_initial_guess(
+                [this, design_start](const Vector& position) {
+                    const double x = position[0] - design_start;
+                    const double y = position.Size() > 1 ? position[1] : 0.0;
+                    const double value = std::cos(
+                        settings.initialPatternX * std::acos(-1.0) * x
+                        / settings.initialPatternLx)
+                        * std::cos(
+                            settings.initialPatternY * std::acos(-1.0) * y
+                            / settings.initialPatternLy)
+                        + settings.initialPatternBias;
+                    return value >= settings.initialPatternThreshold ? 0.0 : 1.0;
+                });
+            GridFunction initial(level_set_fes.get());
+            initial.ProjectCoefficient(paper_initial_guess);
+            initial.GetTrueDofs(lset.design);
+            lset.enforceDesignConstraints();
+            design_initialized = true;
+            log(LogLevel::Message,
+                "Initialized the paper cosine level-set design.");
+        }
     }
 
     Array<int> design_domain_marker(mesh->attributes.Max());
@@ -209,91 +315,9 @@ bool App::Solver::assembleSolutionSpace()
     fixed_air_marker[static_cast<int>(DomainAttribute::inlet) - 1] = 1;
     fixed_air_marker[static_cast<int>(DomainAttribute::outlet) - 1] = 1;
 
-    // Only DOFs exclusively supported by design elements are editable.
-    Array<int> design_incidence(level_set_fes->GetVSize());
-    Array<int> fixed_incidence(level_set_fes->GetVSize());
-    design_incidence = 0;
-    fixed_incidence = 0;
-    const int level_set_size = level_set_fes->GetTrueVSize();
-    SparseMatrix design_to_cell(cell_count, level_set_size);
-    SparseMatrix cell_to_level_set(level_set_size, cell_count);
-    Array<int> element_dofs;
-    Vector shape;
-    for (int element = 0; element < cell_count; ++element) {
-        level_set_fes->GetElementDofs(element, element_dofs);
-        const FiniteElement* finite_element = level_set_fes->GetFE(element);
-        const IntegrationPoint& reference_center =
-            Geometries.GetCenter(mesh->GetElementBaseGeometry(element));
-        shape.SetSize(finite_element->GetDof());
-        finite_element->CalcShape(reference_center, shape);
-        Array<int>& incidence = mesh->GetAttribute(element)
-                == static_cast<int>(DomainAttribute::design)
-            ? design_incidence
-            : fixed_incidence;
-        for (int i = 0; i < element_dofs.Size(); ++i) {
-            const int dof = element_dofs[i];
-            ++incidence[dof];
-            design_to_cell.Add(element, dof, shape[i]);
-            cell_to_level_set.Add(dof, element, 1.0);
-        }
-    }
-    design_to_cell.Finalize();
-    cell_to_level_set.Finalize();
-    const int* cell_to_level_set_rows = cell_to_level_set.GetI();
-    real_t* cell_to_level_set_values = cell_to_level_set.GetData();
-    for (int dof = 0; dof < level_set_size; ++dof) {
-        const int incidence = design_incidence[dof] + fixed_incidence[dof];
-        for (int entry = cell_to_level_set_rows[dof];
-             entry < cell_to_level_set_rows[dof + 1];
-             ++entry) {
-            cell_to_level_set_values[entry] /= incidence;
-        }
-    }
-    Array<int> active_dofs;
-    for (int dof = 0; dof < design_incidence.Size(); ++dof) {
-        if (design_incidence[dof] > 0 && fixed_incidence[dof] == 0) {
-            active_dofs.Append(dof);
-        }
-    }
-    if (active_dofs.Size() == 0
-        || active_dofs.Size() == level_set_fes->GetTrueVSize()) {
-        log(LogLevel::Error,
-            "The level-set space must contain active design and fixed-air DOFs.");
-        return false;
-    }
-    lset.setActiveDesignDofs(active_dofs);
-    if (!design_initialized) {
-        FunctionCoefficient paper_initial_guess(
-            [this, design_start](const Vector& position) {
-                const double x = position[0] - design_start;
-                const double y = position.Size() > 1 ? position[1] : 0.0;
-                const double value = std::cos(
-                    settings.initialPatternX * std::acos(-1.0) * x
-                    / settings.initialPatternLx)
-                    * std::cos(
-                        settings.initialPatternY * std::acos(-1.0) * y
-                        / settings.initialPatternLy)
-                    + settings.initialPatternBias;
-                return value >= settings.initialPatternThreshold ? 0.0 : 1.0;
-            });
-        GridFunction initial(level_set_fes.get());
-        initial.ProjectCoefficient(paper_initial_guess);
-        initial.GetTrueDofs(lset.design);
-        lset.enforceDesignConstraints();
-        design_initialized = true;
-        log(LogLevel::Message,
-            "Initialized the paper cosine level-set design.");
-    }
-
     GridFunction unsmoothed_level_set(level_set_fes.get());
     unsmoothed_level_set.SetFromTrueDofs(lset.design);
-    if (!smooth_level_set(
-            unsmoothed_level_set,
-            *lset.phi,
-            design_to_cell,
-            cell_to_level_set,
-            element_centers,
-            cell_volumes)) {
+    if (!smooth_level_set(unsmoothed_level_set, *lset.phi)) {
         return false;
     }
 
@@ -456,68 +480,71 @@ bool App::Solver::assembleSolutionSpace()
         return false;
     }
 
-    Array<int> clamped_marker(mesh->bdr_attributes.Max());
-    clamped_marker = 0;
-    if (dim == 3) {
-        clamped_marker[static_cast<int>(CartesianBoundary3D::bottom) - 1] = 1;
-        clamped_marker[static_cast<int>(CartesianBoundary3D::top) - 1] = 1;
-    }
-    else {
-        clamped_marker[static_cast<int>(CartesianBoundary2D::bottom) - 1] = 1;
-        clamped_marker[static_cast<int>(CartesianBoundary2D::top) - 1] = 1;
-    }
-    displacement_fes->GetEssentialTrueDofs(
-        clamped_marker, displacement_essential_tdofs);
+    if (inlet_load.Size() == 0) {
+        Array<int> clamped_marker(mesh->bdr_attributes.Max());
+        clamped_marker = 0;
+        if (dim == 3) {
+            clamped_marker[static_cast<int>(CartesianBoundary3D::bottom) - 1] = 1;
+            clamped_marker[static_cast<int>(CartesianBoundary3D::top) - 1] = 1;
+        }
+        else {
+            clamped_marker[static_cast<int>(CartesianBoundary2D::bottom) - 1] = 1;
+            clamped_marker[static_cast<int>(CartesianBoundary2D::top) - 1] = 1;
+        }
+        displacement_fes->GetEssentialTrueDofs(
+            clamped_marker, displacement_essential_tdofs);
 
-    Array<int> inlet_marker(mesh->bdr_attributes.Max());
-    Array<int> outlet_marker(mesh->bdr_attributes.Max());
-    inlet_marker = 0;
-    outlet_marker = 0;
-    inlet_marker[inlet_boundary - 1] = 1;
-    outlet_marker[outlet_boundary - 1] = 1;
-    ConstantCoefficient one(1.0);
-    LinearForm inlet_form(scalar_fes.get());
-    inlet_form.AddBoundaryIntegrator(
-        new BoundaryLFIntegrator(one), inlet_marker);
-    inlet_form.Assemble();
-    inlet_load = inlet_form;
-    LinearForm outlet_form(scalar_fes.get());
-    outlet_form.AddBoundaryIntegrator(
-        new BoundaryLFIntegrator(one), outlet_marker);
-    outlet_form.Assemble();
-    outlet_functional = outlet_form;
+        Array<int> inlet_marker(mesh->bdr_attributes.Max());
+        Array<int> outlet_marker(mesh->bdr_attributes.Max());
+        inlet_marker = 0;
+        outlet_marker = 0;
+        inlet_marker[inlet_boundary - 1] = 1;
+        outlet_marker[outlet_boundary - 1] = 1;
+        ConstantCoefficient one(1.0);
+        LinearForm inlet_form(scalar_fes.get());
+        inlet_form.AddBoundaryIntegrator(
+            new BoundaryLFIntegrator(one), inlet_marker);
+        inlet_form.Assemble();
+        inlet_load = inlet_form;
+        LinearForm outlet_form(scalar_fes.get());
+        outlet_form.AddBoundaryIntegrator(
+            new BoundaryLFIntegrator(one), outlet_marker);
+        outlet_form.Assemble();
+        outlet_functional = outlet_form;
 
-    const double expected_boundary_measure = dim == 3
-        ? settings.sy * settings.sz
-        : settings.sy;
-    const double measure_tolerance = 1.0e-10
-        * std::max(1.0, expected_boundary_measure);
-    if (std::abs(inlet_load.Sum() - expected_boundary_measure) > measure_tolerance
-        || std::abs(outlet_functional.Sum() - expected_boundary_measure)
-            > measure_tolerance) {
-        log(LogLevel::Error,
-            "The inlet/outlet integration vectors do not match the duct cross-section.");
-        return false;
-    }
+        const double expected_boundary_measure = dim == 3
+            ? settings.sy * settings.sz
+            : settings.sy;
+        const double measure_tolerance = 1.0e-10
+            * std::max(1.0, expected_boundary_measure);
+        if (std::abs(inlet_load.Sum() - expected_boundary_measure)
+                > measure_tolerance
+            || std::abs(outlet_functional.Sum() - expected_boundary_measure)
+                > measure_tolerance) {
+            log(LogLevel::Error,
+                "The inlet/outlet integration vectors do not match the duct cross-section.");
+            return false;
+        }
 
-    std::mt19937 generator(settings.sourceSeed);
-    std::uniform_real_distribution<double> distribution(
-        -settings.sourceAmplitude, settings.sourceAmplitude);
-    source_pressure.resize(time_steps + 1);
-    source_pressure_derivative.resize(time_steps + 1);
-    for (double& value : source_pressure) {
-        value = distribution(generator);
+        std::mt19937 generator(settings.sourceSeed);
+        std::uniform_real_distribution<double> distribution(
+            -settings.sourceAmplitude, settings.sourceAmplitude);
+        source_pressure.resize(time_steps + 1);
+        source_pressure_derivative.resize(time_steps + 1);
+        for (double& value : source_pressure) {
+            value = distribution(generator);
+        }
+        source_pressure_derivative[0] =
+            (source_pressure[1] - source_pressure[0]) / settings.dt;
+        for (int step = 1; step < time_steps; ++step) {
+            source_pressure_derivative[step] =
+                (source_pressure[step + 1] - source_pressure[step - 1])
+                / (2.0 * settings.dt);
+        }
+        source_pressure_derivative[time_steps] =
+            (source_pressure[time_steps] - source_pressure[time_steps - 1])
+            / settings.dt;
     }
-    source_pressure_derivative[0] =
-        (source_pressure[1] - source_pressure[0]) / settings.dt;
-    for (int step = 1; step < time_steps; ++step) {
-        source_pressure_derivative[step] =
-            (source_pressure[step + 1] - source_pressure[step - 1])
-            / (2.0 * settings.dt);
-    }
-    source_pressure_derivative[time_steps] =
-        (source_pressure[time_steps] - source_pressure[time_steps - 1])
-        / settings.dt;
 
     result.stateSize = M->Height();
     result.displacementSize = displacement_size;
@@ -534,16 +561,7 @@ bool App::Solver::solve()
 {
     status.store(SolverStatus::Working);
     result.success = 0;
-    result.U.clear();
-    result.residualNorms.clear();
-    std::atomic_store(
-        &result.inletPressure, std::shared_ptr<const SignalTD>{});
-    std::atomic_store(
-        &result.outletPressure, std::shared_ptr<const SignalTD>{});
-    std::atomic_store(
-        &result.referenceOutletPressure, std::shared_ptr<const SignalTD>{});
-    std::atomic_store(
-        &result.materialImpulseResponse, std::shared_ptr<const SignalFFT>{});
+    frequency_response = {};
 
     if (!mesh || !M || !C || !K) {
         log(LogLevel::Error,
@@ -556,13 +574,12 @@ bool App::Solver::solve()
     auto fail = [this, &designed_geometry](SolverStatus failure) {
         lset.design = designed_geometry;
         lset.enforceDesignConstraints();
-        result.U.clear();
-        result.residualNorms.clear();
         status.store(failure);
         return false;
     };
 
     const int first_analysis = reference_ready ? 1 : 0;
+    bool designed_assembly_ready = true;
     for (int analysis = first_analysis; analysis < 2; ++analysis) {
         const bool reference_analysis = analysis == 0;
         if (reference_analysis) {
@@ -573,9 +590,11 @@ bool App::Solver::solve()
             lset.design = designed_geometry;
         }
         lset.enforceDesignConstraints();
-        if (!assembleSolutionSpace()) {
+        if ((reference_analysis || !designed_assembly_ready)
+            && !assembleSolutionSpace()) {
             return fail(SolverStatus::Error);
         }
+        designed_assembly_ready = !reference_analysis;
 
         if (!reference_analysis) {
             char host[] = "127.0.0.1";
@@ -688,15 +707,16 @@ bool App::Solver::solve()
         }
 
         if (!reference_analysis) {
-            result.U.reserve(time_steps + 1);
-            result.residualNorms.reserve(time_steps + 1);
-            Vector U_0(3 * state_size);
+            result.U.resize(time_steps + 1);
+            result.residualNorms.resize(time_steps + 1);
+            for (Vector& state : result.U) {
+                state.SetSize(3 * state_size);
+            }
+            Vector& U_0 = result.U[0];
             U_0.SetVector(v, 0);
             U_0.SetVector(v_dot, state_size);
             U_0.SetVector(v_ddot, 2 * state_size);
-            result.U.push_back(U_0);
-            result.residualNorms.push_back(
-                {initial_residual, 0.0, 0.0});
+            result.residualNorms[0] = {initial_residual, 0.0, 0.0};
         }
 
         std::vector<double>& measured_outlet = reference_analysis
@@ -812,7 +832,9 @@ bool App::Solver::solve()
             if (!std::isfinite(R_1_norm)
                 || !std::isfinite(R_2_norm)
                 || !std::isfinite(R_3_norm)
-                || R_1_norm > 1.0e-9) {
+                || R_1_norm > 1.0e-9
+                || R_2_norm > 1.0e-9
+                || R_3_norm > 1.0e-9) {
                 log(LogLevel::Error,
                     "The Newmark residual check failed at time step "
                         + std::to_string(n) + ".");
@@ -820,13 +842,12 @@ bool App::Solver::solve()
             }
 
             if (!reference_analysis) {
-                Vector U_n(3 * state_size);
+                Vector& U_n = result.U[n];
                 U_n.SetVector(v_n, 0);
                 U_n.SetVector(v_dot_n, state_size);
                 U_n.SetVector(v_ddot_n, 2 * state_size);
-                result.U.push_back(U_n);
-                result.residualNorms.push_back(
-                    {R_1_norm, R_2_norm, R_3_norm});
+                result.residualNorms[n] = {
+                    R_1_norm, R_2_norm, R_3_norm};
             }
 
             v = v_n;
@@ -856,21 +877,18 @@ bool App::Solver::solve()
 
 bool App::Solver::smooth_level_set(
     const GridFunction& level_set,
-    GridFunction& smoothed_level_set,
-    const SparseMatrix& design_to_cell,
-    const SparseMatrix& cell_to_level_set,
-    const DenseMatrix& element_centers,
-    const Vector& cell_volumes)
+    GridFunction& smoothed_level_set)
 {
     const int cell_count = mesh->GetNE();
     const int dim = mesh->Dimension();
     const int level_set_size = level_set_fes->GetTrueVSize();
-    if (level_set.FESpace() != level_set_fes.get()
+    if (!design_to_cell || !cell_to_level_set
+        || level_set.FESpace() != level_set_fes.get()
         || smoothed_level_set.FESpace() != level_set_fes.get()
-        || design_to_cell.Height() != cell_count
-        || design_to_cell.Width() != level_set_size
-        || cell_to_level_set.Height() != level_set_size
-        || cell_to_level_set.Width() != cell_count
+        || design_to_cell->Height() != cell_count
+        || design_to_cell->Width() != level_set_size
+        || cell_to_level_set->Height() != level_set_size
+        || cell_to_level_set->Width() != cell_count
         || element_centers.Height() != cell_count
         || element_centers.Width() != dim
         || cell_volumes.Size() != cell_count) {
@@ -886,7 +904,7 @@ bool App::Solver::smooth_level_set(
     const double hz = settings.nz > 0
         ? settings.sz / settings.nz
         : std::numeric_limits<double>::max();
-    const double level_set_scale = std::min({hx, hy, hz});
+    level_set_scale = std::min({hx, hy, hz});
 
     // Paper Eq. (28): -r^2 Laplacian(phi_c) + phi_c = mapped_design_c.
     const real_t filter_radius = optimizer_settings.filterRadius;
@@ -894,41 +912,43 @@ bool App::Solver::smooth_level_set(
         log(LogLevel::Error, "The PDE filter radius cannot be negative.");
         return false;
     }
-    SparseMatrix filter_matrix(cell_count);
-    for (int element = 0; element < cell_count; ++element) {
-        filter_matrix.Add(element, element, cell_volumes[element]);
+    if (!filter_matrix) {
+        filter_matrix = std::make_unique<SparseMatrix>(cell_count);
+        for (int element = 0; element < cell_count; ++element) {
+            filter_matrix->Add(element, element, cell_volumes[element]);
+        }
+        for (int face = 0; face < mesh->GetNumFaces(); ++face) {
+            int first = -1;
+            int second = -1;
+            mesh->GetFaceElements(face, &first, &second);
+            if (second < 0
+                || mesh->GetAttribute(first)
+                    != static_cast<int>(DomainAttribute::design)
+                || mesh->GetAttribute(second)
+                    != static_cast<int>(DomainAttribute::design)) {
+                continue;
+            }
+            real_t distance_squared = 0.0;
+            for (int axis = 0; axis < dim; ++axis) {
+                const real_t distance = element_centers(second, axis)
+                    - element_centers(first, axis);
+                distance_squared += distance * distance;
+            }
+            if (distance_squared <= 0.0) {
+                log(LogLevel::Error,
+                    "The PDE filter found coincident cell centers.");
+                return false;
+            }
+            const real_t coefficient = filter_radius * filter_radius
+                * 0.5 * (cell_volumes[first] + cell_volumes[second])
+                / distance_squared;
+            filter_matrix->Add(first, first, coefficient);
+            filter_matrix->Add(first, second, -coefficient);
+            filter_matrix->Add(second, first, -coefficient);
+            filter_matrix->Add(second, second, coefficient);
+        }
+        filter_matrix->Finalize();
     }
-    for (int face = 0; face < mesh->GetNumFaces(); ++face) {
-        int first = -1;
-        int second = -1;
-        mesh->GetFaceElements(face, &first, &second);
-        if (second < 0
-            || mesh->GetAttribute(first)
-                != static_cast<int>(DomainAttribute::design)
-            || mesh->GetAttribute(second)
-                != static_cast<int>(DomainAttribute::design)) {
-            continue;
-        }
-        real_t distance_squared = 0.0;
-        for (int axis = 0; axis < dim; ++axis) {
-            const real_t distance = element_centers(second, axis)
-                - element_centers(first, axis);
-            distance_squared += distance * distance;
-        }
-        if (distance_squared <= 0.0) {
-            log(LogLevel::Error,
-                "The PDE filter found coincident cell centers.");
-            return false;
-        }
-        const real_t coefficient = filter_radius * filter_radius
-            * 0.5 * (cell_volumes[first] + cell_volumes[second])
-            / distance_squared;
-        filter_matrix.Add(first, first, coefficient);
-        filter_matrix.Add(first, second, -coefficient);
-        filter_matrix.Add(second, first, -coefficient);
-        filter_matrix.Add(second, second, coefficient);
-    }
-    filter_matrix.Finalize();
 
     Vector mapped;
     level_set.GetTrueDofs(mapped);
@@ -937,15 +957,15 @@ bool App::Solver::smooth_level_set(
     Vector center_values(cell_count);
     Vector filter_rhs(cell_count);
     Vector filtered_centers(cell_count);
-    design_to_cell.Mult(mapped, center_values);
+    design_to_cell->Mult(mapped, center_values);
     for (int cell = 0; cell < cell_count; ++cell) {
         filter_rhs[cell] = cell_volumes[cell] * center_values[cell];
     }
 
-    GSSmoother preconditioner(filter_matrix);
+    GSSmoother preconditioner(*filter_matrix);
     CGSolver solver;
     solver.SetPreconditioner(preconditioner);
-    solver.SetOperator(filter_matrix);
+    solver.SetOperator(*filter_matrix);
     solver.SetRelTol(1.0e-10);
     solver.SetAbsTol(1.0e-12);
     solver.SetMaxIter(1500);
@@ -959,7 +979,7 @@ bool App::Solver::smooth_level_set(
     }
 
     Vector physical(level_set_size);
-    cell_to_level_set.Mult(filtered_centers, physical);
+    cell_to_level_set->Mult(filtered_centers, physical);
     smoothed_level_set.SetFromTrueDofs(physical);
     smoothed_level_set.SetSubVectorComplement(
         lset.activeDesignDofs, -0.5 * level_set_scale);
@@ -974,20 +994,20 @@ bool App::Solver::postprocessFourierResponse()
         return false;
     }
 
-    std::vector<double> window(sample_count);
+    fft_window.resize(sample_count);
     for (int sample = 0; sample < sample_count; ++sample) {
-        window[sample] = settings.useHannWindow
+        fft_window[sample] = settings.useHannWindow
             ? 0.5 * (1.0 - std::cos(
                 2.0 * std::acos(-1.0) * sample / (sample_count - 1)))
             : 1.0;
     }
 
-    auto transform = [&window, sample_count](
+    auto transform = [this, sample_count](
                          const std::vector<double>& signal,
                          std::vector<std::complex<double>>& spectrum) {
         std::vector<double> windowed(sample_count);
         for (int sample = 0; sample < sample_count; ++sample) {
-            windowed[sample] = signal[sample] * window[sample];
+            windowed[sample] = signal[sample] * fft_window[sample];
         }
 
         fftw_complex* output = fftw_alloc_complex(sample_count / 2 + 1);
@@ -1035,7 +1055,7 @@ bool App::Solver::postprocessFourierResponse()
     const double reference_floor =
         std::max(1.0e-14, 1.0e-12 * maximum_reference);
     const double window_sum =
-        std::accumulate(window.begin(), window.end(), 0.0);
+        std::accumulate(fft_window.begin(), fft_window.end(), 0.0);
     if (window_sum <= 0.0) {
         log(LogLevel::Error, "The FFT window has zero total weight.");
         return false;
@@ -1043,6 +1063,10 @@ bool App::Solver::postprocessFourierResponse()
 
     const bool has_nyquist_bin = sample_count % 2 == 0;
     const float invalid_value = std::numeric_limits<float>::quiet_NaN();
+    frequency_response.frequency.resize(response->size);
+    frequency_response.outlet = response_spectrum;
+    frequency_response.reference = reference_spectrum;
+    frequency_response.valid.resize(response->size);
     for (int bin = 0; bin < response->size; ++bin) {
         const double reference_amplitude = std::abs(reference_spectrum[bin]);
         const double amplitude = std::abs(response_spectrum[bin]);
@@ -1052,8 +1076,10 @@ bool App::Solver::postprocessFourierResponse()
             ? 1.0 / window_sum
             : 2.0 / window_sum;
 
-        response->frequency[bin] = static_cast<float>(
-            bin / (sample_count * settings.dt));
+        const double frequency = bin / (sample_count * settings.dt);
+        frequency_response.frequency[bin] = frequency;
+        frequency_response.valid[bin] = valid ? 1 : 0;
+        response->frequency[bin] = static_cast<float>(frequency);
         response->referenceAmplitude[bin] = static_cast<float>(
             reference_amplitude * one_sided_scale);
         response->amplitude[bin] = static_cast<float>(
@@ -1099,5 +1125,471 @@ bool App::Solver::postprocessFourierResponse()
     std::atomic_store(
         &result.referenceOutletPressure,
         make_signal(reference_outlet_pressure, false));
+    return true;
+}
+
+bool App::Solver::differentiateFrequencyResponse(
+    const std::vector<std::complex<double>>& spectrum_derivative,
+    Vector& design_gradient)
+{
+    const int time_steps = result.timeSteps;
+    const int state_size = result.stateSize;
+    const int displacement_size = result.displacementSize;
+    const int pressure_size = result.pressureSize;
+    if (!mesh || mesh->Dimension() != 2 || !M || !C || !K
+        || !design_to_cell || !cell_to_level_set || !filter_matrix
+        || time_steps <= 0 || state_size <= 0
+        || result.U.size() != static_cast<std::size_t>(time_steps + 1)
+        || fft_window.size() != static_cast<std::size_t>(time_steps)
+        || spectrum_derivative.size() != frequency_response.outlet.size()
+        || spectrum_derivative.size()
+            != static_cast<std::size_t>(time_steps / 2 + 1)) {
+        log(LogLevel::Error,
+            "The forward history is incomplete for the discrete adjoint.");
+        return false;
+    }
+    for (const Vector& state : result.U) {
+        if (state.Size() != 3 * state_size) {
+            log(LogLevel::Error,
+                "A stored Newmark state has an invalid block layout.");
+            return false;
+        }
+    }
+
+    // The complex input stores dPhi/dRe + i*dPhi/dIm. FFTW's unnormalized
+    // C2R transform applies the transpose of the unnormalized forward R2C
+    // transform after the interior bins are halved.
+    fftw_complex* fft_derivative = fftw_alloc_complex(
+        spectrum_derivative.size());
+    if (fft_derivative == nullptr) {
+        log(LogLevel::Error,
+            "FFTW could not allocate the adjoint frequency buffer.");
+        return false;
+    }
+    const bool has_nyquist_bin = time_steps % 2 == 0;
+    for (int bin = 0; bin < static_cast<int>(spectrum_derivative.size()); ++bin) {
+        const bool single_sided = bin == 0
+            || (has_nyquist_bin
+                && bin == static_cast<int>(spectrum_derivative.size()) - 1);
+        const double scale = single_sided ? 1.0 : 0.5;
+        fft_derivative[bin][0] = scale * spectrum_derivative[bin].real();
+        fft_derivative[bin][1] = single_sided
+            ? 0.0
+            : scale * spectrum_derivative[bin].imag();
+    }
+    std::vector<double> outlet_derivative(time_steps);
+    fftw_plan inverse_plan = fftw_plan_dft_c2r_1d(
+        time_steps,
+        fft_derivative,
+        outlet_derivative.data(),
+        FFTW_ESTIMATE);
+    if (inverse_plan == nullptr) {
+        fftw_free(fft_derivative);
+        log(LogLevel::Error,
+            "FFTW could not create the adjoint transform.");
+        return false;
+    }
+    fftw_execute(inverse_plan);
+    fftw_destroy_plan(inverse_plan);
+    fftw_free(fft_derivative);
+    for (int sample = 0; sample < time_steps; ++sample) {
+        outlet_derivative[sample] *= fft_window[sample];
+    }
+
+    const double beta = settings.newmarkBeta;
+    const double gamma = settings.newmarkGamma;
+    const double a_1 = 1.0 - gamma / beta;
+    const double a_2 =
+        (1.0 - gamma / (2.0 * beta)) * settings.dt;
+    const double a_3 = gamma / (beta * settings.dt);
+    const double a_4 = 1.0 / (beta * settings.dt);
+    const double a_5 = 1.0 / (2.0 * beta) - 1.0;
+    const double a_6 = 1.0 / (beta * settings.dt * settings.dt);
+
+    if (!effective_matrix_transpose) {
+        std::unique_ptr<SparseMatrix> M_and_C(Add(a_6, *M, a_3, *C));
+        std::unique_ptr<SparseMatrix> K_hat(Add(1.0, *K, 1.0, *M_and_C));
+        for (int i = 0; i < displacement_essential_tdofs.Size(); ++i) {
+            K_hat->EliminateRowCol(displacement_essential_tdofs[i]);
+        }
+        effective_matrix_transpose.reset(Transpose(*K_hat));
+    }
+    GSSmoother K_hat_preconditioner(*effective_matrix_transpose);
+    GMRESSolver K_hat_solver;
+    K_hat_solver.SetPreconditioner(K_hat_preconditioner);
+    K_hat_solver.SetOperator(*effective_matrix_transpose);
+    K_hat_solver.iterative_mode = true;
+    K_hat_solver.SetKDim(50);
+    K_hat_solver.SetRelTol(1.0e-10);
+    K_hat_solver.SetAbsTol(1.0e-12);
+    K_hat_solver.SetMaxIter(1500);
+    K_hat_solver.SetPrintLevel(-1);
+
+    adjoint_history.resize(time_steps + 1);
+    for (Vector& state : adjoint_history) {
+        state.SetSize(state_size);
+    }
+    auto& adjoint = adjoint_history;
+    Vector bar_v(state_size);
+    Vector bar_v_dot(state_size);
+    Vector bar_v_ddot(state_size);
+    bar_v = 0.0;
+    bar_v_dot = 0.0;
+    bar_v_ddot = 0.0;
+    Vector M_transpose_adjoint(state_size);
+    Vector C_transpose_adjoint(state_size);
+    Vector adjoint_residual(state_size);
+
+    for (int n = time_steps; n >= 1; --n) {
+        Vector pressure_bar(
+            bar_v.GetData() + pressure_offset, pressure_size);
+        pressure_bar.Add(outlet_derivative[n - 1], outlet_functional);
+
+        Vector previous_bar_v(state_size);
+        Vector previous_bar_v_dot(state_size);
+        Vector previous_bar_v_ddot(state_size);
+        previous_bar_v = 0.0;
+        previous_bar_v.Add(-a_3, bar_v_dot);
+        previous_bar_v.Add(-a_6, bar_v_ddot);
+        previous_bar_v_dot = 0.0;
+        previous_bar_v_dot.Add(a_1, bar_v_dot);
+        previous_bar_v_dot.Add(-a_4, bar_v_ddot);
+        previous_bar_v_ddot = 0.0;
+        previous_bar_v_ddot.Add(a_2, bar_v_dot);
+        previous_bar_v_ddot.Add(-a_5, bar_v_ddot);
+
+        bar_v.Add(a_3, bar_v_dot);
+        bar_v.Add(a_6, bar_v_ddot);
+        bar_v.SetSubVector(displacement_essential_tdofs, 0.0);
+
+        adjoint[n].SetSize(state_size);
+        if (n == time_steps) {
+            adjoint[n] = 0.0;
+        }
+        else {
+            adjoint[n] = adjoint[n + 1];
+        }
+        K_hat_solver.Mult(bar_v, adjoint[n]);
+        effective_matrix_transpose->Mult(adjoint[n], adjoint_residual);
+        adjoint_residual -= bar_v;
+        const double relative_adjoint_residual = adjoint_residual.Norml2()
+            / std::max(1.0, bar_v.Norml2());
+        if (!K_hat_solver.GetConverged()
+            || !std::isfinite(relative_adjoint_residual)
+            || relative_adjoint_residual > 1.0e-9) {
+            log(LogLevel::Error,
+                "The Newmark adjoint failed its residual gate at time step "
+                    + std::to_string(n) + ".");
+            return false;
+        }
+        adjoint[n].SetSubVector(displacement_essential_tdofs, 0.0);
+
+        M->MultTranspose(adjoint[n], M_transpose_adjoint);
+        C->MultTranspose(adjoint[n], C_transpose_adjoint);
+        previous_bar_v.Add(a_6, M_transpose_adjoint);
+        previous_bar_v.Add(a_3, C_transpose_adjoint);
+        previous_bar_v_dot.Add(a_4, M_transpose_adjoint);
+        previous_bar_v_dot.Add(-a_1, C_transpose_adjoint);
+        previous_bar_v_ddot.Add(a_5, M_transpose_adjoint);
+        previous_bar_v_ddot.Add(-a_2, C_transpose_adjoint);
+
+        bar_v = previous_bar_v;
+        bar_v_dot = previous_bar_v_dot;
+        bar_v_ddot = previous_bar_v_ddot;
+    }
+
+    if (!initial_matrix_transpose) {
+        SparseMatrix initial_matrix(*M);
+        for (int i = 0; i < displacement_essential_tdofs.Size(); ++i) {
+            initial_matrix.EliminateRowCol(displacement_essential_tdofs[i]);
+        }
+        initial_matrix_transpose.reset(Transpose(initial_matrix));
+    }
+    GSSmoother initial_preconditioner(*initial_matrix_transpose);
+    GMRESSolver initial_solver;
+    initial_solver.SetPreconditioner(initial_preconditioner);
+    initial_solver.SetOperator(*initial_matrix_transpose);
+    initial_solver.SetKDim(50);
+    initial_solver.SetRelTol(1.0e-10);
+    initial_solver.SetAbsTol(1.0e-12);
+    initial_solver.SetMaxIter(1500);
+    initial_solver.SetPrintLevel(-1);
+    Vector initial_adjoint(state_size);
+    initial_adjoint = 0.0;
+    bar_v_ddot.SetSubVector(displacement_essential_tdofs, 0.0);
+    initial_solver.Mult(bar_v_ddot, initial_adjoint);
+    initial_matrix_transpose->Mult(initial_adjoint, adjoint_residual);
+    adjoint_residual -= bar_v_ddot;
+    const double initial_adjoint_residual = adjoint_residual.Norml2()
+        / std::max(1.0, bar_v_ddot.Norml2());
+    if (!initial_solver.GetConverged()
+        || !std::isfinite(initial_adjoint_residual)
+        || initial_adjoint_residual > 1.0e-9) {
+        log(LogLevel::Error,
+            "The initial-acceleration adjoint failed its residual gate.");
+        return false;
+    }
+    initial_adjoint.SetSubVector(displacement_essential_tdofs, 0.0);
+
+    const auto* physics =
+        std::get_if<VibroacousticSettings>(&settings.physics);
+    if (physics == nullptr || level_set_scale <= 0.0
+        || optimizer_settings.cutDerivativeRelativeStep <= 0.0) {
+        log(LogLevel::Error,
+            "The cut derivative settings are invalid.");
+        return false;
+    }
+    const double lambda = physics->youngs_modulus * physics->poisson_ratio
+        / (1.0 - physics->poisson_ratio * physics->poisson_ratio);
+    const double mu = physics->youngs_modulus
+        / (2.0 * (1.0 + physics->poisson_ratio));
+    ConstantCoefficient solid_density(physics->rho_s);
+    ConstantCoefficient solid_lambda(lambda);
+    ConstantCoefficient solid_mu(mu);
+    ConstantCoefficient acoustic_mass(
+        1.0 / (physics->rho_a * physics->c_a * physics->c_a));
+    ConstantCoefficient acoustic_stiffness(1.0 / physics->rho_a);
+    ImplicitDomainIntegrator Muu_integrator(
+        std::make_unique<VectorMassIntegrator>(solid_density),
+        *lset.phi, cut_integration_order, level_set_order,
+        physics->epsilon, true);
+    ImplicitDomainIntegrator Kuu_integrator(
+        std::make_unique<ElasticityIntegrator>(solid_lambda, solid_mu),
+        *lset.phi, cut_integration_order, level_set_order,
+        physics->epsilon, true);
+    ImplicitDomainIntegrator Mpp_integrator(
+        std::make_unique<MassIntegrator>(acoustic_mass),
+        *lset.phi, cut_integration_order, level_set_order,
+        physics->epsilon, false);
+    ImplicitDomainIntegrator Kpp_integrator(
+        std::make_unique<DiffusionIntegrator>(acoustic_stiffness),
+        *lset.phi, cut_integration_order, level_set_order,
+        physics->epsilon, false);
+    ImplicitSurfaceNormalIntegrator Kup_integrator(
+        *lset.phi, cut_integration_order, level_set_order, -1.0, false);
+    ImplicitSurfaceNormalIntegrator Mpu_integrator(
+        *lset.phi, cut_integration_order, level_set_order, 1.0, true);
+
+    const double omega_1 = 2.0 * std::acos(-1.0) * physics->f1;
+    const double omega_2 = 2.0 * std::acos(-1.0) * physics->f2;
+    const double alpha_d = 2.0 * physics->zeta * omega_1 * omega_2
+        / (omega_1 + omega_2);
+    const double beta_d = 2.0 * physics->zeta / (omega_1 + omega_2);
+    const double perturbation =
+        optimizer_settings.cutDerivativeRelativeStep * level_set_scale;
+    const double inverse_perturbation = 0.5 / perturbation;
+
+    Array<int> active(level_set_fes->GetTrueVSize());
+    active = 0;
+    for (int i = 0; i < lset.activeDesignDofs.Size(); ++i) {
+        active[lset.activeDesignDofs[i]] = 1;
+    }
+    Vector physical_gradient(level_set_fes->GetTrueVSize());
+    physical_gradient = 0.0;
+    Array<int> phi_dofs;
+    Array<int> displacement_dofs;
+    Array<int> pressure_dofs;
+    Vector matrix_product;
+    auto contract = [&matrix_product](
+                        const Vector& left,
+                        const DenseMatrix& matrix,
+                        const Vector& right) {
+        matrix_product.SetSize(matrix.Height());
+        matrix.Mult(right, matrix_product);
+        return left * matrix_product;
+    };
+    auto difference = [inverse_perturbation](
+                          DenseMatrix& plus,
+                          const DenseMatrix& minus) {
+        plus -= minus;
+        plus *= inverse_perturbation;
+    };
+
+    for (int element = 0; element < mesh->GetNE(); ++element) {
+        if (mesh->GetAttribute(element)
+            != static_cast<int>(DomainAttribute::design)) {
+            continue;
+        }
+        level_set_fes->GetElementDofs(element, phi_dofs);
+        double minimum_phi = std::numeric_limits<double>::max();
+        double maximum_phi = std::numeric_limits<double>::lowest();
+        for (int dof = 0; dof < phi_dofs.Size(); ++dof) {
+            minimum_phi = std::min(minimum_phi, (*lset.phi)[phi_dofs[dof]]);
+            maximum_phi = std::max(maximum_phi, (*lset.phi)[phi_dofs[dof]]);
+        }
+        if (minimum_phi > perturbation || maximum_phi < -perturbation) {
+            continue;
+        }
+        displacement_fes->GetElementVDofs(element, displacement_dofs);
+        scalar_fes->GetElementDofs(element, pressure_dofs);
+        ElementTransformation* transformation =
+            mesh->GetElementTransformation(element);
+        const FiniteElement& scalar_element = *scalar_fes->GetFE(element);
+        const FiniteElement& displacement_element =
+            *displacement_fes->GetFE(element);
+
+        Array<int> pressure_state_dofs(pressure_dofs.Size());
+        for (int i = 0; i < pressure_dofs.Size(); ++i) {
+            pressure_state_dofs[i] = pressure_offset + pressure_dofs[i];
+        }
+
+        for (int local_dof = 0; local_dof < phi_dofs.Size(); ++local_dof) {
+            const int phi_dof = phi_dofs[local_dof];
+            if (active[phi_dof] == 0) {
+                continue;
+            }
+            const double original_phi = (*lset.phi)[phi_dof];
+
+            DenseMatrix Muu_plus, Kuu_plus, Mpp_plus, Kpp_plus;
+            DenseMatrix Kup_plus, Mpu_plus;
+            (*lset.phi)[phi_dof] = original_phi + perturbation;
+            Muu_integrator.AssembleElementMatrix(
+                displacement_element, *transformation, Muu_plus);
+            Kuu_integrator.AssembleElementMatrix(
+                displacement_element, *transformation, Kuu_plus);
+            Mpp_integrator.AssembleElementMatrix(
+                scalar_element, *transformation, Mpp_plus);
+            Kpp_integrator.AssembleElementMatrix(
+                scalar_element, *transformation, Kpp_plus);
+            Kup_integrator.AssembleElementMatrix2(
+                scalar_element, displacement_element,
+                *transformation, Kup_plus);
+            Mpu_integrator.AssembleElementMatrix2(
+                displacement_element, scalar_element,
+                *transformation, Mpu_plus);
+
+            DenseMatrix Muu_minus, Kuu_minus, Mpp_minus, Kpp_minus;
+            DenseMatrix Kup_minus, Mpu_minus;
+            (*lset.phi)[phi_dof] = original_phi - perturbation;
+            Muu_integrator.AssembleElementMatrix(
+                displacement_element, *transformation, Muu_minus);
+            Kuu_integrator.AssembleElementMatrix(
+                displacement_element, *transformation, Kuu_minus);
+            Mpp_integrator.AssembleElementMatrix(
+                scalar_element, *transformation, Mpp_minus);
+            Kpp_integrator.AssembleElementMatrix(
+                scalar_element, *transformation, Kpp_minus);
+            Kup_integrator.AssembleElementMatrix2(
+                scalar_element, displacement_element,
+                *transformation, Kup_minus);
+            Mpu_integrator.AssembleElementMatrix2(
+                displacement_element, scalar_element,
+                *transformation, Mpu_minus);
+            (*lset.phi)[phi_dof] = original_phi;
+
+            difference(Muu_plus, Muu_minus);
+            difference(Kuu_plus, Kuu_minus);
+            difference(Mpp_plus, Mpp_minus);
+            difference(Kpp_plus, Kpp_minus);
+            difference(Kup_plus, Kup_minus);
+            difference(Mpu_plus, Mpu_minus);
+
+            Vector initial_u, initial_p, acceleration_u, acceleration_p;
+            initial_adjoint.GetSubVector(displacement_dofs, initial_u);
+            initial_adjoint.GetSubVector(pressure_state_dofs, initial_p);
+            Vector initial_state(
+                result.U[0].GetData() + 2 * state_size, state_size);
+            initial_state.GetSubVector(displacement_dofs, acceleration_u);
+            initial_state.GetSubVector(pressure_state_dofs, acceleration_p);
+            double sensitivity = -contract(
+                initial_u, Muu_plus, acceleration_u);
+            sensitivity -= contract(initial_p, Mpu_plus, acceleration_u);
+            sensitivity -= contract(initial_p, Mpp_plus, acceleration_p);
+
+            Vector lambda_u, lambda_p;
+            Vector v_u, v_p, previous_v_u, previous_v_p;
+            Vector previous_dot_u, previous_dot_p;
+            Vector previous_ddot_u, previous_ddot_p;
+            Vector mass_u, mass_p, damping_u;
+            for (int n = 1; n <= time_steps; ++n) {
+                adjoint[n].GetSubVector(displacement_dofs, lambda_u);
+                adjoint[n].GetSubVector(pressure_state_dofs, lambda_p);
+
+                Vector state(
+                    result.U[n].GetData(), state_size);
+                Vector previous_state(
+                    result.U[n - 1].GetData(), state_size);
+                Vector previous_dot(
+                    result.U[n - 1].GetData() + state_size, state_size);
+                Vector previous_ddot(
+                    result.U[n - 1].GetData() + 2 * state_size, state_size);
+                state.GetSubVector(displacement_dofs, v_u);
+                state.GetSubVector(pressure_state_dofs, v_p);
+                previous_state.GetSubVector(displacement_dofs, previous_v_u);
+                previous_state.GetSubVector(pressure_state_dofs, previous_v_p);
+                previous_dot.GetSubVector(displacement_dofs, previous_dot_u);
+                previous_dot.GetSubVector(pressure_state_dofs, previous_dot_p);
+                previous_ddot.GetSubVector(
+                    displacement_dofs, previous_ddot_u);
+                previous_ddot.GetSubVector(
+                    pressure_state_dofs, previous_ddot_p);
+
+                mass_u.SetSize(previous_v_u.Size());
+                mass_u = 0.0;
+                mass_u.Add(a_4, previous_dot_u);
+                mass_u.Add(a_5, previous_ddot_u);
+                mass_u.Add(a_6, previous_v_u);
+                mass_u.Add(-a_6, v_u);
+                mass_p.SetSize(previous_v_p.Size());
+                mass_p = 0.0;
+                mass_p.Add(a_4, previous_dot_p);
+                mass_p.Add(a_5, previous_ddot_p);
+                mass_p.Add(a_6, previous_v_p);
+                mass_p.Add(-a_6, v_p);
+                damping_u.SetSize(previous_v_u.Size());
+                damping_u = 0.0;
+                damping_u.Add(-a_1, previous_dot_u);
+                damping_u.Add(-a_2, previous_ddot_u);
+                damping_u.Add(a_3, previous_v_u);
+                damping_u.Add(-a_3, v_u);
+
+                sensitivity += contract(lambda_u, Muu_plus, mass_u);
+                sensitivity += contract(lambda_p, Mpu_plus, mass_u);
+                sensitivity += contract(lambda_p, Mpp_plus, mass_p);
+                sensitivity += alpha_d
+                    * contract(lambda_u, Muu_plus, damping_u);
+                sensitivity += beta_d
+                    * contract(lambda_u, Kuu_plus, damping_u);
+                sensitivity -= contract(lambda_u, Kuu_plus, v_u);
+                sensitivity -= contract(lambda_u, Kup_plus, v_p);
+                sensitivity -= contract(lambda_p, Kpp_plus, v_p);
+            }
+            physical_gradient[phi_dof] += sensitivity;
+        }
+    }
+
+    // Reverse the paper's node -> cell -> finite-volume filter -> node map.
+    Vector filtered_gradient(cell_to_level_set->Width());
+    cell_to_level_set->MultTranspose(
+        physical_gradient, filtered_gradient);
+    GSSmoother filter_preconditioner(*filter_matrix);
+    CGSolver filter_solver;
+    filter_solver.SetPreconditioner(filter_preconditioner);
+    filter_solver.SetOperator(*filter_matrix);
+    filter_solver.SetRelTol(1.0e-10);
+    filter_solver.SetAbsTol(1.0e-12);
+    filter_solver.SetMaxIter(1500);
+    filter_solver.SetPrintLevel(-1);
+    Vector filter_adjoint(filtered_gradient.Size());
+    filter_adjoint = 0.0;
+    filter_solver.Mult(filtered_gradient, filter_adjoint);
+    if (!filter_solver.GetConverged()) {
+        log(LogLevel::Error,
+            "The adjoint PDE filter solve did not converge.");
+        return false;
+    }
+    Vector center_gradient(filter_adjoint.Size());
+    for (int cell = 0; cell < center_gradient.Size(); ++cell) {
+        center_gradient[cell] = cell_volumes[cell] * filter_adjoint[cell];
+    }
+    design_gradient.SetSize(design_to_cell->Width());
+    design_to_cell->MultTranspose(center_gradient, design_gradient);
+    design_gradient *= level_set_scale;
+    design_gradient.SetSubVectorComplement(lset.activeDesignDofs, 0.0);
+    if (design_gradient.CheckFinite() != 0) {
+        log(LogLevel::Error,
+            "The discrete-adjoint design gradient is non-finite.");
+        return false;
+    }
     return true;
 }

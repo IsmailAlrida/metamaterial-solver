@@ -67,6 +67,7 @@ public:
         integrator->SetIntegrationRule(cut_rule);
         integrator->AssembleElementMatrix(
             element, transformation, cut_matrix);
+        integrator->SetIntRule(nullptr);
 
         element_matrix = full_matrix;
         element_matrix *= epsilon;

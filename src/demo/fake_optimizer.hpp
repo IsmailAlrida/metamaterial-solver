@@ -30,9 +30,14 @@ class FakeOptimizer {
             cancelRequested.store(false);
             iteration.store(0);
             status.store(OptimizerStatus::Working);
+            passObjective.store(0.0);
+            stopObjective.store(0.0);
+            mmaBound.store(0.0);
 
             try {
-                if (!solver.run()) {
+                if (!solver.setMesh()
+                    || !solver.assembleSolutionSpace()
+                    || !solver.solve()) {
                     status.store(
                         solver.get_status() == SolverStatus::Diverged
                             ? OptimizerStatus::Diverged
@@ -50,7 +55,9 @@ class FakeOptimizer {
 
                     optimize();
 
-                    if (!solver.run()) {
+                    if (!solver.setMesh()
+                        || !solver.assembleSolutionSpace()
+                        || !solver.solve()) {
                         status.store(
                             solver.get_status() == SolverStatus::Diverged
                                 ? OptimizerStatus::Diverged
@@ -80,6 +87,10 @@ class FakeOptimizer {
                     0.5 + 0.34 * std::sin(position * 18.0 + phase), 0.0, 1.0);
             }
             geometry.phi->SetFromTrueDofs(geometry.design);
+            const double progress = static_cast<double>(iteration.load() + 1);
+            passObjective.store(10.0 / (1.0 + progress));
+            stopObjective.store(14.0 / (1.0 + progress));
+            mmaBound.store(std::max(passObjective.load(), stopObjective.load()));
             log(LogLevel::Message,
                 "Demo optimizer updated the shared level-set design.");
         }
@@ -113,6 +124,21 @@ class FakeOptimizer {
                     && solver.get_status() == SolverStatus::Converged);
         }
 
+        double get_pass_objective() const
+        {
+            return passObjective.load();
+        }
+
+        double get_stop_objective() const
+        {
+            return stopObjective.load();
+        }
+
+        double get_mma_bound() const
+        {
+            return mmaBound.load();
+        }
+
     private:
         const OptimizerSettings& settings;
         FakeSolver& solver;
@@ -122,6 +148,9 @@ class FakeOptimizer {
         std::atomic_bool cancelRequested{false};
         std::atomic<OptimizerStatus> status{OptimizerStatus::Idle};
         std::atomic<int> iteration{0};
+        std::atomic<double> passObjective{0.0};
+        std::atomic<double> stopObjective{0.0};
+        std::atomic<double> mmaBound{0.0};
 };
 
 } // namespace App::Demo
