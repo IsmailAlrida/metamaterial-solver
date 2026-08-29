@@ -634,9 +634,8 @@ bool App::Solver::solve()
 
         std::unique_ptr<SparseMatrix> M_and_C(Add(a_6, *M, a_3, *C));
         std::unique_ptr<SparseMatrix> K_hat(Add(1.0, *K, 1.0, *M_and_C));
-        for (int i = 0; i < displacement_essential_tdofs.Size(); ++i) {
-            K_hat->EliminateRowCol(displacement_essential_tdofs[i]);
-        }
+        K_hat->EliminateBC(
+            displacement_essential_tdofs, Operator::DIAG_ONE);
 
         // ponytail: GSSmoother is the low-memory baseline; replace it with a
         // block preconditioner only if the paper-default residual gate fails.
@@ -674,9 +673,8 @@ bool App::Solver::solve()
 
         // Paper Eq. (21): M v_ddot^0 = h^0.
         SparseMatrix M_system(*M);
-        for (int i = 0; i < displacement_essential_tdofs.Size(); ++i) {
-            M_system.EliminateRowCol(displacement_essential_tdofs[i]);
-        }
+        M_system.EliminateBC(
+            displacement_essential_tdofs, Operator::DIAG_ONE);
         GSSmoother M_preconditioner(M_system);
         GMRESSolver M_solver;
         M_solver.SetPreconditioner(M_preconditioner);
@@ -761,7 +759,7 @@ bool App::Solver::solve()
             h_hat = h;
             h_hat += y_M;
             h_hat += y_C;
-            // EliminateRowCol() imposes v = 0 on these rows, so their RHS is 0.
+            // The essential boundary rows impose v = 0, so their RHS is 0.
             h_hat.SetSubVector(displacement_essential_tdofs, 0.0);
 
             v_n = v;
@@ -1209,9 +1207,8 @@ bool App::Solver::differentiateFrequencyResponse(
     if (!effective_matrix_transpose) {
         std::unique_ptr<SparseMatrix> M_and_C(Add(a_6, *M, a_3, *C));
         std::unique_ptr<SparseMatrix> K_hat(Add(1.0, *K, 1.0, *M_and_C));
-        for (int i = 0; i < displacement_essential_tdofs.Size(); ++i) {
-            K_hat->EliminateRowCol(displacement_essential_tdofs[i]);
-        }
+        K_hat->EliminateBC(
+            displacement_essential_tdofs, Operator::DIAG_ONE);
         effective_matrix_transpose.reset(Transpose(*K_hat));
     }
     GSSmoother K_hat_preconditioner(*effective_matrix_transpose);
@@ -1300,9 +1297,8 @@ bool App::Solver::differentiateFrequencyResponse(
 
     if (!initial_matrix_transpose) {
         SparseMatrix initial_matrix(*M);
-        for (int i = 0; i < displacement_essential_tdofs.Size(); ++i) {
-            initial_matrix.EliminateRowCol(displacement_essential_tdofs[i]);
-        }
+        initial_matrix.EliminateBC(
+            displacement_essential_tdofs, Operator::DIAG_ONE);
         initial_matrix_transpose.reset(Transpose(initial_matrix));
     }
     GSSmoother initial_preconditioner(*initial_matrix_transpose);
