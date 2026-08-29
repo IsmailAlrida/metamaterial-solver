@@ -39,7 +39,7 @@ class Dispatcher {
         using Callback = std::function<void()>;
         //TODO: Add pause mechanism later to pause from either opt/solve
         enum class State{Idle, Solving, Optimizing, Diverged, Done, Exporting, Error};
-        enum class Event{Reset, Cancel, Start, OptFail, SolveFail, SolveConverged, OptConverged, OptSuccess, Export, Error, HandleError, ExportDone};
+        enum class Event{Reset, Cancel, Start, OptFail, SolveFail, SolveConverged, OptConverged, OptSuccess, Export, Error, HandleError, ExportDone, Nothing};
 
         Dispatcher(
             Solver& solver, 
@@ -174,40 +174,65 @@ class Dispatcher {
         
         
         
-        void dispatch(Event e) {
+        void dispatch(Event e = Event::Nothing) {
             using namespace std::chrono_literals;
 
+            if (e == Event::Nothing) {
+                // Flush branch: Called at the end of each frame to flush the queue
+                // progress the dequeue of events until its empty
+                // Check if the worker thread is busy
+                // if busy, do nothing and return (skip)
+                // Else if the worker future is ready, consume the future with .join()
+                //      then, if queue is non-empty, dispatch event from queue FIFO-style
 
-            if (std::find(events.begin(), events.end(), e) == events.end())
+            } 
+            else if (e not in Event class) 
             {
-
+                // Skip action and log warning. Set no state.
             }
-            
-                events.push_back(e);
-            std::pair<State, Event> p(state, e);
-
-            std::pair<State, Callback> sf = transitions.at(p);
-            set_state(sf.first);
-
-            // So this is a nonblocking poll of if the worker is donezo
-            if (worker.valid() 
-                && worker.wait_for(0ms) == std::future_status::ready) {
-                
-                // If it's donezo
-                try
+            else 
+            {                
+                // Dispatched event comes in, is in the list, and is a valid event
+                // Check again if the worker is busy
+                // If its busy, push to the dequeue then return
+                // Coalesce the event if we are spamming
+                if (std::find(events.begin(), events.end(), e) == events.end())
                 {
-                    // Consume the future!
-                    worker.get();
-                }
-                catch(const std::exception& e)
-                {
-                    // And also bubble up the exceptions here
-                    log(App::LogLevel::Error, e.what());
-                }
-                
-            }
-            worker = std::async(std::launch::async, sf.second);
+                    events.push_back(e);
+                    return;
 
+                }
+
+                // If the worker is NOT busy
+                // Set state from the transition table first of all
+                // Then 
+                
+                std::pair<State, Event> p(state, e);
+                std::pair<State, Callback> sf = transitions.at(p);
+                // Set the state transition first
+                set_state(sf.first);
+
+                // So this is a nonblocking poll of if the worker is donezo
+                // If the worker is free, run an async 
+                if (worker.valid() 
+                    && worker.wait_for(0ms) == std::future_status::ready) {
+                    
+                    // If it's donezo
+                    try
+                    {
+                        // Consume the future!
+                        worker.get();
+                    }
+                    catch(const std::exception& e)
+                    {
+                        // And also bubble up the exceptions here
+                        // Also should probably stringifity the e.what from a c string to std string
+                        log(App::LogLevel::Error, e.what());
+                    }
+                    
+                }
+                worker = std::async(std::launch::async, sf.second);
+}
         } 
 
         void set_state(State s) {
