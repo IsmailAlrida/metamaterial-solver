@@ -13,10 +13,12 @@ namespace App::Demo {
 class FakeSolver {
     public:
         FakeSolver(const SolverSettings& settings,
+                   const OptimizerSettings& optimizerSettings,
                    LevelSet& lset,
                    SolverResult& result,
                    const LogFunction& log)
             : settings(settings),
+              optimizerSettings(optimizerSettings),
               lset(lset),
               result(result),
               log(log),
@@ -163,6 +165,7 @@ class FakeSolver {
         }
 
         const SolverSettings& settings;
+        const OptimizerSettings& optimizerSettings;
         LevelSet& lset;
         SolverResult& result;
         const LogFunction& log;

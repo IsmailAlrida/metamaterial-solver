@@ -38,17 +38,20 @@ enum class CartesianBoundary3D {
 
 App::Solver::Solver( 
             const App::SolverSettings& settings,
+            const App::OptimizerSettings& optimizer_settings,
             App::LevelSet& lset,
             App::SolverResult& result,
             const App::LogFunction& log
             )
             : 
             settings(settings),
+            optimizer_settings(optimizer_settings),
             lset(lset),
             result(result),
             log(log),
             mesh(nullptr),
             fec(nullptr),
+            level_set_fes(nullptr),
             scalar_fes(nullptr),
             displacement_fes(nullptr),
             fe_order(0),
@@ -97,6 +100,7 @@ bool App::Solver::setMesh() {
     }
 
     lset.detach();
+    level_set_fes.reset();
     scalar_fes.reset();
     displacement_fes.reset();
     fec.reset();
@@ -117,6 +121,7 @@ bool App::Solver::setMesh() {
     return true;
 }
 
+// TODO: Make a bloch-floquet periodic boundary condition?
 bool App::Solver::assembleSolutionSpace(){
 
     // TODO: Fix the inconsistent use of floats, doubles, and mfem real_ts in the codebase.
@@ -131,9 +136,10 @@ bool App::Solver::assembleSolutionSpace(){
     K.reset();
 
     fec = std::make_unique<H1_FECollection>(fe_order, dim);
+    level_set_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get());
     scalar_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get());
     displacement_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get(), dim, Ordering::byVDIM);
-    lset.setSpace(*scalar_fes);
+    lset.setSpace(*level_set_fes);
 
     // Domain regions along x
     int inlet_element_count = 0;
@@ -193,6 +199,30 @@ bool App::Solver::assembleSolutionSpace(){
     log(App::LogLevel::Message,
         "Classified inlet, design, and outlet mesh regions along x.");
 
+    // The level set has its own FE space. Only DOFs belonging exclusively to
+    // design elements are editable; shared inlet/outlet interface DOFs remain air.
+    PWConstCoefficient design_indicator(mesh->attributes.Max());
+    design_indicator(static_cast<int>(DomainAttribute::design)) = 1.0;
+    GridFunction design_support(level_set_fes.get());
+    design_support.ProjectDiscCoefficient(
+        design_indicator,
+        GridFunction::ARITHMETIC
+    );
+
+    Array<int> active_level_set_dofs;
+    for (int dof = 0; dof < design_support.Size(); dof++) {
+        if (design_support[dof] == 1.0) {
+            active_level_set_dofs.Append(dof);
+        }
+    }
+    if (active_level_set_dofs.Size() == 0
+        || active_level_set_dofs.Size() == level_set_fes->GetVSize()) {
+        log(App::LogLevel::Error,
+            "The level-set space must contain both active design and fixed-air DOFs.");
+        return false;
+    }
+    lset.setActiveDesignDofs(active_level_set_dofs);
+
 
     //TODO: later make all below these comments persistent class members
     Array<int> pressure_boundary_dofs;
@@ -208,9 +238,8 @@ bool App::Solver::assembleSolutionSpace(){
     mapped_design -= 0.5;
     mapped_design *= he;
 
-    GridFunction mapped_design_h(scalar_fes.get());
+    GridFunction mapped_design_h(level_set_fes.get());
     mapped_design_h.SetFromTrueDofs(mapped_design);
-    lset.phi->SetFromTrueDofs(mapped_design);
 
     // Sample code for how we can get center DOFs
     Vector center_design_values(mesh->GetNE());
@@ -225,7 +254,91 @@ bool App::Solver::assembleSolutionSpace(){
 
     };
 
-    // TODO: Run a filtered solver for the PDE filter
+    // Paper Eq. (28): -r^2 Laplacian(phi_c) + phi_c = mapped_design_c.
+    // The unknowns live at cell centers. Boundary faces contribute no flux,
+    // which imposes the homogeneous Neumann condition used in the paper.
+    // I know its funky to have the optimizer's filter radius here, but just roll with it
+    const real_t filter_radius = optimizer_settings.filterRadius;
+    if (filter_radius < 0.0) {
+        log(App::LogLevel::Error, "The PDE filter radius cannot be negative.");
+        return false;
+    }
+
+    const int cell_count = mesh->GetNE();
+    SparseMatrix filter_matrix(cell_count);
+    Vector filter_rhs(cell_count);
+    Vector filtered_center_values(cell_count);
+    Vector cell_volumes(cell_count);
+
+    for (int element = 0; element < cell_count; element++) {
+        cell_volumes[element] = mesh->GetElementVolume(element);
+        filter_matrix.Add(element, element, cell_volumes[element]);
+        filter_rhs[element] = cell_volumes[element] * center_design_values[element];
+    }
+
+    Vector first_center(dim);
+    Vector second_center(dim);
+    for (int face = 0; face < mesh->GetNumFaces(); face++) {
+        int first_element = -1;
+        int second_element = -1;
+        mesh->GetFaceElements(face, &first_element, &second_element);
+        if (second_element < 0
+            || !design_domain_marker[mesh->GetAttribute(first_element) - 1]
+            || !design_domain_marker[mesh->GetAttribute(second_element) - 1]) {
+            continue;
+        }
+
+        mesh->GetElementCenter(first_element, first_center);
+        mesh->GetElementCenter(second_element, second_center);
+        second_center -= first_center;
+        const real_t center_distance_squared = second_center * second_center;
+        if (center_distance_squared <= 0.0) {
+            log(App::LogLevel::Error, "The PDE filter found coincident cell centers.");
+            return false;
+        }
+
+        const real_t face_coefficient = filter_radius * filter_radius
+            * 0.5 * (cell_volumes[first_element] + cell_volumes[second_element])
+            / center_distance_squared;
+        filter_matrix.Add(first_element, first_element, face_coefficient);
+        filter_matrix.Add(first_element, second_element, -face_coefficient);
+        filter_matrix.Add(second_element, first_element, -face_coefficient);
+        filter_matrix.Add(second_element, second_element, face_coefficient);
+    }
+    filter_matrix.Finalize();
+
+    GSSmoother filter_preconditioner(filter_matrix);
+    CGSolver filter_solver;
+    filter_solver.SetPreconditioner(filter_preconditioner);
+    filter_solver.SetOperator(filter_matrix);
+    // TODO: Delegate magic numbers to real app settings LATER
+    filter_solver.SetRelTol(1.0e-12);
+    filter_solver.SetAbsTol(1.0e-14);
+    filter_solver.SetMaxIter(500);
+    filter_solver.SetPrintLevel(-1);
+    filtered_center_values = 0.0;
+    filter_solver.Mult(filter_rhs, filtered_center_values);
+    if (!filter_solver.GetConverged()) {
+        log(App::LogLevel::Error, "The cell-centered PDE filter did not converge.");
+        return false;
+    }
+
+    // Interpolate the filtered cell-center values back to the nodal level set.
+    L2_FECollection cell_fec(0, dim);
+    FiniteElementSpace cell_fes(mesh.get(), &cell_fec);
+    GridFunction filtered_cells(&cell_fes);
+    filtered_cells = filtered_center_values;
+    GridFunctionCoefficient filtered_cell_coefficient(&filtered_cells);
+    lset.phi->ProjectDiscCoefficient(
+        filtered_cell_coefficient,
+        GridFunction::ARITHMETIC
+    );
+    lset.phi->SetSubVectorComplement(
+        lset.activeDesignDofs,
+        -0.5 * he
+    );
+
+    log(App::LogLevel::Message, "Applied the cell-centered finite-volume PDE filter.");
 
 
     // TODO: ALl needs to be unique_pointered and set as class variables

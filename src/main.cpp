@@ -50,6 +50,7 @@ int main(int, char**)
             log);
         auto solver = std::make_unique<App::solver_t>(
             solverSettings,
+            optimizerSettings,
             geometry,
             solverResult,
             log);

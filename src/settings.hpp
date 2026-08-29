@@ -45,11 +45,11 @@ struct SettingEntry {
 
 // TODO: Add more to this, and this is where setting entries get used.
 struct VibroacousticSettings {
-    float rho_s = 0.0f;
+    float rho_s = 1000.0f;
     float rho_a = 1.21f;
     float c_a = 343.0f;
-    float youngs_modulus = 0.0f;
-    float poisson_ratio = 0.0f;
+    float youngs_modulus = 50.0e6f;
+    float poisson_ratio = 0.4f;
 
     // Rayleigh damping
     float zeta = 0.1f;
@@ -80,7 +80,7 @@ using PhysicsSettings = std::variant<
 >;
 
 struct OptimizerSettings {
-    float filterRadius = 0.0025f;
+    float filterRadius = 0.008f;
     float frequencyMin = 0.0f;
     float frequencyMax = 5000.0f;
     float attenuationMinDb = -80.0f;
@@ -105,12 +105,12 @@ struct SolverSettings {
     double outletLength = 0.1;
     double sy = 0.1;
     double sz = 1.0;
-    double duration = 0.2;
-    double dt = duration / 1000.0;
+    double duration = 0.02;
+    double dt = 2.0e-5;
     std::string algo = "newmark";
     bool isotropicGrid = false;
     bool useHannWindow = true;
-    int fftSamples = 2048;
+    int fftSamples = 1000;
     PhysicsSettings physics;
     SolverDevice device = SolverDevice::serial;
     

@@ -38,16 +38,34 @@ class LevelSet {
                 design = 0.5;
             }
 
+            activeDesignDofs.SetSize(fes.GetTrueVSize());
+            for (int dof = 0; dof < activeDesignDofs.Size(); dof++) {
+                activeDesignDofs[dof] = dof;
+            }
+
             phi = std::make_unique<mfem::GridFunction>(&fes);
             phi->SetFromTrueDofs(design);
+        }
+
+        void setActiveDesignDofs(const mfem::Array<int>& active_dofs)
+        {
+            activeDesignDofs = active_dofs;
+            enforceDesignConstraints();
+        }
+
+        void enforceDesignConstraints()
+        {
+            design.SetSubVectorComplement(activeDesignDofs, 0.0);
         }
 
         void detach()
         {
             phi = std::make_unique<mfem::GridFunction>();
+            activeDesignDofs.SetSize(0);
         }
         
         mfem::Vector design;
+        mfem::Array<int> activeDesignDofs;
         std::unique_ptr<mfem::GridFunction> phi;
 
 
