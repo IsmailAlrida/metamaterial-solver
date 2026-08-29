@@ -45,6 +45,8 @@ echo.
 echo Setup completed. Open a new terminal, then run:
 echo   setup.bat check
 echo   build.bat deps serial
+echo.
+pause
 exit /b 0
 
 :ensure_tool
@@ -123,7 +125,10 @@ if exist "%MPI_INC%\mpi.h" setx.exe /M MSMPI_INC "%MPI_INC%" >nul
 if exist "%MPI_LIB64%\msmpi.lib" setx.exe /M MSMPI_LIB64 "%MPI_LIB64%" >nul
 
 set "MKL_PATH=%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest"
-if exist "%MKL_PATH%\include\mkl.h" setx.exe /M MKLROOT "%MKL_PATH%" >nul
+if exist "%MKL_PATH%\include\mkl.h" (
+    setx.exe /M MKLROOT "%MKL_PATH%" >nul
+    powershell.exe -NoProfile -Command "$mklBin = '%MKL_PATH%\bin'; $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine'); if (($machinePath -split ';') -notcontains $mklBin) { [Environment]::SetEnvironmentVariable('Path', $machinePath.TrimEnd(';') + ';' + $mklBin, 'Machine') }"
+)
 exit /b 0
 
 :check
@@ -146,6 +151,7 @@ call :check_file "%ProgramFiles(x86)%\Microsoft SDKs\MPI\Include\mpi.h" "Microso
 call :check_file "%ProgramFiles(x86)%\Microsoft SDKs\MPI\Lib\x64\msmpi.lib" "Microsoft MPI SDK x64 library"
 call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\include\mkl.h" "Intel oneMKL headers"
 call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\lib\mkl_core.lib" "Intel oneMKL libraries"
+call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\bin\mkl_sequential.3.dll" "Intel oneMKL runtime"
 
 where nvcc.exe >nul 2>nul
 if errorlevel 1 (
