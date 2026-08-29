@@ -336,3 +336,11 @@ if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
       CUDA::cusolver
   )
 endif()
+
+add_executable(dispatcher_backend_check
+    tests/dispatcher_backend_check.cpp
+)
+target_include_directories(dispatcher_backend_check PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+target_link_libraries(dispatcher_backend_check PRIVATE mfem)
