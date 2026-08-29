@@ -43,24 +43,42 @@ struct SimulationInfo {
 };
 
 struct SignalFFT {
-    int size;
+    int size = 0;
+    std::vector<float> referenceAmplitude;
     std::vector<float> amplitude;
-    std::vector<float> attenuationDB; 
+    std::vector<float> transmission;
+    std::vector<float> attenuationDB;
     std::vector<float> phase;
     std::vector<float> frequency;
+    std::vector<unsigned char> valid;
 };
 
 struct SignalTD {
-    int size;
-    std::vector<float> amplitude;
-    std::vector<float> time;
+    int size = 0;
+    std::vector<double> amplitude;
+    std::vector<double> time;
+};
+
+struct NewmarkResidualNorms {
+    double equilibrium = 0.0;
+    double velocity = 0.0;
+    double acceleration = 0.0;
 };
 
 struct SolverResult {
     int success = 0;
+    int stateSize = 0;
+    int displacementSize = 0;
+    int pressureSize = 0;
+    int pressureOffset = 0;
+    int timeSteps = 0;
+    double dt = 0.0;
+    std::shared_ptr<const SignalTD> inletPressure;
+    std::shared_ptr<const SignalTD> outletPressure;
+    std::shared_ptr<const SignalTD> referenceOutletPressure;
     std::shared_ptr<const SignalFFT> materialImpulseResponse;
     std::vector<mfem::Vector> U;
-    std::vector<mfem::Vector> R;
+    std::vector<NewmarkResidualNorms> residualNorms;
 };
 
 struct SolverInput {

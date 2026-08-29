@@ -20,9 +20,9 @@ enum class PhysicsProblem {
     electromagnetic
 };
 
-enum class ObjectiveMode {
-    bandgap,
-    freeform
+enum class FrequencyBandType {
+    pass,
+    stop
 };
 
 using Value = std::variant<int, float, double, long, bool, std::string>;
@@ -67,11 +67,11 @@ struct ElectromagneticSettings {
 
 };
 
-// Maybe add an ID for bandgap?
-struct Bandgap {
-    float center = 1500.0f;
-    float bandwidth = 400.0f;
-    float attenuationDb = -35.0f;
+struct FrequencyBand {
+    FrequencyBandType type = FrequencyBandType::stop;
+    float startHz = 2500.0f;
+    float endHz = 4000.0f;
+    float targetDb = -40.0f;
 };
 
 using PhysicsSettings = std::variant<
@@ -81,18 +81,22 @@ using PhysicsSettings = std::variant<
 
 struct OptimizerSettings {
     float filterRadius = 0.008f;
-    float frequencyMin = 0.0f;
-    float frequencyMax = 5000.0f;
-    float attenuationMinDb = -80.0f;
-    float attenuationMaxDb = 5.0f;
+    float frequencyMin = 1000.0f;
+    float frequencyMax = 4000.0f;
+    float attenuationMinDb = -120.0f;
+    float attenuationMaxDb = 0.0f;
     int frequencySamples = 256;
-    int maxIterations = 8;
-    ObjectiveMode objectiveMode = ObjectiveMode::bandgap;
-    std::vector<Bandgap> bandgaps{
-        {1450.0f, 500.0f, -32.0f},
-        {2850.0f, 700.0f, -44.0f}
+    int maxIterations = 400;
+    double mmaInitialAsymptote = 0.5;
+    double mmaDecreaseAsymptote = 0.7;
+    double mmaIncreaseAsymptote = 1.2;
+    double mmaConstraintPenalty = 1000.0;
+    double cutDerivativeRelativeStep = 1.0e-4;
+    bool displayTargetInDb = true;
+    std::vector<FrequencyBand> frequencyBands{
+        {FrequencyBandType::pass, 1000.0f, 2500.0f, 0.0f},
+        {FrequencyBandType::stop, 2500.0f, 4000.0f, -40.0f}
     };
-    std::vector<float> freeformTarget;
 };
 
 // TODO: For all settings, pick default app values.
@@ -107,10 +111,19 @@ struct SolverSettings {
     double sz = 1.0;
     double duration = 0.02;
     double dt = 2.0e-5;
+    double newmarkBeta = 0.25;
+    double newmarkGamma = 0.5;
+    double sourceAmplitude = 1.0;
+    unsigned int sourceSeed = 1337;
+    double initialPatternLx = 0.1;
+    double initialPatternLy = 0.1;
+    int initialPatternX = 7;
+    int initialPatternY = 7;
+    double initialPatternBias = 0.1;
+    double initialPatternThreshold = 0.01;
     std::string algo = "newmark";
     bool isotropicGrid = false;
     bool useHannWindow = true;
-    int fftSamples = 1000;
     PhysicsSettings physics;
     SolverDevice device = SolverDevice::serial;
     

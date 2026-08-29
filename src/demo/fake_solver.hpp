@@ -42,38 +42,6 @@ class FakeSolver {
             lset.detach();
         }
 
-        bool setup()
-        {
-            if (!std::atomic_load(&result.materialImpulseResponse)) {
-                populateResponse();
-            }
-            return true;
-        }
-
-        bool run()
-        {
-            status.store(SolverStatus::Working);
-
-            try {
-                if (!setMesh() || !assembleSolutionSpace()) {
-                    status.store(SolverStatus::Error);
-                    return false;
-                }
-
-                if (!solve()) {
-                    status.store(SolverStatus::Diverged);
-                    return false;
-                }
-
-                status.store(SolverStatus::Converged);
-                return true;
-            }
-            catch (...) {
-                status.store(SolverStatus::Error);
-                throw;
-            }
-        }
-
         bool setMesh()
         {
             log(LogLevel::Message, "MFEM Example 1 prepared its Cartesian mesh.");
@@ -88,6 +56,7 @@ class FakeSolver {
 
         bool solve()
         {
+            status.store(SolverStatus::Working);
             // MFEM Example 1: solve -Delta u = 1 with homogeneous Dirichlet data.
             mfem::Array<int> essentialTrueDofs;
             if (mesh.bdr_attributes.Size()) {
@@ -139,6 +108,7 @@ class FakeSolver {
             mfem::socketstream stream(host, GlvisAdapter::Port);
             if (!stream.good()) {
                 log(LogLevel::Error, "MFEM Example 1 could not connect to the GLVis adapter.");
+                status.store(SolverStatus::Error);
                 return false;
             }
             stream.precision(8);
@@ -147,13 +117,8 @@ class FakeSolver {
             ++solveCount;
             populateResponse();
             result.success = 1;
+            status.store(SolverStatus::Converged);
             log(LogLevel::Message, "MFEM Example 1 solved and streamed its solution to GLVis.");
-            return true;
-        }
-
-        bool bindToGlvis()
-        {
-            log(LogLevel::Message, "MFEM Example 1 streams to the embedded GLVis adapter.");
             return true;
         }
 
@@ -171,9 +136,12 @@ class FakeSolver {
 
             response->size = sampleCount;
             response->frequency.resize(sampleCount);
+            response->referenceAmplitude.resize(sampleCount);
             response->attenuationDB.resize(sampleCount);
             response->amplitude.resize(sampleCount);
+            response->transmission.resize(sampleCount);
             response->phase.resize(sampleCount);
+            response->valid.assign(sampleCount, 1);
 
             const float improvement = static_cast<float>(std::min(solveCount, 8));
             for (int i = 0; i < sampleCount; ++i) {
@@ -189,7 +157,9 @@ class FakeSolver {
 
                 response->frequency[i] = frequency;
                 response->attenuationDB[i] = attenuation;
-                response->amplitude[i] = std::pow(10.0f, attenuation / 20.0f);
+                response->referenceAmplitude[i] = 1.0f;
+                response->transmission[i] = std::pow(10.0f, attenuation / 20.0f);
+                response->amplitude[i] = response->transmission[i];
                 response->phase[i] = 0.55f * std::sin(t * 13.0f + improvement * 0.1f);
             }
 

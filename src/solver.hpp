@@ -1,6 +1,7 @@
 #pragma once
 #include <atomic>
 #include <memory>
+#include <vector>
 #include "global_types.hpp"
 #include "logging.hpp"
 #include "mfem.hpp"
@@ -21,12 +22,9 @@ namespace App {
 
         ~Solver();
 
-        bool setup();
-        bool run();
         bool setMesh();
         bool assembleSolutionSpace();
         bool solve();
-        bool bindToGlvis();
         SolverStatus get_status() const;
 
 
@@ -56,8 +54,25 @@ namespace App {
         std::unique_ptr<mfem::SparseMatrix> M;
         std::unique_ptr<mfem::SparseMatrix> C;
         std::unique_ptr<mfem::SparseMatrix> K;
+        mfem::Vector inlet_load;
+        mfem::Vector outlet_functional;
+        mfem::Array<int> displacement_essential_tdofs;
+        std::vector<double> source_pressure;
+        std::vector<double> source_pressure_derivative;
+        std::vector<double> outlet_pressure;
+        std::vector<double> reference_outlet_pressure;
+        int pressure_offset = 0;
+        bool design_initialized = false;
         std::atomic<SolverStatus> status{SolverStatus::Idle};
 
+        bool smooth_level_set(
+            const mfem::GridFunction& level_set,
+            mfem::GridFunction& smoothed_level_set,
+            const mfem::SparseMatrix& design_to_cell,
+            const mfem::SparseMatrix& cell_to_level_set,
+            const mfem::DenseMatrix& element_centers,
+            const mfem::Vector& cell_volumes);
+        bool postprocessFourierResponse();
 
 
 

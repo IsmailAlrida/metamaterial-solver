@@ -1,9 +1,16 @@
 #include <algorithm>
 #include <cmath>
-#include <iostream>
+#include <complex>
+#include <limits>
+#include <numeric>
+#include <random>
+#include <string>
+#include <vector>
+
+#include "fftw3.h"
+#include "glvis_adapter.hpp"
 #include "integrators.hpp"
 #include "solver.hpp"
-
 
 using namespace mfem;
 
@@ -31,62 +38,29 @@ enum class CartesianBoundary3D {
     top = 6
 };
 
-}
+} // namespace
 
 // move this later outside?
 // TODO: Make comments doxygen-style with math and all to explain ur stuff
-
-App::Solver::Solver( 
-            const App::SolverSettings& settings,
-            const App::OptimizerSettings& optimizer_settings,
-            App::LevelSet& lset,
-            App::SolverResult& result,
-            const App::LogFunction& log
-            )
-            : 
-            settings(settings),
-            optimizer_settings(optimizer_settings),
-            lset(lset),
-            result(result),
-            log(log),
-            mesh(nullptr),
-            fec(nullptr),
-            level_set_fes(nullptr),
-            scalar_fes(nullptr),
-            displacement_fes(nullptr),
-            fe_order(0),
-            level_set_order(0),
-            cut_integration_order(0)
-            {
-            }
+App::Solver::Solver(const App::SolverSettings& settings,
+                    const App::OptimizerSettings& optimizer_settings,
+                    App::LevelSet& lset,
+                    App::SolverResult& result,
+                    const App::LogFunction& log)
+    : settings(settings),
+      optimizer_settings(optimizer_settings),
+      lset(lset),
+      result(result),
+      log(log),
+      fe_order(1),
+      level_set_order(1),
+      cut_integration_order(4)
+{
+}
 
 App::Solver::~Solver()
 {
     lset.detach();
-}
-
-bool App::Solver::run()
-{
-    status.store(SolverStatus::Working);
-
-    try {
-        if (!setMesh() || !assembleSolutionSpace()) {
-            status.store(SolverStatus::Error);
-            return false;
-        }
-
-        if (!solve()) {
-            status.store(SolverStatus::Diverged);
-            return false;
-        }
-
-        status.store(SolverStatus::Converged);
-        return true;
-    }
-    catch (...) {
-        status.store(SolverStatus::Error);
-        throw;
-    }
 }
 
 App::SolverStatus App::Solver::get_status() const
@@ -95,37 +69,30 @@ App::SolverStatus App::Solver::get_status() const
 }
 
 // TODO: Do something about the mixed camelCase and snake_case. Choose one.
-// Given for this iteration we will run the following sequentially
-/* setMesh --> assembleSolutionSpace --> solve*/
-// i doubt the bottleneck is in setting the mesh as much as it is in the actual forward solves
-bool App::Solver::setMesh() {
-
+bool App::Solver::setMesh()
+{
     const int nx = settings.nx;
     const int ny = settings.ny;
     const int nz = settings.nz;
-    const mfem::real_t sx = settings.inletLength
-        + settings.designLength
-        + settings.outletLength;
-    const mfem::real_t sy = settings.sy;
-    const mfem::real_t sz = settings.sz;
-
-    if (nx <= 0 || ny < 0 || nz < 0
+    const real_t sx = settings.inletLength
+        + settings.designLength + settings.outletLength;
+    if (nx <= 0 || ny <= 0 || nz < 0
         || settings.inletLength <= 0.0
         || settings.designLength <= 0.0
         || settings.outletLength <= 0.0
-        || sy <= 0.0 || sz <= 0.0) {
-        log(App::LogLevel::Error, "Mesh element counts and extents must be positive.");
+        || settings.sy <= 0.0 || settings.sz <= 0.0) {
+        log(LogLevel::Error, "Mesh element counts and extents must be positive.");
         return false;
     }
 
-    if (ny == 0 && nz == 0) {
-        log(App::LogLevel::Warning, "1D meshes are not supported yet.");
-        return false;
+    // TODO: Complete and validate the independent 3D optimization track.
+    if (nz > 0) {
+        mesh = std::make_unique<Mesh>(Mesh::MakeCartesian3D(
+            nx, ny, nz, Element::HEXAHEDRON, sx, settings.sy, settings.sz));
     }
-
-    if (nz > 0 && ny == 0) {
-        log(App::LogLevel::Error, "A 3D mesh requires a positive y element count.");
-        return false;
+    else {
+        mesh = std::make_unique<Mesh>(Mesh::MakeCartesian2D(
+            nx, ny, Element::QUADRILATERAL, true, sx, settings.sy));
     }
 
     lset.detach();
@@ -133,29 +100,50 @@ bool App::Solver::setMesh() {
     scalar_fes.reset();
     displacement_fes.reset();
     fec.reset();
-
-    if (nz > 0) {
-        mesh = std::make_unique<Mesh>(Mesh::MakeCartesian3D(nx, ny, nz, Element::HEXAHEDRON, sx, sy, sz));
-    }
-    else
-    {
-        mesh = std::make_unique<Mesh>(Mesh::MakeCartesian2D(nx, ny, Element::QUADRILATERAL, true, sx, sy));
-    }
-
-    fe_order = 1;
-    level_set_order = 1;
-    cut_integration_order = 4;
-
-    log(App::LogLevel::Message, nz > 0 ? "Created 3D Cartesian mesh." : "Created 2D Cartesian mesh.");
+    M.reset();
+    C.reset();
+    K.reset();
+    design_initialized = false;
+    log(LogLevel::Message,
+        nz > 0 ? "Created 3D Cartesian mesh." : "Created 2D Cartesian mesh.");
     return true;
 }
 
 // TODO: Make a bloch-floquet periodic boundary condition?
-bool App::Solver::assembleSolutionSpace(){
-
-    // TODO: Fix the inconsistent use of floats, doubles, and mfem real_ts in the codebase.
-    if (!mesh || fe_order <= 0 || settings.dt <= 0.0) {
-        log(App::LogLevel::Error, "Cannot assemble the solution space: mesh, finite-element order, or time step is invalid.");
+bool App::Solver::assembleSolutionSpace()
+{
+    if (!mesh || settings.duration <= 0.0 || settings.dt <= 0.0) {
+        log(LogLevel::Error,
+            "The duration and time step must be positive before assembly.");
+        return false;
+    }
+    const double step_ratio = settings.duration / settings.dt;
+    if (!std::isfinite(step_ratio) || step_ratio < 2.0
+        || step_ratio > std::numeric_limits<int>::max()) {
+        log(LogLevel::Error,
+            "The duration contains an unsupported number of time steps.");
+        return false;
+    }
+    const long long rounded_steps = std::llround(step_ratio);
+    const double step_tolerance =
+        1.0e-10 * std::max(1.0, std::abs(step_ratio));
+    if (std::abs(step_ratio - static_cast<double>(rounded_steps))
+            > step_tolerance) {
+        log(LogLevel::Error,
+            "The duration must contain an integer number of at least two time steps.");
+        return false;
+    }
+    const int time_steps = static_cast<int>(rounded_steps);
+    const auto* physics = std::get_if<VibroacousticSettings>(&settings.physics);
+    if (physics == nullptr || physics->epsilon <= 0.0
+        || physics->rho_s <= 0.0 || physics->youngs_modulus <= 0.0
+        || physics->rho_a <= 0.0 || physics->c_a <= 0.0
+        || physics->poisson_ratio < 0.0 || physics->poisson_ratio >= 0.5
+        || physics->zeta < 0.0 || physics->f1 <= 0.0 || physics->f2 <= 0.0
+        || settings.sourceAmplitude < 0.0
+        || settings.initialPatternLx <= 0.0
+        || settings.initialPatternLy <= 0.0) {
+        log(LogLevel::Error, "The vibroacoustic material settings are invalid.");
         return false;
     }
 
@@ -163,653 +151,915 @@ bool App::Solver::assembleSolutionSpace(){
     M.reset();
     C.reset();
     K.reset();
-
+    lset.detach();
+    level_set_fes.reset();
+    scalar_fes.reset();
+    displacement_fes.reset();
+    fec.reset();
     fec = std::make_unique<H1_FECollection>(fe_order, dim);
     level_set_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get());
     scalar_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get());
-    displacement_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get(), dim, Ordering::byVDIM);
+    displacement_fes = std::make_unique<FiniteElementSpace>(
+        mesh.get(), fec.get(), dim, Ordering::byVDIM);
     lset.setSpace(*level_set_fes);
 
     // Domain regions along x
-    int inlet_element_count = 0;
-    int design_element_count = 0;
-    int outlet_element_count = 0;
     const double design_start = settings.inletLength;
     const double design_end = settings.inletLength + settings.designLength;
-    Vector element_center(dim);
-
-    for (int element = 0; element < mesh->GetNE(); element++) {
-        const Geometry::Type geometry = mesh->GetElementBaseGeometry(element);
-        const IntegrationPoint& center = Geometries.GetCenter(geometry);
-        ElementTransformation* transformation = mesh->GetElementTransformation(element);
-        transformation->Transform(center, element_center);
-
-        if (element_center[0] < design_start) {
+    const int cell_count = mesh->GetNE();
+    int inlet_count = 0;
+    int design_count = 0;
+    int outlet_count = 0;
+    DenseMatrix element_centers(cell_count, dim);
+    Vector cell_volumes(cell_count);
+    Vector center(dim);
+    for (int element = 0; element < cell_count; ++element) {
+        mesh->GetElementCenter(element, center);
+        element_centers.SetRow(element, center);
+        cell_volumes[element] = mesh->GetElementVolume(element);
+        if (center[0] < design_start) {
             mesh->SetAttribute(element, static_cast<int>(DomainAttribute::inlet));
-            inlet_element_count++;
+            ++inlet_count;
         }
-        else if (element_center[0] < design_end) {
+        else if (center[0] < design_end) {
             mesh->SetAttribute(element, static_cast<int>(DomainAttribute::design));
-            design_element_count++;
+            ++design_count;
         }
         else {
             mesh->SetAttribute(element, static_cast<int>(DomainAttribute::outlet));
-            outlet_element_count++;
+            ++outlet_count;
         }
     }
     mesh->SetAttributes();
-
-    const int classified_element_count = inlet_element_count
-        + design_element_count
-        + outlet_element_count;
-    if (classified_element_count != mesh->GetNE()
-        || inlet_element_count == 0
-        || design_element_count == 0
-        || outlet_element_count == 0) {
-        log(App::LogLevel::Error,
-            "The inlet, design, and outlet lengths must each contain at least one mesh element center.");
+    if (inlet_count + design_count + outlet_count != cell_count
+        || inlet_count == 0 || design_count == 0 || outlet_count == 0) {
+        log(LogLevel::Error,
+            "Each duct region must contain at least one mesh element center.");
         return false;
     }
 
-    Array<int> inlet_domain_marker(mesh->attributes.Max());
     Array<int> design_domain_marker(mesh->attributes.Max());
-    Array<int> outlet_domain_marker(mesh->attributes.Max());
-    Array<int> air_domain_marker(mesh->attributes.Max());
-    inlet_domain_marker = 0;
     design_domain_marker = 0;
-    outlet_domain_marker = 0;
-    air_domain_marker = 0;
-    inlet_domain_marker[static_cast<int>(DomainAttribute::inlet) - 1] = 1;
     design_domain_marker[static_cast<int>(DomainAttribute::design) - 1] = 1;
-    outlet_domain_marker[static_cast<int>(DomainAttribute::outlet) - 1] = 1;
-    air_domain_marker[static_cast<int>(DomainAttribute::inlet) - 1] = 1;
-    air_domain_marker[static_cast<int>(DomainAttribute::outlet) - 1] = 1;
 
-    log(App::LogLevel::Message,
-        "Classified inlet, design, and outlet mesh regions along x.");
-
-    // The level set has its own FE space. Only DOFs belonging exclusively to
-    // design elements are editable; shared inlet/outlet interface DOFs remain air.
-    PWConstCoefficient design_indicator(mesh->attributes.Max());
-    design_indicator(static_cast<int>(DomainAttribute::design)) = 1.0;
-    GridFunction design_support(level_set_fes.get());
-    design_support.ProjectDiscCoefficient(
-        design_indicator,
-        GridFunction::ARITHMETIC
-    );
-
-    Array<int> active_level_set_dofs;
-    for (int dof = 0; dof < design_support.Size(); dof++) {
-        if (design_support[dof] == 1.0) {
-            active_level_set_dofs.Append(dof);
+    // Only DOFs exclusively supported by design elements are editable.
+    Array<int> design_incidence(level_set_fes->GetVSize());
+    Array<int> fixed_incidence(level_set_fes->GetVSize());
+    design_incidence = 0;
+    fixed_incidence = 0;
+    const int level_set_size = level_set_fes->GetTrueVSize();
+    SparseMatrix design_to_cell(cell_count, level_set_size);
+    SparseMatrix cell_to_level_set(level_set_size, cell_count);
+    Array<int> element_dofs;
+    Vector shape;
+    for (int element = 0; element < cell_count; ++element) {
+        level_set_fes->GetElementDofs(element, element_dofs);
+        const FiniteElement* finite_element = level_set_fes->GetFE(element);
+        const IntegrationPoint& reference_center =
+            Geometries.GetCenter(mesh->GetElementBaseGeometry(element));
+        shape.SetSize(finite_element->GetDof());
+        finite_element->CalcShape(reference_center, shape);
+        Array<int>& incidence = mesh->GetAttribute(element)
+                == static_cast<int>(DomainAttribute::design)
+            ? design_incidence
+            : fixed_incidence;
+        for (int i = 0; i < element_dofs.Size(); ++i) {
+            const int dof = element_dofs[i];
+            ++incidence[dof];
+            design_to_cell.Add(element, dof, shape[i]);
+            cell_to_level_set.Add(dof, element, 1.0);
         }
     }
-    if (active_level_set_dofs.Size() == 0
-        || active_level_set_dofs.Size() == level_set_fes->GetVSize()) {
-        log(App::LogLevel::Error,
-            "The level-set space must contain both active design and fixed-air DOFs.");
-        return false;
-    }
-    lset.setActiveDesignDofs(active_level_set_dofs);
-
-
-    //TODO: later make all below these comments persistent class members
-    Array<int> pressure_boundary_dofs;
-    Array<int> displacment_boundary_dofs;
-
-    scalar_fes->GetBoundaryTrueDofs(pressure_boundary_dofs);
-    displacement_fes->GetBoundaryTrueDofs(displacment_boundary_dofs);
-
-
-    const real_t he = mesh->GetElementSize(0, 1);
-
-    Vector mapped_design(lset.design);
-    mapped_design -= 0.5;
-    mapped_design *= he;
-
-    GridFunction mapped_design_h(level_set_fes.get());
-    mapped_design_h.SetFromTrueDofs(mapped_design);
-
-    // Sample code for how we can get center DOFs
-    Vector center_design_values(mesh->GetNE());
-    for (int element = 0; element < mesh->GetNE(); element++){
-        
-        // Get the base shape of the cell
-        const Geometry::Type geometry = mesh->GetElementBaseGeometry(element);
-        // Get the point in the center of the shape
-        const IntegrationPoint& center = Geometries.GetCenter(geometry);
-        // Let the GridFunction of the shifted design variable inter
-        center_design_values[element] = mapped_design_h.GetValue(element, center);
-
-    };
-
-    // Paper Eq. (28): -r^2 Laplacian(phi_c) + phi_c = mapped_design_c.
-    // The unknowns live at cell centers. Boundary faces contribute no flux,
-    // which imposes the homogeneous Neumann condition used in the paper.
-    // I know its funky to have the optimizer's filter radius here, but just roll with it
-    const real_t filter_radius = optimizer_settings.filterRadius;
-    if (filter_radius < 0.0) {
-        log(App::LogLevel::Error, "The PDE filter radius cannot be negative.");
-        return false;
-    }
-
-    const int cell_count = mesh->GetNE();
-    SparseMatrix filter_matrix(cell_count);
-    Vector filter_rhs(cell_count);
-    Vector filtered_center_values(cell_count);
-    Vector cell_volumes(cell_count);
-
-    for (int element = 0; element < cell_count; element++) {
-        cell_volumes[element] = mesh->GetElementVolume(element);
-        filter_matrix.Add(element, element, cell_volumes[element]);
-        filter_rhs[element] = cell_volumes[element] * center_design_values[element];
-    }
-
-    Vector first_center(dim);
-    Vector second_center(dim);
-    for (int face = 0; face < mesh->GetNumFaces(); face++) {
-        int first_element = -1;
-        int second_element = -1;
-        mesh->GetFaceElements(face, &first_element, &second_element);
-        if (second_element < 0
-            || !design_domain_marker[mesh->GetAttribute(first_element) - 1]
-            || !design_domain_marker[mesh->GetAttribute(second_element) - 1]) {
-            continue;
+    design_to_cell.Finalize();
+    cell_to_level_set.Finalize();
+    const int* cell_to_level_set_rows = cell_to_level_set.GetI();
+    real_t* cell_to_level_set_values = cell_to_level_set.GetData();
+    for (int dof = 0; dof < level_set_size; ++dof) {
+        const int incidence = design_incidence[dof] + fixed_incidence[dof];
+        for (int entry = cell_to_level_set_rows[dof];
+             entry < cell_to_level_set_rows[dof + 1];
+             ++entry) {
+            cell_to_level_set_values[entry] /= incidence;
         }
-
-        mesh->GetElementCenter(first_element, first_center);
-        mesh->GetElementCenter(second_element, second_center);
-        second_center -= first_center;
-        const real_t center_distance_squared = second_center * second_center;
-        if (center_distance_squared <= 0.0) {
-            log(App::LogLevel::Error, "The PDE filter found coincident cell centers.");
-            return false;
+    }
+    Array<int> active_dofs;
+    for (int dof = 0; dof < design_incidence.Size(); ++dof) {
+        if (design_incidence[dof] > 0 && fixed_incidence[dof] == 0) {
+            active_dofs.Append(dof);
         }
-
-        const real_t face_coefficient = filter_radius * filter_radius
-            * 0.5 * (cell_volumes[first_element] + cell_volumes[second_element])
-            / center_distance_squared;
-        filter_matrix.Add(first_element, first_element, face_coefficient);
-        filter_matrix.Add(first_element, second_element, -face_coefficient);
-        filter_matrix.Add(second_element, first_element, -face_coefficient);
-        filter_matrix.Add(second_element, second_element, face_coefficient);
     }
-    filter_matrix.Finalize();
+    if (active_dofs.Size() == 0
+        || active_dofs.Size() == level_set_fes->GetTrueVSize()) {
+        log(LogLevel::Error,
+            "The level-set space must contain active design and fixed-air DOFs.");
+        return false;
+    }
+    lset.setActiveDesignDofs(active_dofs);
+    if (!design_initialized) {
+        FunctionCoefficient paper_initial_guess(
+            [this, design_start](const Vector& position) {
+                const double x = position[0] - design_start;
+                const double y = position.Size() > 1 ? position[1] : 0.0;
+                const double value = std::cos(
+                    settings.initialPatternX * std::acos(-1.0) * x
+                    / settings.initialPatternLx)
+                    * std::cos(
+                        settings.initialPatternY * std::acos(-1.0) * y
+                        / settings.initialPatternLy)
+                    + settings.initialPatternBias;
+                return value >= settings.initialPatternThreshold ? 0.0 : 1.0;
+            });
+        GridFunction initial(level_set_fes.get());
+        initial.ProjectCoefficient(paper_initial_guess);
+        initial.GetTrueDofs(lset.design);
+        lset.enforceDesignConstraints();
+        design_initialized = true;
+        log(LogLevel::Message,
+            "Initialized the paper cosine level-set design.");
+    }
 
-    GSSmoother filter_preconditioner(filter_matrix);
-    CGSolver filter_solver;
-    filter_solver.SetPreconditioner(filter_preconditioner);
-    filter_solver.SetOperator(filter_matrix);
-    // TODO: Delegate magic numbers to real app settings LATER
-    filter_solver.SetRelTol(1.0e-12);
-    filter_solver.SetAbsTol(1.0e-14);
-    filter_solver.SetMaxIter(500);
-    filter_solver.SetPrintLevel(-1);
-    filtered_center_values = 0.0;
-    filter_solver.Mult(filter_rhs, filtered_center_values);
-    if (!filter_solver.GetConverged()) {
-        log(App::LogLevel::Error, "The cell-centered PDE filter did not converge.");
+    GridFunction unsmoothed_level_set(level_set_fes.get());
+    unsmoothed_level_set.SetFromTrueDofs(lset.design);
+    if (!smooth_level_set(
+            unsmoothed_level_set,
+            *lset.phi,
+            design_to_cell,
+            cell_to_level_set,
+            element_centers,
+            cell_volumes)) {
         return false;
     }
 
-    // Interpolate the filtered cell-center values back to the nodal level set.
-    L2_FECollection cell_fec(0, dim);
-    FiniteElementSpace cell_fes(mesh.get(), &cell_fec);
-    GridFunction filtered_cells(&cell_fes);
-    filtered_cells = filtered_center_values;
-    GridFunctionCoefficient filtered_cell_coefficient(&filtered_cells);
-    lset.phi->ProjectDiscCoefficient(
-        filtered_cell_coefficient,
-        GridFunction::ARITHMETIC
-    );
-    lset.phi->SetSubVectorComplement(
-        lset.activeDesignDofs,
-        -0.5 * he
-    );
 
-    log(App::LogLevel::Message, "Applied the cell-centered finite-volume PDE filter.");
+    const int displacement_size = displacement_fes->GetVSize();
+    const int pressure_size = scalar_fes->GetVSize();
 
+    const real_t lambda = dim == 3
+        ? physics->youngs_modulus * physics->poisson_ratio
+            / ((1.0 + physics->poisson_ratio)
+               * (1.0 - 2.0 * physics->poisson_ratio))
+        : physics->youngs_modulus * physics->poisson_ratio
+            / (1.0 - physics->poisson_ratio * physics->poisson_ratio);
+    const real_t mu = physics->youngs_modulus
+        / (2.0 * (1.0 + physics->poisson_ratio));
+    LevelSetScaledCoefficient solid_density(
+        *lset.phi, physics->rho_s, physics->epsilon, true);
+    LevelSetScaledCoefficient solid_lambda(
+        *lset.phi, lambda, physics->epsilon, true);
+    LevelSetScaledCoefficient solid_mu(
+        *lset.phi, mu, physics->epsilon, true);
+    LevelSetScaledCoefficient acoustic_mass(
+        *lset.phi,
+        1.0 / (physics->rho_a * physics->c_a * physics->c_a),
+        physics->epsilon,
+        false);
+    LevelSetScaledCoefficient acoustic_stiffness(
+        *lset.phi, 1.0 / physics->rho_a, physics->epsilon, false);
 
-    // TODO: ALl needs to be unique_pointered and set as class variables
-    GridFunction pressure(scalar_fes.get());
-    GridFunction displacement(displacement_fes.get());
-
-    // All these doubles should be re-evaluted in later steps as mfem ConstantCoeffecients
-    // Well, not CONSTANT coeffecient. We want to have a base coeff, then for the 
-    // Fictitious domain, we want just a spatially varying coeff that is either real or fict
-    // Depending on where it is in the cut
-
-    const auto* physics = std::get_if<App::VibroacousticSettings>(&settings.physics);
-    if (physics == nullptr) {
-        log(App::LogLevel::Error, "The selected physics model is not supported by the vibroacoustic solver.");
-        return false;
-    }
-
-    // Material settings
-    const double epsilon_f = physics->epsilon; // fictitious contrast
-
-    // Structural domain stuff
-    const double rho_s = physics->rho_s; // Solid Density kg/m^3
-    const double E = physics->youngs_modulus; // Young modulus Pa
-    const double nu = physics->poisson_ratio; // Poisson ratio, which is the weird-looking V you see
-    const double mu = E / (2*(1 + nu));    // Shear modulus
-    const double lame_ps = (E * nu) / (1 - std::pow(nu, 2));
-    const double lame_3D = (E * nu) / ((1 + nu)*(1 - 2*nu)); // FIXME: If-gate the lame coefficient
-
-
-    // Acoustic domain stuff
-    const double rho_a = physics->rho_a; // Fluid Density kg/m^3
-    const double c_a = physics->c_a; // sound speed, m/s
-    const double K_a = rho_a * std::pow(c_a, 2); // acoustic bulk modulus
-
-    // Funny how C++ 17 doesnt have PI. Like how do you not have PI for 20 generations of C++?
-    // Rayleigh Parameters
-    const double omega_1 = 2.0 * std::acos(-1.0) * physics->f1;
-    const double omega_2 = 2.0 * std::acos(-1.0) * physics->f2;
-    const double alpha_d = (2 * physics->zeta * omega_1 * omega_2)/(omega_1 + omega_2); // Rayleigh mass factor, 1/s
-    const double beta_d  = (2 * physics->zeta) / (omega_1 + omega_2); // Rayleigh stiffness factor, s
-
-    // TODO: Multiplex 2D and 3D case
-    double lambda;
-    if (settings.nz > 0)
-    {
-        lambda = lame_3D;
-    }
-    else if (settings.nz == 0)
-    {
-        lambda = lame_ps;
-    }
-    else
-    {
-        // TODO: Get a better sense of humor
-        log(App::LogLevel::Warning, "Negative nz again?");
-        _sleep(200);
-        throw;
-    }
-
-    // Spatially varying material coefficients
-    LevelSetScaledCoefficient solid_rho(*lset.phi, rho_s, epsilon_f, true);
-    LevelSetScaledCoefficient solid_lambda(*lset.phi, lambda, epsilon_f, true);
-    LevelSetScaledCoefficient solid_mu(*lset.phi, mu, epsilon_f, true);
-    LevelSetScaledCoefficient damped_solid_rho(*lset.phi, rho_s * alpha_d, epsilon_f, true);
-    LevelSetScaledCoefficient damped_solid_lambda(*lset.phi, lambda * beta_d, epsilon_f, true);
-    LevelSetScaledCoefficient damped_solid_mu(*lset.phi, mu * beta_d, epsilon_f, true);
-    LevelSetScaledCoefficient acoustic_inv_rho(*lset.phi, 1/rho_a, epsilon_f, false);
-    LevelSetScaledCoefficient acoustic_inv_bulk(*lset.phi, 1/K_a, epsilon_f, false);
-    ConstantCoefficient acoustic_inv_impedance(1/(rho_a * c_a));
-
-    // Weak form matrix blocks
-    // All these should be unique_pointers initially null in the solver since their 
-    // Construction is stateful
-    // TODO: Reimplement these bad boys in the header file as unique pointers
-    
-
-
-    // We call finalize for all just before the run, better not finalize it when "setting" the thing and tweaking the params
-    
-
-    // You know, maybe we only need to have the final sparse matrix as class-wide, not these
-    // These bad boys can be ressambleed each time
-    // FInal input of this function is that the final discrete system 
-    // Is assembled and ready to go
+    // The fictitious-domain coefficients select solid or air at each
+    // quadrature point. MFEM owns the element loops and sparse assembly.
     BilinearForm Muu_form(displacement_fes.get());
-    BilinearForm Kuu_form(displacement_fes.get());
-    BilinearForm Cuu_form(displacement_fes.get());
-    BilinearForm Mpp_form(scalar_fes.get());
-    BilinearForm Kpp_form(scalar_fes.get());
-    BilinearForm Cpp_form(scalar_fes.get());
-
-    MixedBilinearForm Kup_form(
-        scalar_fes.get(), 
-        displacement_fes.get()
-    );
-    MixedBilinearForm Mpu_form(
-        displacement_fes.get(), 
-        scalar_fes.get()
-    );
-
-    // Note: with the way im calling state transitions, i would normally defer this assembly
-    // And finalization to a later function, but since we do all this in one go, well.... doesnt really matter
-    // Adding the integrators
-    Muu_form.AddDomainIntegrator(
-        new VectorMassIntegrator(
-            solid_rho
-        )
-    );
+    Muu_form.AddDomainIntegrator(new VectorMassIntegrator(solid_density));
     Muu_form.Assemble();
     Muu_form.Finalize();
     std::unique_ptr<SparseMatrix> Muu(Muu_form.LoseMat());
 
+    BilinearForm Kuu_form(displacement_fes.get());
     Kuu_form.AddDomainIntegrator(
-        new ElasticityIntegrator(
-            solid_lambda,
-            solid_mu
-        ) // For the elasticity integrator, how does thios work
-    );
+        new ElasticityIntegrator(solid_lambda, solid_mu));
     Kuu_form.Assemble();
     Kuu_form.Finalize();
     std::unique_ptr<SparseMatrix> Kuu(Kuu_form.LoseMat());
 
+    BilinearForm Mpp_form(scalar_fes.get());
+    Mpp_form.AddDomainIntegrator(new MassIntegrator(acoustic_mass));
+    Mpp_form.Assemble();
+    Mpp_form.Finalize();
+    std::unique_ptr<SparseMatrix> Mpp(Mpp_form.LoseMat());
 
-    Cuu_form.AddDomainIntegrator(
-        new VectorMassIntegrator(
-            damped_solid_rho
-        )
-    );
-    Cuu_form.AddDomainIntegrator(
-        new ElasticityIntegrator(
-            damped_solid_lambda,
-            damped_solid_mu
-        )
-    );
-    Cuu_form.Assemble();
-    Cuu_form.Finalize();
-    std::unique_ptr<SparseMatrix> Cuu(Cuu_form.LoseMat());
-
-    Kpp_form.AddDomainIntegrator(
-        new DiffusionIntegrator(
-            acoustic_inv_rho
-        )
-    );
+    BilinearForm Kpp_form(scalar_fes.get());
+    Kpp_form.AddDomainIntegrator(new DiffusionIntegrator(acoustic_stiffness));
     Kpp_form.Assemble();
     Kpp_form.Finalize();
     std::unique_ptr<SparseMatrix> Kpp(Kpp_form.LoseMat());
 
-    Mpp_form.AddDomainIntegrator(
-        new MassIntegrator(
-            acoustic_inv_bulk
-        )
-    );
-    Mpp_form.Assemble();
-    Mpp_form.Finalize();
-    std::unique_ptr<SparseMatrix> Mpp(Mpp_form.LoseMat());
-    
-    // TODO: How do we make the absorbing boundary into a periodic one with ?
-    // oh yeah mesh brd_attributes go 1,2,3,4
-    mfem::Array<int> absorbing_marker(
-        mesh->bdr_attributes.Max()
-    );
-    absorbing_marker = 0;
-
-    const int inlet_boundary_attribute = dim == 3
-        ? static_cast<int>(CartesianBoundary3D::left)
-        : static_cast<int>(CartesianBoundary2D::left);
-    const int outlet_boundary_attribute = dim == 3
-        ? static_cast<int>(CartesianBoundary3D::right)
-        : static_cast<int>(CartesianBoundary2D::right);
-    absorbing_marker[inlet_boundary_attribute - 1] = 1;
-    absorbing_marker[outlet_boundary_attribute - 1] = 1;
-
-    Cpp_form.AddBoundaryIntegrator(
-        new BoundaryMassIntegrator(
-            acoustic_inv_impedance
-        ),
-        absorbing_marker
-    );
-    Cpp_form.Assemble();
-    Cpp_form.Finalize();
-    std::unique_ptr<SparseMatrix> Cpp(Cpp_form.LoseMat());
-
-    // Kup: scalar pressure trial -> vector displacement test
-    Kup_form.AddDomainIntegrator(
-        new App::ImplicitSurfaceNormalIntegrator(
-            *lset.phi,
-            cut_integration_order,
-            level_set_order,
-            -1.0,
-            false
-        ),
-        design_domain_marker
-    );
+    MixedBilinearForm Kup_form(scalar_fes.get(), displacement_fes.get());
+    Kup_form.AddDomainIntegrator(new ImplicitSurfaceNormalIntegrator(
+        *lset.phi, cut_integration_order, level_set_order, -1.0, false),
+        design_domain_marker);
     Kup_form.Assemble();
     Kup_form.Finalize();
     std::unique_ptr<SparseMatrix> Kup(Kup_form.LoseMat());
 
-    // Mpu: vector displacement trial -> scalar pressure test
-    Mpu_form.AddDomainIntegrator(
-        new App::ImplicitSurfaceNormalIntegrator(
-            *lset.phi,
-            cut_integration_order,
-            level_set_order,
-            1.0,
-            true
-        ),
-        design_domain_marker
-    );
+    MixedBilinearForm Mpu_form(displacement_fes.get(), scalar_fes.get());
+    Mpu_form.AddDomainIntegrator(new ImplicitSurfaceNormalIntegrator(
+        *lset.phi, cut_integration_order, level_set_order, 1.0, true),
+        design_domain_marker);
     Mpu_form.Assemble();
     Mpu_form.Finalize();
     std::unique_ptr<SparseMatrix> Mpu(Mpu_form.LoseMat());
 
-    std::unique_ptr<SparseMatrix> Kup_transpose(
-        Transpose(*Kup)
-    );
+    const real_t omega_1 = 2.0 * std::acos(-1.0) * physics->f1;
+    const real_t omega_2 = 2.0 * std::acos(-1.0) * physics->f2;
+    const real_t alpha_d = 2.0 * physics->zeta * omega_1 * omega_2
+        / (omega_1 + omega_2);
+    const real_t beta_d = 2.0 * physics->zeta / (omega_1 + omega_2);
+    std::unique_ptr<SparseMatrix> Cuu(
+        Add(alpha_d, *Muu, beta_d, *Kuu));
+
+    Array<int> absorbing_marker(mesh->bdr_attributes.Max());
+    absorbing_marker = 0;
+    const int inlet_boundary = dim == 3
+        ? static_cast<int>(CartesianBoundary3D::left)
+        : static_cast<int>(CartesianBoundary2D::left);
+    const int outlet_boundary = dim == 3
+        ? static_cast<int>(CartesianBoundary3D::right)
+        : static_cast<int>(CartesianBoundary2D::right);
+    absorbing_marker[inlet_boundary - 1] = 1;
+    absorbing_marker[outlet_boundary - 1] = 1;
+    ConstantCoefficient inverse_impedance(
+        1.0 / (physics->rho_a * physics->c_a));
+    BilinearForm Cpp_form(scalar_fes.get());
+    Cpp_form.AddBoundaryIntegrator(
+        new BoundaryMassIntegrator(inverse_impedance), absorbing_marker);
+    Cpp_form.Assemble();
+    Cpp_form.Finalize();
+    std::unique_ptr<SparseMatrix> Cpp(Cpp_form.LoseMat());
+    std::unique_ptr<SparseMatrix> Kup_transpose(Transpose(*Kup));
     std::unique_ptr<SparseMatrix> coupling_residual(
-        Add(1.0, *Mpu, 1.0, *Kup_transpose)
-    );
+        Add(1.0, *Mpu, 1.0, *Kup_transpose));
     const real_t coupling_scale = std::max(
         real_t{1.0},
-        std::max(Mpu->MaxNorm(), Kup_transpose->MaxNorm())
-    );
+        std::max(Mpu->MaxNorm(), Kup_transpose->MaxNorm()));
     if (coupling_residual->MaxNorm() > 1.0e-10 * coupling_scale) {
-        log(App::LogLevel::Error, "The implicit coupling matrices do not satisfy Mpu = -Kup^T.");
+        log(LogLevel::Error,
+            "The implicit coupling matrices do not satisfy Mpu = -Kup^T.");
         return false;
     }
 
-    mfem::Array<int> offsets(3);
+    Array<int> offsets(3);
     offsets[0] = 0;
-    offsets[1] = displacement_fes->GetVSize();
-    offsets[2] = scalar_fes->GetVSize() + offsets[1];
-
+    offsets[1] = displacement_size;
+    offsets[2] = displacement_size + pressure_size;
+    pressure_offset = displacement_size;
     BlockMatrix M_blocks(offsets);
     M_blocks.SetBlock(0, 0, Muu.get());
     M_blocks.SetBlock(1, 0, Mpu.get());
     M_blocks.SetBlock(1, 1, Mpp.get());
     M.reset(M_blocks.CreateMonolithic());
-
     BlockMatrix C_blocks(offsets);
     C_blocks.SetBlock(0, 0, Cuu.get());
     C_blocks.SetBlock(1, 1, Cpp.get());
     C.reset(C_blocks.CreateMonolithic());
-
     BlockMatrix K_blocks(offsets);
     K_blocks.SetBlock(0, 0, Kuu.get());
     K_blocks.SetBlock(0, 1, Kup.get());
     K_blocks.SetBlock(1, 1, Kpp.get());
     K.reset(K_blocks.CreateMonolithic());
-
     if (M->CheckFinite() != 0 || C->CheckFinite() != 0 || K->CheckFinite() != 0) {
-        log(App::LogLevel::Error, "The assembled global matrices contain non-finite values.");
-        M.reset();
-        C.reset();
-        K.reset();
+        log(LogLevel::Error, "The assembled global matrices contain non-finite values.");
         return false;
     }
 
-    log(App::LogLevel::Message, "Assembled the vibroacoustic solution space.");
+    Array<int> clamped_marker(mesh->bdr_attributes.Max());
+    clamped_marker = 0;
+    if (dim == 3) {
+        clamped_marker[static_cast<int>(CartesianBoundary3D::bottom) - 1] = 1;
+        clamped_marker[static_cast<int>(CartesianBoundary3D::top) - 1] = 1;
+    }
+    else {
+        clamped_marker[static_cast<int>(CartesianBoundary2D::bottom) - 1] = 1;
+        clamped_marker[static_cast<int>(CartesianBoundary2D::top) - 1] = 1;
+    }
+    displacement_fes->GetEssentialTrueDofs(
+        clamped_marker, displacement_essential_tdofs);
+
+    Array<int> inlet_marker(mesh->bdr_attributes.Max());
+    Array<int> outlet_marker(mesh->bdr_attributes.Max());
+    inlet_marker = 0;
+    outlet_marker = 0;
+    inlet_marker[inlet_boundary - 1] = 1;
+    outlet_marker[outlet_boundary - 1] = 1;
+    ConstantCoefficient one(1.0);
+    LinearForm inlet_form(scalar_fes.get());
+    inlet_form.AddBoundaryIntegrator(
+        new BoundaryLFIntegrator(one), inlet_marker);
+    inlet_form.Assemble();
+    inlet_load = inlet_form;
+    LinearForm outlet_form(scalar_fes.get());
+    outlet_form.AddBoundaryIntegrator(
+        new BoundaryLFIntegrator(one), outlet_marker);
+    outlet_form.Assemble();
+    outlet_functional = outlet_form;
+
+    const double expected_boundary_measure = dim == 3
+        ? settings.sy * settings.sz
+        : settings.sy;
+    const double measure_tolerance = 1.0e-10
+        * std::max(1.0, expected_boundary_measure);
+    if (std::abs(inlet_load.Sum() - expected_boundary_measure) > measure_tolerance
+        || std::abs(outlet_functional.Sum() - expected_boundary_measure)
+            > measure_tolerance) {
+        log(LogLevel::Error,
+            "The inlet/outlet integration vectors do not match the duct cross-section.");
+        return false;
+    }
+
+    std::mt19937 generator(settings.sourceSeed);
+    std::uniform_real_distribution<double> distribution(
+        -settings.sourceAmplitude, settings.sourceAmplitude);
+    source_pressure.resize(time_steps + 1);
+    source_pressure_derivative.resize(time_steps + 1);
+    for (double& value : source_pressure) {
+        value = distribution(generator);
+    }
+    source_pressure_derivative[0] =
+        (source_pressure[1] - source_pressure[0]) / settings.dt;
+    for (int step = 1; step < time_steps; ++step) {
+        source_pressure_derivative[step] =
+            (source_pressure[step + 1] - source_pressure[step - 1])
+            / (2.0 * settings.dt);
+    }
+    source_pressure_derivative[time_steps] =
+        (source_pressure[time_steps] - source_pressure[time_steps - 1])
+        / settings.dt;
+
+    result.stateSize = M->Height();
+    result.displacementSize = displacement_size;
+    result.pressureSize = pressure_size;
+    result.pressureOffset = pressure_offset;
+    result.timeSteps = time_steps;
+    result.dt = settings.dt;
+    log(LogLevel::Message,
+        "Assembled fictitious-domain vibroacoustic M, C, and K matrices.");
     return true;
 }
 
-
-// TODO: we still have to sample the FFT into the FFT section of the solver result.
-// Also TODO: we ought o
-bool App::Solver::solve(){
-
-    //TODO: We probably need to make a SolverResults array (sizeof the number of maxiterations) intiailly empty so at the app layer we can append results
-    // Actually no that would suck, then we would have to deal with ballooning memory
+bool App::Solver::solve()
+{
+    status.store(SolverStatus::Working);
     result.success = 0;
     result.U.clear();
-    result.R.clear();
+    result.residualNorms.clear();
+    std::atomic_store(
+        &result.inletPressure, std::shared_ptr<const SignalTD>{});
+    std::atomic_store(
+        &result.outletPressure, std::shared_ptr<const SignalTD>{});
+    std::atomic_store(
+        &result.referenceOutletPressure, std::shared_ptr<const SignalTD>{});
+    std::atomic_store(
+        &result.materialImpulseResponse, std::shared_ptr<const SignalFFT>{});
 
-    if (!M || !C || !K) {
-        log(App::LogLevel::Error, "Cannot solve before assembling M, C, and K.");
-        return false;
-    }
-    if (settings.dt <= 0.0 || settings.duration <= 0.0) {
-        log(App::LogLevel::Error, "The Newmark time step and duration must be positive.");
-        return false;
-    }
-    if (M->Height() != M->Width()
-        || C->Height() != M->Height() || C->Width() != M->Width()
-        || K->Height() != M->Height() || K->Width() != M->Width()) {
-        log(App::LogLevel::Error, "M, C, and K must have matching square dimensions.");
-        return false;
-    }
-
-    // Newmark constants
-    // These are selected to keep the algo UNCONDITIONALLY STABLE
-    const double beta_nm = 0.25;
-    const double gamma_nm = 0.5;
-
-    const double a1 = 1.0 - gamma_nm/beta_nm;
-    const double a2 = (1.0 - gamma_nm/(2*beta_nm)) * settings.dt;
-    const double a3 = gamma_nm/(beta_nm * settings.dt);
-    const double a4 = 1.0 / (beta_nm * settings.dt);
-    const double a5 = 1/(2*beta_nm) - 1.0;
-    const double a6 = 1 / (beta_nm * settings.dt * settings.dt);
-
-    std::unique_ptr<SparseMatrix> mass_and_damping(
-        Add(a6, *M, a3, *C)
-    );
-    std::unique_ptr<SparseMatrix> effective_stiffness(
-        Add(1.0, *K, 1.0, *mass_and_damping)
-    );
-
-    if (effective_stiffness->CheckFinite() != 0) {
-        log(App::LogLevel::Error, "The Newmark effective stiffness matrix contains non-finite values.");
+    if (!mesh || !M || !C || !K) {
+        log(LogLevel::Error,
+            "Call setMesh() and assembleSolutionSpace() before solve().");
+        status.store(SolverStatus::Error);
         return false;
     }
 
-    GSSmoother effective_preconditioner(*effective_stiffness);
-    GMRESSolver linear_solver;
-    linear_solver.SetPreconditioner(effective_preconditioner);
-    linear_solver.SetOperator(*effective_stiffness);
-    linear_solver.iterative_mode = true;
-    linear_solver.SetRelTol(1.0e-10);
-    linear_solver.SetAbsTol(1.0e-12);
-    linear_solver.SetMaxIter(1000);
-    // TODO: Capture prints to the imgui terminal (would be nice)
-    linear_solver.SetPrintLevel(-1);
+    const Vector designed_geometry(lset.design);
+    auto fail = [this, &designed_geometry](SolverStatus failure) {
+        lset.design = designed_geometry;
+        lset.enforceDesignConstraints();
+        result.U.clear();
+        result.residualNorms.clear();
+        status.store(failure);
+        return false;
+    };
 
-    const int state_size = M->Height();
-    const int time_steps = static_cast<int>(std::ceil(settings.duration / settings.dt));
-
-    Vector v(state_size);
-    Vector v_dot(state_size);
-    Vector v_ddot(state_size);
-    v = 0.0;
-    v_dot = 0.0;
-    v_ddot = 0.0;
-
-    result.U.reserve(time_steps + 1);
-    result.R.reserve(time_steps + 1);
-
-    Vector U_n(3 * state_size);
-    Vector R_n(3 * state_size);
-    U_n = 0.0;
-    R_n = 0.0;
-    result.U.push_back(U_n);
-    result.R.push_back(R_n);
-
-    Vector h(state_size);
-    Vector h_hat(state_size);
-    Vector x_M(state_size);
-    Vector x_C(state_size);
-    Vector y_M(state_size);
-    Vector y_C(state_size);
-    Vector v_new(state_size);
-    Vector v_dot_new(state_size);
-    Vector v_ddot_new(state_size);
-    Vector delta_v(state_size);
-    Vector r1(state_size);
-    Vector r2(state_size);
-    Vector r3(state_size);
-
-    log(App::LogLevel::Warning,
-        "The incoming-wave load is not assembled yet; this solve uses h^n = 0.");
-
-    for (int n = 1; n <= time_steps; n++) {
-        // TODO: Assemble the incoming-wave boundary load g(t) into the pressure block.
-        h = 0.0;
-
-        x_M = 0.0;
-        x_M.Add(a4, v_dot);
-        x_M.Add(a5, v_ddot);
-        x_M.Add(a6, v);
-        M->Mult(x_M, y_M);
-
-        x_C = 0.0;
-        x_C.Add(-a1, v_dot);
-        x_C.Add(-a2, v_ddot);
-        x_C.Add(a3, v);
-        C->Mult(x_C, y_C);
-
-        h_hat = h;
-        h_hat += y_M;
-        h_hat += y_C;
-
-        v_new = v;
-        linear_solver.Mult(h_hat, v_new);
-        if (!linear_solver.GetConverged()) {
-            log(App::LogLevel::Error,
-                "The Newmark linear solve failed at time step " + std::to_string(n) + ".");
-            result.U.clear();
-            result.R.clear();
-            return false;
+    for (int analysis = 0; analysis < 2; ++analysis) {
+        const bool reference_analysis = analysis == 0;
+        if (reference_analysis) {
+            lset.design = 0.0;
+        }
+        else {
+            lset.design = designed_geometry;
+        }
+        lset.enforceDesignConstraints();
+        if (!assembleSolutionSpace()) {
+            return fail(SolverStatus::Error);
         }
 
-        delta_v = v_new;
-        delta_v -= v;
+        if (!reference_analysis) {
+            char host[] = "127.0.0.1";
+            socketstream stream(host, GlvisAdapter::Port);
+            if (stream.good()) {
+                stream.precision(8);
+                stream << "solution\n" << *mesh << *lset.phi << std::flush;
+                log(LogLevel::Message,
+                    "Streamed the filtered paper initial geometry to GLVis.");
+            }
+            else {
+                log(LogLevel::Warning,
+                    "Could not connect to the local GLVis panel; continuing headless.");
+            }
+        }
 
-        v_dot_new = 0.0;
-        v_dot_new.Add(a1, v_dot);
-        v_dot_new.Add(a2, v_ddot);
-        v_dot_new.Add(a3, delta_v);
+        const auto* physics =
+            std::get_if<VibroacousticSettings>(&settings.physics);
+        const double beta = settings.newmarkBeta;
+        const double gamma = settings.newmarkGamma;
+        if (physics == nullptr || beta <= 0.0 || gamma < 0.5
+            || beta < 0.25 * std::pow(gamma + 0.5, 2.0)) {
+            log(LogLevel::Error,
+                "The Newmark parameters do not satisfy the stability bound.");
+            return fail(SolverStatus::Error);
+        }
 
-        v_ddot_new = 0.0;
-        v_ddot_new.Add(-a4, v_dot);
-        v_ddot_new.Add(-a5, v_ddot);
-        v_ddot_new.Add(a6, delta_v);
+        // Paper Eqs. (14)-(19).
+        const double a_1 = 1.0 - gamma / beta;
+        const double a_2 =
+            (1.0 - gamma / (2.0 * beta)) * settings.dt;
+        const double a_3 = gamma / (beta * settings.dt);
+        const double a_4 = 1.0 / (beta * settings.dt);
+        const double a_5 = 1.0 / (2.0 * beta) - 1.0;
+        const double a_6 =
+            1.0 / (beta * settings.dt * settings.dt);
 
-        effective_stiffness->Mult(v_new, r1);
-        r1 -= h_hat;
+        std::unique_ptr<SparseMatrix> M_and_C(Add(a_6, *M, a_3, *C));
+        std::unique_ptr<SparseMatrix> K_hat(Add(1.0, *K, 1.0, *M_and_C));
+        for (int i = 0; i < displacement_essential_tdofs.Size(); ++i) {
+            K_hat->EliminateRowCol(displacement_essential_tdofs[i]);
+        }
 
-        r2 = v_dot_new;
-        r2.Add(-a1, v_dot);
-        r2.Add(-a2, v_ddot);
-        r2.Add(-a3, delta_v);
+        // ponytail: GSSmoother is the low-memory baseline; replace it with a
+        // block preconditioner only if the paper-default residual gate fails.
+        GSSmoother K_hat_preconditioner(*K_hat);
+        GMRESSolver K_hat_solver;
+        K_hat_solver.SetPreconditioner(K_hat_preconditioner);
+        K_hat_solver.SetOperator(*K_hat);
+        K_hat_solver.iterative_mode = true;
+        K_hat_solver.SetKDim(50);
+        K_hat_solver.SetRelTol(1.0e-10);
+        K_hat_solver.SetAbsTol(1.0e-12);
+        K_hat_solver.SetMaxIter(1500);
+        K_hat_solver.SetPrintLevel(-1);
 
-        r3 = v_ddot_new;
-        r3.Add(a4, v_dot);
-        r3.Add(a5, v_ddot);
-        r3.Add(-a6, delta_v);
+        const int state_size = M->Height();
+        const int pressure_size = scalar_fes->GetVSize();
+        const int time_steps = result.timeSteps;
+        const double load_scale =
+            2.0 / (physics->rho_a * physics->c_a);
 
-        U_n.SetVector(v_new, 0);
-        U_n.SetVector(v_dot_new, state_size);
-        U_n.SetVector(v_ddot_new, 2 * state_size);
-        R_n.SetVector(r1, 0);
-        R_n.SetVector(r2, state_size);
-        R_n.SetVector(r3, 2 * state_size);
-        result.U.push_back(U_n);
-        result.R.push_back(R_n);
+        Vector v(state_size);
+        Vector v_dot(state_size);
+        Vector v_ddot(state_size);
+        v = 0.0;
+        v_dot = 0.0;
+        v_ddot = 0.0;
 
-        v = v_new;
-        v_dot = v_dot_new;
-        v_ddot = v_ddot_new;
+        Vector h(state_size);
+        h = 0.0;
+        Vector pressure_h(h.GetData() + pressure_offset, pressure_size);
+        pressure_h.Add(
+            load_scale * source_pressure_derivative[0], inlet_load);
+        // The load is not zero: only the clamped displacement rows are.
+        h.SetSubVector(displacement_essential_tdofs, 0.0);
+
+        // Paper Eq. (21): M v_ddot^0 = h^0.
+        SparseMatrix M_system(*M);
+        for (int i = 0; i < displacement_essential_tdofs.Size(); ++i) {
+            M_system.EliminateRowCol(displacement_essential_tdofs[i]);
+        }
+        GSSmoother M_preconditioner(M_system);
+        GMRESSolver M_solver;
+        M_solver.SetPreconditioner(M_preconditioner);
+        M_solver.SetOperator(M_system);
+        M_solver.SetKDim(50);
+        M_solver.SetRelTol(1.0e-10);
+        M_solver.SetAbsTol(1.0e-12);
+        M_solver.SetMaxIter(1500);
+        M_solver.SetPrintLevel(-1);
+        M_solver.Mult(h, v_ddot);
+        if (!M_solver.GetConverged()) {
+            log(LogLevel::Error,
+                "The initial-acceleration solve did not converge.");
+            return fail(SolverStatus::Diverged);
+        }
+        v_ddot.SetSubVector(displacement_essential_tdofs, 0.0);
+
+        Vector R_0(state_size);
+        M_system.Mult(v_ddot, R_0);
+        R_0 -= h;
+        const double initial_residual = R_0.Norml2()
+            / std::max(1.0, h.Norml2());
+        if (!std::isfinite(initial_residual)
+            || initial_residual > 1.0e-9) {
+            log(LogLevel::Error,
+                "The initial-acceleration solve exceeded the residual tolerance.");
+            return fail(SolverStatus::Diverged);
+        }
+
+        if (!reference_analysis) {
+            result.U.reserve(time_steps + 1);
+            result.residualNorms.reserve(time_steps + 1);
+            Vector U_0(3 * state_size);
+            U_0.SetVector(v, 0);
+            U_0.SetVector(v_dot, state_size);
+            U_0.SetVector(v_ddot, 2 * state_size);
+            result.U.push_back(U_0);
+            result.residualNorms.push_back(
+                {initial_residual, 0.0, 0.0});
+        }
+
+        std::vector<double>& measured_outlet = reference_analysis
+            ? reference_outlet_pressure
+            : outlet_pressure;
+        measured_outlet.clear();
+        measured_outlet.reserve(time_steps);
+
+        Vector h_hat(state_size);
+        Vector x_M(state_size);
+        Vector x_C(state_size);
+        Vector y_M(state_size);
+        Vector y_C(state_size);
+        Vector v_n(state_size);
+        Vector v_dot_n(state_size);
+        Vector v_ddot_n(state_size);
+        Vector delta_v(state_size);
+        Vector K_v(state_size);
+        Vector R_1(state_size);
+        Vector R_2(state_size);
+        Vector R_3(state_size);
+
+        for (int n = 1; n <= time_steps; ++n) {
+            h = 0.0;
+            pressure_h.SetDataAndSize(
+                h.GetData() + pressure_offset, pressure_size);
+            pressure_h.Add(
+                load_scale * source_pressure_derivative[n], inlet_load);
+
+            x_M = 0.0;
+            x_M.Add(a_4, v_dot);
+            x_M.Add(a_5, v_ddot);
+            x_M.Add(a_6, v);
+            M->Mult(x_M, y_M);
+
+            x_C = 0.0;
+            x_C.Add(-a_1, v_dot);
+            x_C.Add(-a_2, v_ddot);
+            x_C.Add(a_3, v);
+            C->Mult(x_C, y_C);
+
+            h_hat = h;
+            h_hat += y_M;
+            h_hat += y_C;
+            // EliminateRowCol() imposes v = 0 on these rows, so their RHS is 0.
+            h_hat.SetSubVector(displacement_essential_tdofs, 0.0);
+
+            v_n = v;
+            K_hat_solver.Mult(h_hat, v_n);
+            if (!K_hat_solver.GetConverged()) {
+                log(LogLevel::Error,
+                    "The Newmark solve failed at time step "
+                        + std::to_string(n) + ".");
+                return fail(SolverStatus::Diverged);
+            }
+            v_n.SetSubVector(displacement_essential_tdofs, 0.0);
+
+            delta_v = v_n;
+            delta_v -= v;
+            v_dot_n = 0.0;
+            v_dot_n.Add(a_1, v_dot);
+            v_dot_n.Add(a_2, v_ddot);
+            v_dot_n.Add(a_3, delta_v);
+            v_ddot_n = 0.0;
+            v_ddot_n.Add(-a_4, v_dot);
+            v_ddot_n.Add(-a_5, v_ddot);
+            v_ddot_n.Add(a_6, delta_v);
+            v_dot_n.SetSubVector(displacement_essential_tdofs, 0.0);
+            v_ddot_n.SetSubVector(displacement_essential_tdofs, 0.0);
+
+            Vector pressure(
+                v_n.GetData() + pressure_offset, pressure_size);
+            measured_outlet.push_back(outlet_functional * pressure);
+
+            M->Mult(v_ddot_n, y_M);
+            C->Mult(v_dot_n, y_C);
+            K->Mult(v_n, K_v);
+            R_1 = y_M;
+            R_1 += y_C;
+            R_1 += K_v;
+            R_1 -= h;
+            R_1.SetSubVector(displacement_essential_tdofs, 0.0);
+
+            R_2 = v_dot_n;
+            R_2.Add(-a_1, v_dot);
+            R_2.Add(-a_2, v_ddot);
+            R_2.Add(-a_3, delta_v);
+
+            R_3 = v_ddot_n;
+            R_3.Add(a_4, v_dot);
+            R_3.Add(a_5, v_ddot);
+            R_3.Add(-a_6, delta_v);
+
+            const double R_1_norm = R_1.Norml2() / std::max({
+                1.0,
+                h.Norml2(),
+                y_M.Norml2() + y_C.Norml2() + K_v.Norml2()
+            });
+            const double R_2_norm = R_2.Norml2() / std::max({
+                1.0,
+                v_dot_n.Norml2(),
+                std::abs(a_1) * v_dot.Norml2()
+                    + std::abs(a_2) * v_ddot.Norml2()
+                    + std::abs(a_3) * delta_v.Norml2()
+            });
+            const double R_3_norm = R_3.Norml2() / std::max({
+                1.0,
+                v_ddot_n.Norml2(),
+                std::abs(a_4) * v_dot.Norml2()
+                    + std::abs(a_5) * v_ddot.Norml2()
+                    + std::abs(a_6) * delta_v.Norml2()
+            });
+            if (!std::isfinite(R_1_norm)
+                || !std::isfinite(R_2_norm)
+                || !std::isfinite(R_3_norm)
+                || R_1_norm > 1.0e-9) {
+                log(LogLevel::Error,
+                    "The Newmark residual check failed at time step "
+                        + std::to_string(n) + ".");
+                return fail(SolverStatus::Diverged);
+            }
+
+            if (!reference_analysis) {
+                Vector U_n(3 * state_size);
+                U_n.SetVector(v_n, 0);
+                U_n.SetVector(v_dot_n, state_size);
+                U_n.SetVector(v_ddot_n, 2 * state_size);
+                result.U.push_back(U_n);
+                result.residualNorms.push_back(
+                    {R_1_norm, R_2_norm, R_3_norm});
+            }
+
+            v = v_n;
+            v_dot = v_dot_n;
+            v_ddot = v_ddot_n;
+        }
+
+        if (reference_analysis) {
+            log(LogLevel::Message,
+                "Computed the deterministic empty-duct reference response.");
+        }
+    }
+
+    lset.design = designed_geometry;
+    lset.enforceDesignConstraints();
+    if (!postprocessFourierResponse()) {
+        return fail(SolverStatus::Error);
     }
 
     result.success = 1;
-    log(App::LogLevel::Message,
-        "Completed " + std::to_string(time_steps) + " Newmark time steps.");
+    status.store(SolverStatus::Converged);
+    log(LogLevel::Message,
+        "Completed the Newmark solve and published the outlet transmission FFT.");
     return true;
 }
 
-bool App::Solver::bindToGlvis(){
-    log(App::LogLevel::Warning, "GLVis binding is not implemented yet.");
-    return false;
+bool App::Solver::smooth_level_set(
+    const GridFunction& level_set,
+    GridFunction& smoothed_level_set,
+    const SparseMatrix& design_to_cell,
+    const SparseMatrix& cell_to_level_set,
+    const DenseMatrix& element_centers,
+    const Vector& cell_volumes)
+{
+    const int cell_count = mesh->GetNE();
+    const int dim = mesh->Dimension();
+    const int level_set_size = level_set_fes->GetTrueVSize();
+    if (level_set.FESpace() != level_set_fes.get()
+        || smoothed_level_set.FESpace() != level_set_fes.get()
+        || design_to_cell.Height() != cell_count
+        || design_to_cell.Width() != level_set_size
+        || cell_to_level_set.Height() != level_set_size
+        || cell_to_level_set.Width() != cell_count
+        || element_centers.Height() != cell_count
+        || element_centers.Width() != dim
+        || cell_volumes.Size() != cell_count) {
+        log(LogLevel::Error,
+            "The level-set smoother received incompatible mesh data.");
+        return false;
+    }
+
+    const double sx = settings.inletLength
+        + settings.designLength + settings.outletLength;
+    const double hx = sx / settings.nx;
+    const double hy = settings.sy / settings.ny;
+    const double hz = settings.nz > 0
+        ? settings.sz / settings.nz
+        : std::numeric_limits<double>::max();
+    const double level_set_scale = std::min({hx, hy, hz});
+
+    // Paper Eq. (28): -r^2 Laplacian(phi_c) + phi_c = mapped_design_c.
+    const real_t filter_radius = optimizer_settings.filterRadius;
+    if (filter_radius < 0.0) {
+        log(LogLevel::Error, "The PDE filter radius cannot be negative.");
+        return false;
+    }
+    SparseMatrix filter_matrix(cell_count);
+    for (int element = 0; element < cell_count; ++element) {
+        filter_matrix.Add(element, element, cell_volumes[element]);
+    }
+    for (int face = 0; face < mesh->GetNumFaces(); ++face) {
+        int first = -1;
+        int second = -1;
+        mesh->GetFaceElements(face, &first, &second);
+        if (second < 0
+            || mesh->GetAttribute(first)
+                != static_cast<int>(DomainAttribute::design)
+            || mesh->GetAttribute(second)
+                != static_cast<int>(DomainAttribute::design)) {
+            continue;
+        }
+        real_t distance_squared = 0.0;
+        for (int axis = 0; axis < dim; ++axis) {
+            const real_t distance = element_centers(second, axis)
+                - element_centers(first, axis);
+            distance_squared += distance * distance;
+        }
+        if (distance_squared <= 0.0) {
+            log(LogLevel::Error,
+                "The PDE filter found coincident cell centers.");
+            return false;
+        }
+        const real_t coefficient = filter_radius * filter_radius
+            * 0.5 * (cell_volumes[first] + cell_volumes[second])
+            / distance_squared;
+        filter_matrix.Add(first, first, coefficient);
+        filter_matrix.Add(first, second, -coefficient);
+        filter_matrix.Add(second, first, -coefficient);
+        filter_matrix.Add(second, second, coefficient);
+    }
+    filter_matrix.Finalize();
+
+    Vector mapped;
+    level_set.GetTrueDofs(mapped);
+    mapped -= 0.5;
+    mapped *= level_set_scale;
+    Vector center_values(cell_count);
+    Vector filter_rhs(cell_count);
+    Vector filtered_centers(cell_count);
+    design_to_cell.Mult(mapped, center_values);
+    for (int cell = 0; cell < cell_count; ++cell) {
+        filter_rhs[cell] = cell_volumes[cell] * center_values[cell];
+    }
+
+    GSSmoother preconditioner(filter_matrix);
+    CGSolver solver;
+    solver.SetPreconditioner(preconditioner);
+    solver.SetOperator(filter_matrix);
+    solver.SetRelTol(1.0e-10);
+    solver.SetAbsTol(1.0e-12);
+    solver.SetMaxIter(1500);
+    solver.SetPrintLevel(-1);
+    filtered_centers = 0.0;
+    solver.Mult(filter_rhs, filtered_centers);
+    if (!solver.GetConverged()) {
+        log(LogLevel::Error,
+            "The cell-centered PDE filter did not converge.");
+        return false;
+    }
+
+    Vector physical(level_set_size);
+    cell_to_level_set.Mult(filtered_centers, physical);
+    smoothed_level_set.SetFromTrueDofs(physical);
+    smoothed_level_set.SetSubVectorComplement(
+        lset.activeDesignDofs, -0.5 * level_set_scale);
+    return true;
 }
 
-bool App::Solver::setup(){
+bool App::Solver::postprocessFourierResponse()
+{
+    const int sample_count = static_cast<int>(outlet_pressure.size());
+    if (sample_count == 0
+        || reference_outlet_pressure.size() != outlet_pressure.size()) {
+        return false;
+    }
 
-    //todo: think about getting rid of this
+    std::vector<double> window(sample_count);
+    for (int sample = 0; sample < sample_count; ++sample) {
+        window[sample] = settings.useHannWindow
+            ? 0.5 * (1.0 - std::cos(
+                2.0 * std::acos(-1.0) * sample / (sample_count - 1)))
+            : 1.0;
+    }
+
+    auto transform = [&window, sample_count](
+                         const std::vector<double>& signal,
+                         std::vector<std::complex<double>>& spectrum) {
+        std::vector<double> windowed(sample_count);
+        for (int sample = 0; sample < sample_count; ++sample) {
+            windowed[sample] = signal[sample] * window[sample];
+        }
+
+        fftw_complex* output = fftw_alloc_complex(sample_count / 2 + 1);
+        if (output == nullptr) {
+            return false;
+        }
+        fftw_plan plan = fftw_plan_dft_r2c_1d(
+            sample_count, windowed.data(), output, FFTW_ESTIMATE);
+        if (plan == nullptr) {
+            fftw_free(output);
+            return false;
+        }
+        fftw_execute(plan);
+        spectrum.resize(sample_count / 2 + 1);
+        for (int bin = 0; bin < static_cast<int>(spectrum.size()); ++bin) {
+            spectrum[bin] = {output[bin][0], output[bin][1]};
+        }
+        fftw_destroy_plan(plan);
+        fftw_free(output);
+        return true;
+    };
+
+    std::vector<std::complex<double>> response_spectrum;
+    std::vector<std::complex<double>> reference_spectrum;
+    if (!transform(outlet_pressure, response_spectrum)
+        || !transform(reference_outlet_pressure, reference_spectrum)) {
+        log(LogLevel::Error, "FFTW could not produce the frequency response.");
+        return false;
+    }
+
+    auto response = std::make_shared<SignalFFT>();
+    response->size = static_cast<int>(response_spectrum.size());
+    response->frequency.resize(response->size);
+    response->referenceAmplitude.resize(response->size);
+    response->amplitude.resize(response->size);
+    response->transmission.resize(response->size);
+    response->attenuationDB.resize(response->size);
+    response->phase.resize(response->size);
+    response->valid.resize(response->size);
+
+    double maximum_reference = 0.0;
+    for (const std::complex<double>& value : reference_spectrum) {
+        maximum_reference = std::max(maximum_reference, std::abs(value));
+    }
+    const double reference_floor =
+        std::max(1.0e-14, 1.0e-12 * maximum_reference);
+    const double window_sum =
+        std::accumulate(window.begin(), window.end(), 0.0);
+    if (window_sum <= 0.0) {
+        log(LogLevel::Error, "The FFT window has zero total weight.");
+        return false;
+    }
+
+    const bool has_nyquist_bin = sample_count % 2 == 0;
+    const float invalid_value = std::numeric_limits<float>::quiet_NaN();
+    for (int bin = 0; bin < response->size; ++bin) {
+        const double reference_amplitude = std::abs(reference_spectrum[bin]);
+        const double amplitude = std::abs(response_spectrum[bin]);
+        const bool valid = reference_amplitude > reference_floor;
+        const double one_sided_scale = bin == 0
+                || (has_nyquist_bin && bin == response->size - 1)
+            ? 1.0 / window_sum
+            : 2.0 / window_sum;
+
+        response->frequency[bin] = static_cast<float>(
+            bin / (sample_count * settings.dt));
+        response->referenceAmplitude[bin] = static_cast<float>(
+            reference_amplitude * one_sided_scale);
+        response->amplitude[bin] = static_cast<float>(
+            amplitude * one_sided_scale);
+        response->valid[bin] = valid ? 1 : 0;
+        if (!valid) {
+            response->transmission[bin] = invalid_value;
+            response->attenuationDB[bin] = invalid_value;
+            response->phase[bin] = invalid_value;
+            continue;
+        }
+
+        const double transmission = amplitude / reference_amplitude;
+        response->transmission[bin] = static_cast<float>(transmission);
+        response->attenuationDB[bin] = static_cast<float>(
+            20.0 * std::log10(std::max(transmission, 1.0e-12)));
+        response->phase[bin] = static_cast<float>(
+            std::arg(response_spectrum[bin] / reference_spectrum[bin]));
+    }
+
+    auto make_signal = [this, sample_count](
+                           const std::vector<double>& amplitude,
+                           bool skip_initial_sample) {
+        auto signal = std::make_shared<SignalTD>();
+        signal->size = sample_count;
+        signal->time.resize(sample_count);
+        signal->amplitude.resize(sample_count);
+        for (int sample = 0; sample < sample_count; ++sample) {
+            signal->time[sample] = (sample + 1) * settings.dt;
+            signal->amplitude[sample] =
+                amplitude[sample + (skip_initial_sample ? 1 : 0)];
+        }
+        return std::shared_ptr<const SignalTD>(std::move(signal));
+    };
+
+    std::shared_ptr<const SignalFFT> published_response = std::move(response);
+    std::atomic_store(
+        &result.materialImpulseResponse, std::move(published_response));
+    std::atomic_store(
+        &result.inletPressure, make_signal(source_pressure, true));
+    std::atomic_store(
+        &result.outletPressure, make_signal(outlet_pressure, false));
+    std::atomic_store(
+        &result.referenceOutletPressure,
+        make_signal(reference_outlet_pressure, false));
     return true;
 }

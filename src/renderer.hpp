@@ -29,7 +29,7 @@ using SDL_GLContext = void*;
 namespace App {
 
     struct AppSettings;
-    struct Bandgap;
+    struct FrequencyBand;
     class GlvisAdapter;
 
 #if METAMATERIAL_DEMO_MODE
@@ -70,7 +70,6 @@ namespace App {
             SolverResult& result;
             LevelSet& geometry;
 
-            int lastFreeformIndex = -1;
             std::vector<float> objectiveFrequency;
             std::vector<float> objectiveTarget;
 
@@ -196,7 +195,7 @@ namespace App {
 
             */
             void OptimizerDesignPanel(const dispatcher_t& dispatcher);
-            void bandgapGroup(Bandgap* bg); // This is the bandgap UI group, linked to one bg, recursively created in an inline block horizontal overflow x auto 
+            void frequencyBandGroup(FrequencyBand* band);
 
             /*
             ActionPanel
