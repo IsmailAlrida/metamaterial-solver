@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <memory>
 #include "global_types.hpp"
 #include "logging.hpp"
@@ -21,10 +22,12 @@ namespace App {
         ~Solver();
 
         bool setup();
+        bool run();
         bool setMesh();
         bool assembleSolutionSpace();
         bool solve();
         bool bindToGlvis();
+        SolverStatus get_status() const;
 
 
 
@@ -53,6 +56,7 @@ namespace App {
         std::unique_ptr<mfem::SparseMatrix> M;
         std::unique_ptr<mfem::SparseMatrix> C;
         std::unique_ptr<mfem::SparseMatrix> K;
+        std::atomic<SolverStatus> status{SolverStatus::Idle};
 
 
 

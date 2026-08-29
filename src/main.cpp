@@ -42,15 +42,16 @@ int main(int, char**)
             renderer->log(level, std::move(message));
         };
 
-        // in opt, result is const, not edited.
-        auto optimizer = std::make_unique<App::optimizer_t>(
+        auto solver = std::make_unique<App::solver_t>(
+            solverSettings,
             optimizerSettings,
             geometry,
             solverResult,
             log);
-        auto solver = std::make_unique<App::solver_t>(
-            solverSettings,
+        // in opt, result is const, not edited.
+        auto optimizer = std::make_unique<App::optimizer_t>(
             optimizerSettings,
+            *solver,
             geometry,
             solverResult,
             log);
@@ -60,13 +61,17 @@ int main(int, char**)
             log);
         auto executor = std::make_unique<App::executor_t>(log);
 
-        auto dispatcher = std::make_unique<App::Dispatcher>(*solver, *optimizer,*exporter, log);
+        auto dispatcher = std::make_unique<
+            App::Dispatcher<App::optimizer_t, App::exporter_t>>(
+                *optimizer,
+                *exporter,
+                log);
         renderer->setup();
         log(App::LogLevel::Message, "Renderer initialized");
 
         while (!renderer->shouldClose) {
             dispatcher->dispatch();
-            renderer->displayFrame(*dispatcher);
+            renderer->displayFrame(*solver, *optimizer, *exporter, *executor);
         }
 
         // TODO: Executor should own and join its backend thread in its destructor.

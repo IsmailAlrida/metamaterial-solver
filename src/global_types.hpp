@@ -13,6 +13,24 @@ constexpr double pi = 3.14159265358979323846;
 
 namespace App {
 
+enum class SolverStatus {
+    Idle,
+    Working,
+    Converged,
+    Diverged,
+    Error
+};
+
+enum class OptimizerStatus {
+    Idle,
+    Working,
+    Converged,
+    MaximumIterations,
+    Diverged,
+    Cancelled,
+    Error
+};
+
 struct Result {
     int code;
     std::string msg;

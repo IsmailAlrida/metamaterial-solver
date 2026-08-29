@@ -1,254 +1,172 @@
 #pragma once
+
+#include <chrono>
+#include <functional>
+#include <future>
+#include <map>
 #include <stdexcept>
 #include <utility>
-#include <variant>
-#include <map>
-#include <memory>
-#include <functional> // Added missing header
-#include <atomic>
-#include <mutex>
-#include <thread> 
-#include <chrono>
-#include <future>
-#include <deque>
-#include "optimizer.hpp" 
-#include "solver.hpp"    
-#include "exporter.hpp"  
-#include "executor.hpp"  
-#include "error.hpp"
-#include "logging.hpp"
 
+#include "global_types.hpp"
+#include "logging.hpp"
 
 namespace App {
 
-    /*
-        If my dispatcher here sets state, i think it would be better to have the 
-        dispatcher itself manage its own state internally, and not let the UI 
-        manage that state.
-
-        So get this, in the UI the blocking of different UI parts goes like
-
-            if dispatcher.getState == X, do Y in the UI
-        
-        So now wh
-        
-    */
+template <typename OptimizerType, typename ExporterType>
 class Dispatcher {
-        
+
     public:
         using Callback = std::function<void()>;
-        //TODO: Add pause mechanism later to pause from either opt/solve
-        enum class State{Idle, Solving, Optimizing, Diverged, Done, Exporting, Error};
-        enum class Event{Reset, Cancel, Start, OptFail, SolveFail, SolveConverged, OptConverged, OptSuccess, Export, Error, HandleError, ExportDone, Nothing};
 
-        Dispatcher(
-            Solver& solver, 
-            Optimizer& optimizer, 
-            Exporter& exporter, 
-            const LogFunction& log
-        );
-        ~Dispatcher();
-
-        Solver& solver;
-        Optimizer& optimizer;
-        Exporter& exporter;
-        const LogFunction& log;
-
-        // FYI: We get the pair bad boys from the utility module
-        // TODO: Switch this to a flat array later for less memory fragmentation cuz like... maps be everywhere in the ram
-        // Just keep in your mind that when you dispatch inside a function, you're firing an event on the next state
-
-        std::map<std::pair<State, Event>, std::pair<State, Callback>> transitions = {
-            {{State::Idle, Event::Start}, {State::Solving, [this](){
-
-                try
-                {
-                    if (!(
-                        solver.setMesh() &&
-                        solver.assembleSolutionSpace() &&
-                        solver.solve() 
-                        )) 
-                    {
-                        // TODO: make a meaningful message propagate to the catch block, or just remove this
-                        throw;
-                    }
-                    
-                }
-                catch(const std::exception& e)
-                {
-                    std::cerr << e.what() << '\n';
-                    dispatch(Event::SolveFail);
-
-                }
-                dispatch(Event::SolveConverged);
-                
-                
-            }}},
-            {{State::Idle, Event::Error}, {State::Error, [this](){
-                // dunno
-                // Actually this might be a useless state transition
-            }}},
-            {{State::Solving, Event::SolveConverged}, {State::Optimizing, [this](){
-
-                try
-                {
-                    optimizer.optimize()
-                }
-                catch(const std::exception& e)
-                {
-                    std::cerr << e.what() << '\n';
-                    dispatch(Event::OptFail);
-                    // Im seriously starting to think we should just make one error level
-                    // If we're only using this to log
-                    // Like if i care about flags for optimizier/solver convergence/divergence/error
-                    // I could just forward flags from the app top level to the renderer and the respective classes
-                    // Instead of making these weird state transitions
-                }
-
-                // TODO: Add a convergence getter to the optimizer class.
-                // Same thing with the solver.
-                // This will help us log warning messages that certain solvers
-                // Converged instead of syntax errored or whatever
-                if (optimizer.is_done()) {
-                    // Max iters reached, or reached the target
-                    dispatch(Event::OptSuccess);
-                }
-                else {
-                    // Reiterate the optimizer
-                    dispatch(Event::OptConverged);
-                }
-                
-                
-                // FYI: doing this promises that the optimizer WILL change the global levelset implicitly
-                // And because in solver transition we reset the mesh on each forward solve, we guarantee to have the
-                // Latest mesh shape (the global one) for both the optimizer and solver
-            }}},
-            {{State::Solving, Event::SolveFail},{State::Diverged, [this](){
-                // dunno, it's enough to log and do nothing
-                log(App::LogLevel::Warning, "solver failed lul");
-                // I think we should be careful of how we name the reset
-                dispatch(Event::Reset);
-
-            }}},
-            {{State::Solving, Event::Cancel}, {State::Idle, [this](){
-                // should NOT send another callback to executor, rather just 
-                // Make it stop executing after it finishes its current run
-            }}},
-            {{State::Solving, Event::Error}, {State::Error, [this](){
-
-            }}},
-            {{State::Optimizing, Event::OptConverged}, {State::Solving, [this](){
-            }}},
-            {{State::Optimizing, Event::OptSuccess}, {State::Done, [this](){
-
-            }}},
-            {{State::Optimizing, Event::OptFail}, {State::Diverged, [this](){
-
-            }}},
-            {{State::Optimizing, Event::Cancel}, {State::Idle, [this](){
-
-            }}},
-            {{State::Optimizing, Event::Error}, {State::Error, [this](){
-
-            }}},
-            {{State::Diverged, Event::Reset}, {State::Idle, [this](){
-
-            }}},
-            {{State::Done, Event::Export}, {State::Exporting, [this](){
-
-            }}},
-            {{State::Exporting, Event::ExportDone}, {State::Idle, [this](){
-
-            }}},
-            {{State::Exporting, Event::Error}, {State::Error, [this](){
-
-            }}},
-            {{State::Exporting, Event::Cancel}, {State::Idle, [this](){
-
-            }}},
-            {{State::Error, Event::HandleError}, {State::Idle, [this](){
-
-            }}},
+        // TODO: Add pause mechanism later to pause from either opt/solve.
+        enum class State {
+            Idle,
+            Working,
+            Exporting,
+            Error
         };
 
-        
-        
-        
-        void dispatch(Event e = Event::Nothing) {
-            using namespace std::chrono_literals;
+        enum class Event {
+            Start,
+            Cancel,
+            Export
+        };
 
-            if (e == Event::Nothing) {
-                // Flush branch: Called at the end of each frame to flush the queue
-                // progress the dequeue of events until its empty
-                // Check if the worker thread is busy
-                // if busy, do nothing and return (skip)
-                // Else if the worker future is ready, consume the future with .join()
-                //      then, if queue is non-empty, dispatch event from queue FIFO-style
-
-            } 
-            else if (e not in Event class) 
-            {
-                // Skip action and log warning. Set no state.
-            }
-            else 
-            {                
-                // Dispatched event comes in, is in the list, and is a valid event
-                // Check again if the worker is busy
-                // If its busy, push to the dequeue then return
-                // Coalesce the event if we are spamming
-                if (std::find(events.begin(), events.end(), e) == events.end())
-                {
-                    events.push_back(e);
-                    return;
-
-                }
-
-                // If the worker is NOT busy
-                // Set state from the transition table first of all
-                // Then 
-                
-                std::pair<State, Event> p(state, e);
-                std::pair<State, Callback> sf = transitions.at(p);
-                // Set the state transition first
-                set_state(sf.first);
-
-                // So this is a nonblocking poll of if the worker is donezo
-                // If the worker is free, run an async 
-                if (worker.valid() 
-                    && worker.wait_for(0ms) == std::future_status::ready) {
-                    
-                    // If it's donezo
-                    try
-                    {
-                        // Consume the future!
-                        worker.get();
-                    }
-                    catch(const std::exception& e)
-                    {
-                        // And also bubble up the exceptions here
-                        // Also should probably stringifity the e.what from a c string to std string
-                        log(App::LogLevel::Error, e.what());
-                    }
-                    
-                }
-                worker = std::async(std::launch::async, sf.second);
-}
-        } 
-
-        void set_state(State s) {
-            state.store(s);
+        Dispatcher(OptimizerType& optimizer,
+                   ExporterType& exporter,
+                   const LogFunction& log)
+            : optimizer(optimizer),
+              exporter(exporter),
+              log(log),
+              transitions{
+                  {{State::Idle, Event::Start},
+                   {State::Working, [this]() {
+                       optimizer.run();
+                   }}},
+                  {{State::Working, Event::Cancel},
+                   {State::Working, [this]() {
+                       optimizer.request_cancel();
+                   }}},
+                  {{State::Idle, Event::Export},
+                   {State::Exporting, [this]() {
+                       if (!exporter.exportMesh()) {
+                           throw std::runtime_error("Mesh export failed.");
+                       }
+                   }}}
+              }
+        {
         }
 
-        State get_state() {
-            State s = state.load();
-            return s;
+        ~Dispatcher()
+        {
+            optimizer.request_cancel();
+
+            if (worker.valid()) {
+                worker.wait();
+            }
+        }
+
+        Dispatcher(const Dispatcher&) = delete;
+        Dispatcher& operator=(const Dispatcher&) = delete;
+
+        void dispatch(Event event)
+        {
+            const auto transition = transitions.find({state, event});
+
+            if (transition == transitions.end()) {
+                log(LogLevel::Warning,
+                    "Event is invalid for the current dispatcher state.");
+                return;
+            }
+
+            const auto& [next_state, callback] = transition->second;
+
+            if (event == Event::Cancel) {
+                callback();
+                return;
+            }
+
+            if (event == Event::Export && !optimizer.is_exportable()) {
+                log(LogLevel::Warning,
+                    "Export requires a completed optimization result.");
+                return;
+            }
+
+            state = next_state;
+
+            try {
+                worker = std::async(std::launch::async, callback);
+            }
+            catch (const std::exception& error) {
+                log(LogLevel::Error, error.what());
+                state = State::Error;
+            }
+        }
+
+        // Called once per frame to poll the active operation without blocking.
+        void dispatch()
+        {
+            using namespace std::chrono_literals;
+
+            if (state == State::Error && !worker.valid()) {
+                // Log the error later
+                state = State::Idle;
+                return;
+            }
+
+            if (!worker.valid()
+                || worker.wait_for(0ms) != std::future_status::ready) {
+                return;
+            }
+
+            try {
+                worker.get();
+                state = State::Idle;
+            }
+            catch (const std::exception& error) {
+                log(LogLevel::Error, error.what());
+                state = State::Error;
+            }
+            catch (...) {
+                log(LogLevel::Error, "Unknown dispatcher callback error.");
+                state = State::Error;
+            }
+        }
+
+        State get_state() const
+        {
+            return state;
+        }
+
+        SolverStatus get_solver_status() const
+        {
+            return optimizer.get_solver_status();
+        }
+
+        OptimizerStatus get_optimizer_status() const
+        {
+            return optimizer.get_status();
+        }
+
+        int get_iteration() const
+        {
+            return optimizer.get_iteration();
+        }
+
+        bool is_exportable() const
+        {
+            return optimizer.is_exportable();
         }
 
     private:
-        std::atomic<State> state;
+        OptimizerType& optimizer;
+        ExporterType& exporter;
+        const LogFunction& log;
+
+        // TODO: Switch this to a flat array later if the transition table ever grows.
+        std::map<std::pair<State, Event>, std::pair<State, Callback>> transitions;
+        State state = State::Idle;
         std::future<void> worker;
-        std::deque<Event> events;
-        std::mutex mutex; 
 };
 
 } // namespace App

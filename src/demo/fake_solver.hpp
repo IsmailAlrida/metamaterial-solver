@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 
 #include "glvis_adapter.hpp"
@@ -47,6 +48,30 @@ class FakeSolver {
                 populateResponse();
             }
             return true;
+        }
+
+        bool run()
+        {
+            status.store(SolverStatus::Working);
+
+            try {
+                if (!setMesh() || !assembleSolutionSpace()) {
+                    status.store(SolverStatus::Error);
+                    return false;
+                }
+
+                if (!solve()) {
+                    status.store(SolverStatus::Diverged);
+                    return false;
+                }
+
+                status.store(SolverStatus::Converged);
+                return true;
+            }
+            catch (...) {
+                status.store(SolverStatus::Error);
+                throw;
+            }
         }
 
         bool setMesh()
@@ -132,6 +157,11 @@ class FakeSolver {
             return true;
         }
 
+        SolverStatus get_status() const
+        {
+            return status.load();
+        }
+
     private:
         void populateResponse()
         {
@@ -173,6 +203,7 @@ class FakeSolver {
         mfem::H1_FECollection fec;
         mfem::FiniteElementSpace fespace;
         int solveCount = 0;
+        std::atomic<SolverStatus> status{SolverStatus::Idle};
 };
 
 } // namespace App::Demo

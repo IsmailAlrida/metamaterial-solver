@@ -65,6 +65,35 @@ App::Solver::~Solver()
     lset.detach();
 }
 
+bool App::Solver::run()
+{
+    status.store(SolverStatus::Working);
+
+    try {
+        if (!setMesh() || !assembleSolutionSpace()) {
+            status.store(SolverStatus::Error);
+            return false;
+        }
+
+        if (!solve()) {
+            status.store(SolverStatus::Diverged);
+            return false;
+        }
+
+        status.store(SolverStatus::Converged);
+        return true;
+    }
+    catch (...) {
+        status.store(SolverStatus::Error);
+        throw;
+    }
+}
+
+App::SolverStatus App::Solver::get_status() const
+{
+    return status.load();
+}
+
 // TODO: Do something about the mixed camelCase and snake_case. Choose one.
 // Given for this iteration we will run the following sequentially
 /* setMesh --> assembleSolutionSpace --> solve*/
@@ -601,6 +630,8 @@ bool App::Solver::assembleSolutionSpace(){
 }
 
 
+// TODO: we still have to sample the FFT into the FFT section of the solver result.
+// Also TODO: we ought o
 bool App::Solver::solve(){
 
     //TODO: We probably need to make a SolverResults array (sizeof the number of maxiterations) intiailly empty so at the app layer we can append results
