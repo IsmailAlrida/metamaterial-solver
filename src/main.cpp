@@ -4,7 +4,6 @@
 #include <string>
 #include <utility>
 
-#include "executor.hpp"
 #include "exporter.hpp"
 #include "global_types.hpp"
 #include "logging.hpp"
@@ -13,6 +12,7 @@
 #include "solver.hpp"
 #include "dispatcher.hpp"
 
+// OK so what is left?
 int main(int, char**)
 {
     try {
@@ -59,22 +59,18 @@ int main(int, char**)
             exporterSettings,
             geometry,
             log);
-        auto executor = std::make_unique<App::executor_t>(log);
-
-        auto dispatcher = std::make_unique<
-            App::Dispatcher<App::optimizer_t, App::exporter_t>>(
-                *optimizer,
-                *exporter,
-                log);
+        auto dispatcher = std::make_unique<App::dispatcher_t>(
+            *optimizer,
+            *exporter,
+            log);
         renderer->setup();
         log(App::LogLevel::Message, "Renderer initialized");
 
         while (!renderer->shouldClose) {
             dispatcher->dispatch();
-            renderer->displayFrame(*solver, *optimizer, *exporter, *executor);
+            renderer->displayFrame(*dispatcher);
         }
 
-        // TODO: Executor should own and join its backend thread in its destructor.
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "Application startup failed: " << error.what() << '\n';

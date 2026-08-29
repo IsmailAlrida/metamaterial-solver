@@ -169,10 +169,7 @@ void Renderer::setup()
     glvis = std::make_unique<GlvisAdapter>();
 }
 
-void Renderer::displayFrame(solver_t& solver,
-                            optimizer_t& optimizer,
-                            exporter_t& exporter,
-                            executor_t& executor)
+void Renderer::displayFrame(dispatcher_t& dispatcher)
 {
     if (!openglBackendInitialized) {
         throw std::logic_error("Renderer::setup() must succeed before displayFrame()");
@@ -204,18 +201,18 @@ void Renderer::displayFrame(solver_t& solver,
     ImGui_ImplSDL2_NewFrame();
     ImGui::NewFrame();
 
-    StartMenu();
+    StartMenu(dispatcher);
 
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     const ImGuiID dockspaceId = ImHashStr("MetamaterialDockSpace");
     setupInitialDockLayout(dockspaceId, *viewport);
     ImGui::DockSpaceOverViewport(dockspaceId, viewport);
 
-    SimulationSettingsPanel();
+    SimulationSettingsPanel(dispatcher);
     SimulationInfoPanel();
     glvis->draw();
-    OptimizerDesignPanel();
-    ActionPanel(solver, optimizer, exporter, executor);
+    OptimizerDesignPanel(dispatcher);
+    ActionPanel(dispatcher);
     LogPanel();
 
     ImGui::Render();
@@ -282,7 +279,7 @@ void Renderer::setupInitialDockLayout(ImGuiID dockspaceId,
     ImGui::DockBuilderFinish(dockspaceId);
 }
 
-void Renderer::StartMenu()
+void Renderer::StartMenu(const dispatcher_t& dispatcher)
 {
     if (!ImGui::BeginMainMenuBar()) {
         return;
@@ -318,21 +315,28 @@ void Renderer::StartMenu()
 
     const char* state = "IDLE";
     ImVec4 stateColor(0.52f, 0.61f, 0.72f, 1.0f);
-    if (runState == RunState::Running) {
+    if (dispatcher.get_state() == dispatcher_t::State::Working) {
         state = "RUNNING";
         stateColor = ImVec4(0.30f, 0.82f, 0.61f, 1.0f);
     }
-    else if (runState == RunState::Complete) {
-        state = "COMPLETE";
-        stateColor = ImVec4(0.35f, 0.69f, 1.0f, 1.0f);
-    }
-    else if (runState == RunState::Exporting) {
+    else if (dispatcher.get_state() == dispatcher_t::State::Exporting) {
         state = "EXPORTING";
         stateColor = ImVec4(0.78f, 0.61f, 0.28f, 1.0f);
     }
-    else if (runState == RunState::Error) {
+    else if (dispatcher.get_state() == dispatcher_t::State::Error
+        || dispatcher.get_optimizer_status() == OptimizerStatus::Diverged
+        || dispatcher.get_optimizer_status() == OptimizerStatus::Error) {
         state = "ERROR";
         stateColor = ImVec4(1.0f, 0.38f, 0.38f, 1.0f);
+    }
+    else if (dispatcher.get_optimizer_status() == OptimizerStatus::Converged
+        || dispatcher.get_optimizer_status() == OptimizerStatus::MaximumIterations) {
+        state = "COMPLETE";
+        stateColor = ImVec4(0.35f, 0.69f, 1.0f, 1.0f);
+    }
+    else if (dispatcher.get_optimizer_status() == OptimizerStatus::Cancelled) {
+        state = "CANCELLED";
+        stateColor = ImVec4(0.95f, 0.72f, 0.28f, 1.0f);
     }
 
     const float statusWidth = 245.0f;
@@ -342,7 +346,7 @@ void Renderer::StartMenu()
     ImGui::EndMainMenuBar();
 }
 
-void Renderer::SimulationSettingsPanel()
+void Renderer::SimulationSettingsPanel(const dispatcher_t& dispatcher)
 {
     if (!ImGui::Begin("Simulation Settings")) {
         ImGui::End();
@@ -351,7 +355,8 @@ void Renderer::SimulationSettingsPanel()
 
     SolverSettings& solver = settings.solverSettings;
     OptimizerSettings& optimizer = settings.optSettings;
-    const bool locked = runState == RunState::Running || runState == RunState::Exporting;
+    const bool locked = dispatcher.get_state() == dispatcher_t::State::Working
+        || dispatcher.get_state() == dispatcher_t::State::Exporting;
 
     if (locked) {
         ImGui::TextColored(
@@ -575,10 +580,14 @@ void Renderer::updateObjectiveCurve()
     }
 }
 
-void Renderer::OptimizerDesignPanel()
+void Renderer::OptimizerDesignPanel(const dispatcher_t& dispatcher)
 {
     OptimizerSettings& optimizer = settings.optSettings;
-    updateObjectiveCurve();
+    const bool locked = dispatcher.get_state() == dispatcher_t::State::Working
+        || dispatcher.get_state() == dispatcher_t::State::Exporting;
+    if (!locked) {
+        updateObjectiveCurve();
+    }
 
     if (ImGui::Begin("Frequency Response")) {
         ImGui::TextDisabled("Target objective and latest forward-solver response");
@@ -610,20 +619,24 @@ void Renderer::OptimizerDesignPanel()
                 static_cast<int>(objectiveTarget.size()),
                 {ImPlotProp_LineColor, ImVec4(0.35f, 0.69f, 1.0f, 1.0f)});
 
-            const SignalFFT& response = result.materialImpulseResponse;
-            const int responseCount = std::min(
-                static_cast<int>(response.frequency.size()),
-                static_cast<int>(response.attenuationDB.size()));
+            const auto response = std::atomic_load(
+                &result.materialImpulseResponse);
+            const int responseCount = response
+                ? std::min(
+                    static_cast<int>(response->frequency.size()),
+                    static_cast<int>(response->attenuationDB.size()))
+                : 0;
             if (responseCount > 0) {
                 ImPlot::PlotLine(
                     "Response",
-                    response.frequency.data(),
-                    response.attenuationDB.data(),
+                    response->frequency.data(),
+                    response->attenuationDB.data(),
                     responseCount,
                     {ImPlotProp_LineColor, ImVec4(0.31f, 0.86f, 0.61f, 1.0f)});
             }
 
-            if (optimizer.objectiveMode == ObjectiveMode::freeform
+            if (!locked
+                && optimizer.objectiveMode == ObjectiveMode::freeform
                 && ImPlot::IsPlotHovered()
                 && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
                 const ImPlotPoint mouse = ImPlot::GetPlotMousePos();
@@ -666,6 +679,7 @@ void Renderer::OptimizerDesignPanel()
         return;
     }
 
+    ImGui::BeginDisabled(locked);
     const bool bandgapMode = optimizer.objectiveMode == ObjectiveMode::bandgap;
     if (bandgapMode) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.38f, 0.67f, 1.0f));
@@ -759,6 +773,7 @@ void Renderer::OptimizerDesignPanel()
             optimizer.bandgaps.erase(optimizer.bandgaps.begin() + removeIndex);
         }
     }
+    ImGui::EndDisabled();
     ImGui::End();
 }
 
@@ -775,10 +790,7 @@ void Renderer::bandgapGroup(Bandgap* bandgap)
     bandgap->bandwidth = std::max(bandgap->bandwidth, 0.0f);
 }
 
-void Renderer::ActionPanel(solver_t& solver,
-                           optimizer_t& optimizer,
-                           exporter_t& exporter,
-                           executor_t& executor)
+void Renderer::ActionPanel(dispatcher_t& dispatcher)
 {
     if (!ImGui::Begin("Run Control")) {
         ImGui::End();
@@ -787,15 +799,29 @@ void Renderer::ActionPanel(solver_t& solver,
 
     const char* state = "Ready";
     ImVec4 stateColor(0.52f, 0.61f, 0.72f, 1.0f);
-    if (runState == RunState::Running) {
+    if (dispatcher.get_state() == dispatcher_t::State::Working) {
         state = "Running";
         stateColor = ImVec4(0.30f, 0.82f, 0.61f, 1.0f);
     }
-    else if (runState == RunState::Complete) {
-        state = "Iteration complete";
+    else if (dispatcher.get_state() == dispatcher_t::State::Exporting) {
+        state = "Exporting";
+        stateColor = ImVec4(0.78f, 0.61f, 0.28f, 1.0f);
+    }
+    else if (dispatcher.get_optimizer_status() == OptimizerStatus::Converged
+        || dispatcher.get_optimizer_status() == OptimizerStatus::MaximumIterations) {
+        state = dispatcher.get_optimizer_status()
+                == OptimizerStatus::MaximumIterations
+            ? "Maximum iterations reached!"
+            : "Optimization complete";
         stateColor = ImVec4(0.35f, 0.69f, 1.0f, 1.0f);
     }
-    else if (runState == RunState::Error) {
+    else if (dispatcher.get_optimizer_status() == OptimizerStatus::Cancelled) {
+        state = "Cancelled";
+        stateColor = ImVec4(0.95f, 0.72f, 0.28f, 1.0f);
+    }
+    else if (dispatcher.get_state() == dispatcher_t::State::Error
+        || dispatcher.get_optimizer_status() == OptimizerStatus::Diverged
+        || dispatcher.get_optimizer_status() == OptimizerStatus::Error) {
         state = "Operation failed";
         stateColor = ImVec4(1.0f, 0.38f, 0.38f, 1.0f);
     }
@@ -804,6 +830,7 @@ void Renderer::ActionPanel(solver_t& solver,
     ImGui::TextColored(stateColor, "%s", state);
     ImGui::Spacing();
 
+    const int completedIterations = dispatcher.get_iteration();
     const int maximumIterations = std::max(settings.optSettings.maxIterations, 1);
     const float progress = std::clamp(
         static_cast<float>(completedIterations) / static_cast<float>(maximumIterations),
@@ -823,32 +850,10 @@ void Renderer::ActionPanel(solver_t& solver,
 #endif
 
     const bool canRun = backendReady
-        && runState != RunState::Running
-        && completedIterations < maximumIterations;
+        && dispatcher.get_state() == dispatcher_t::State::Idle;
     ImGui::BeginDisabled(!canRun);
-    if (ImGui::Button("Run next iteration", ImVec2(-1.0f, 38.0f))) {
-        runState = RunState::Running;
-        bool success = false;
-        executor.execute([&]() {
-            success = solver.setup()
-                && solver.setMesh()
-                && solver.assembleSolutionSpace()
-                && solver.solve();
-            if (success) {
-                optimizer.optimize();
-                success = solver.solve();
-            }
-        });
-
-        if (success) {
-            ++completedIterations;
-            runState = RunState::Complete;
-            log(LogLevel::Message, "Optimization iteration completed successfully.");
-        }
-        else {
-            runState = RunState::Error;
-            log(LogLevel::Error, "The solver/optimizer iteration did not complete.");
-        }
+    if (ImGui::Button("Run optimization", ImVec2(-1.0f, 38.0f))) {
+        dispatcher.dispatch(dispatcher_t::Event::Start);
     }
     ImGui::EndDisabled();
     if (!backendReady && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
@@ -859,54 +864,46 @@ void Renderer::ActionPanel(solver_t& solver,
     ImGui::Button("Pause", ImVec2(-1.0f, 0.0f));
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-        ImGui::SetTooltip("Pause becomes available when Executor owns the background thread.");
+        ImGui::SetTooltip("Pause is not implemented yet.");
     }
 
-    const bool canReset = backendReady
-        && (completedIterations > 0 || runState == RunState::Error);
-    ImGui::BeginDisabled(!canReset);
-    if (ImGui::Button("Cancel and reset", ImVec2(-1.0f, 0.0f))) {
-        ImGui::OpenPopup("Reset demo run?");
+    const bool canCancel = backendReady
+        && dispatcher.get_state() == dispatcher_t::State::Working;
+    ImGui::BeginDisabled(!canCancel);
+    if (ImGui::Button("Cancel run", ImVec2(-1.0f, 0.0f))) {
+        ImGui::OpenPopup("Cancel optimization?");
     }
     ImGui::EndDisabled();
 
-    if (ImGui::BeginPopupModal("Reset demo run?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextWrapped("Discard the current synthetic run and reset its progress?");
+    if (ImGui::BeginPopupModal("Cancel optimization?", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped(
+            "Stop after the current complete iteration and keep its result?");
         ImGui::Spacing();
-        if (ImGui::Button("Reset", ImVec2(120.0f, 0.0f))) {
-            result = SolverResult{};
-            completedIterations = 0;
-            runState = RunState::Idle;
-            solver.setup();
-            log(LogLevel::Warning, "Demo run was reset.");
+        if (ImGui::Button("Cancel run", ImVec2(120.0f, 0.0f))) {
+            dispatcher.dispatch(dispatcher_t::Event::Cancel);
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
-        if (ImGui::Button("Keep run", ImVec2(120.0f, 0.0f))) {
+        if (ImGui::Button("Keep running", ImVec2(120.0f, 0.0f))) {
             ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();
     }
 
-    const bool canExport = backendReady && completedIterations > 0;
+    const bool canExport = backendReady
+        && dispatcher.get_state() == dispatcher_t::State::Idle
+        && dispatcher.is_exportable();
     ImGui::BeginDisabled(!canExport);
     if (ImGui::Button("Export mesh + manifest", ImVec2(-1.0f, 0.0f))) {
-        runState = RunState::Exporting;
-        bool success = false;
-        executor.execute([&]() {
-            success = exporter.exportMesh();
-        });
-        runState = success ? RunState::Complete : RunState::Error;
-        if (!success) {
-            log(LogLevel::Error, "Mesh export failed.");
-        }
+        dispatcher.dispatch(dispatcher_t::Event::Export);
     }
     ImGui::EndDisabled();
 
     ImGui::Separator();
 #if METAMATERIAL_DEMO_MODE
     ImGui::TextColored(ImVec4(0.35f, 0.69f, 1.0f, 1.0f), "DEMO SOURCE");
-    ImGui::TextDisabled("Deterministic data / synchronous execution");
+    ImGui::TextDisabled("Deterministic data / single background workflow");
 #else
     ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.28f, 1.0f), "REAL SOURCE / WIP");
     ImGui::TextDisabled("Serial MFEM backend");

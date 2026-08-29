@@ -29,7 +29,7 @@ if(CMAKE_CUDA_COMPILER)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 endif()
 
-option(METAMATERIAL_DEMO_MODE "Use deterministic fake solver, optimizer, exporter, and executor classes" ON)
+option(METAMATERIAL_DEMO_MODE "Use deterministic fake solver, optimizer, and exporter classes" ON)
 
 # ---------------------------------------------------------
 # AUTOMATED DEPENDENCY MANAGEMENT

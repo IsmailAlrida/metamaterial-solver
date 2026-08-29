@@ -44,7 +44,7 @@ class FakeSolver {
 
         bool setup()
         {
-            if (result.materialImpulseResponse.frequency.empty()) {
+            if (!std::atomic_load(&result.materialImpulseResponse)) {
                 populateResponse();
             }
             return true;
@@ -167,13 +167,13 @@ class FakeSolver {
         {
             constexpr int sampleCount = 256;
             constexpr float maximumFrequency = 5000.0f;
-            SignalFFT& response = result.materialImpulseResponse;
+            auto response = std::make_shared<SignalFFT>();
 
-            response.size = sampleCount;
-            response.frequency.resize(sampleCount);
-            response.attenuationDB.resize(sampleCount);
-            response.amplitude.resize(sampleCount);
-            response.phase.resize(sampleCount);
+            response->size = sampleCount;
+            response->frequency.resize(sampleCount);
+            response->attenuationDB.resize(sampleCount);
+            response->amplitude.resize(sampleCount);
+            response->phase.resize(sampleCount);
 
             const float improvement = static_cast<float>(std::min(solveCount, 8));
             for (int i = 0; i < sampleCount; ++i) {
@@ -187,11 +187,16 @@ class FakeSolver {
                     - (12.0f + improvement * 2.0f) * firstBand
                     - (17.0f + improvement * 2.4f) * secondBand;
 
-                response.frequency[i] = frequency;
-                response.attenuationDB[i] = attenuation;
-                response.amplitude[i] = std::pow(10.0f, attenuation / 20.0f);
-                response.phase[i] = 0.55f * std::sin(t * 13.0f + improvement * 0.1f);
+                response->frequency[i] = frequency;
+                response->attenuationDB[i] = attenuation;
+                response->amplitude[i] = std::pow(10.0f, attenuation / 20.0f);
+                response->phase[i] = 0.55f * std::sin(t * 13.0f + improvement * 0.1f);
             }
+
+            std::shared_ptr<const SignalFFT> publishedResponse = std::move(response);
+            std::atomic_store(
+                &result.materialImpulseResponse,
+                std::move(publishedResponse));
         }
 
         const SolverSettings& settings;

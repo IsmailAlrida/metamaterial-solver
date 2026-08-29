@@ -1,4 +1,5 @@
 #pragma once
+#include <memory>
 #include <string>
 #include <vector>
 #include <stdexcept>
@@ -57,7 +58,7 @@ struct SignalTD {
 
 struct SolverResult {
     int success = 0;
-    SignalFFT materialImpulseResponse;
+    std::shared_ptr<const SignalFFT> materialImpulseResponse;
     std::vector<mfem::Vector> U;
     std::vector<mfem::Vector> R;
 };

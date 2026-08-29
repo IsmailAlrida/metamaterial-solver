@@ -4,7 +4,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
-#include "executor.hpp"
+#include "dispatcher.hpp"
 #include "exporter.hpp"
 #include "global_types.hpp"
 #include "imgui.h"
@@ -36,13 +36,13 @@ namespace App {
     using solver_t = Demo::FakeSolver;
     using optimizer_t = Demo::FakeOptimizer;
     using exporter_t = Demo::FakeExporter;
-    using executor_t = Demo::FakeExecutor;
 #else
     using solver_t = Solver;
     using optimizer_t = Optimizer;
     using exporter_t = Exporter;
-    using executor_t = Executor;
 #endif
+
+    using dispatcher_t = Dispatcher<optimizer_t, exporter_t>;
 
     class Renderer { 
         
@@ -59,10 +59,7 @@ namespace App {
 
             // Does the boring imgui window setup and flags and stuff, App class should call this
             void setup();
-            void displayFrame(solver_t& solver,
-                              optimizer_t& optimizer,
-                              exporter_t& exporter,
-                              executor_t& executor);
+            void displayFrame(dispatcher_t& dispatcher);
             void LogPanel();
             void log(LogLevel level, std::string msg);
 
@@ -73,16 +70,6 @@ namespace App {
             SolverResult& result;
             LevelSet& geometry;
 
-            enum class RunState {
-                Idle,
-                Running,
-                Complete,
-                Exporting,
-                Error
-            };
-
-            RunState runState = RunState::Idle;
-            int completedIterations = 0;
             int lastFreeformIndex = -1;
             std::vector<float> objectiveFrequency;
             std::vector<float> objectiveTarget;
@@ -135,7 +122,7 @@ namespace App {
             // Based on user choice and call sim settings + Plots window
 
             // Landing page, will (in far future) have selecting between different design tools
-            void StartMenu();
+            void StartMenu(const dispatcher_t& dispatcher);
 
             // All the following are IMGUI function calls to construct UI
 
@@ -159,7 +146,7 @@ namespace App {
                 
 
             */
-            void SimulationSettingsPanel();
+            void SimulationSettingsPanel(const dispatcher_t& dispatcher);
 
             /*
             SimulationInfoPanel
@@ -208,7 +195,7 @@ namespace App {
                     - Feature could be folded directly into freeform mode, replacing the bandgap row of triple sandwiches with single-entry attenuation levels.
 
             */
-            void OptimizerDesignPanel();
+            void OptimizerDesignPanel(const dispatcher_t& dispatcher);
             void bandgapGroup(Bandgap* bg); // This is the bandgap UI group, linked to one bg, recursively created in an inline block horizontal overflow x auto 
 
             /*
@@ -228,12 +215,8 @@ namespace App {
                     - Run the exporter class to meshify the level set into a real mesh file viewable in 3D
                     - Possibly dispatch any other scripts/algos we might bundle with this. IM feeling peckish for an HTML form with CDNs for three.js consuming a JSON of our data to make anice little html report.
                 
-                FYI: I will make a threadpool class called Executor
             */
-            void ActionPanel(solver_t& solver,
-                             optimizer_t& optimizer,
-                             exporter_t& exporter,
-                             executor_t& executor);
+            void ActionPanel(dispatcher_t& dispatcher);
             
     };
 
