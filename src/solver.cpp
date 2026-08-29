@@ -104,6 +104,8 @@ bool App::Solver::setMesh()
     C.reset();
     K.reset();
     design_initialized = false;
+    reference_ready = false;
+    reference_outlet_pressure.clear();
     log(LogLevel::Message,
         nz > 0 ? "Created 3D Cartesian mesh." : "Created 2D Cartesian mesh.");
     return true;
@@ -136,6 +138,7 @@ bool App::Solver::assembleSolutionSpace()
     const int time_steps = static_cast<int>(rounded_steps);
     const auto* physics = std::get_if<VibroacousticSettings>(&settings.physics);
     if (physics == nullptr || physics->epsilon <= 0.0
+        || physics->epsilon > 1.0
         || physics->rho_s <= 0.0 || physics->youngs_modulus <= 0.0
         || physics->rho_a <= 0.0 || physics->c_a <= 0.0
         || physics->poisson_ratio < 0.0 || physics->poisson_ratio >= 0.5
@@ -199,8 +202,12 @@ bool App::Solver::assembleSolutionSpace()
     }
 
     Array<int> design_domain_marker(mesh->attributes.Max());
+    Array<int> fixed_air_marker(mesh->attributes.Max());
     design_domain_marker = 0;
+    fixed_air_marker = 0;
     design_domain_marker[static_cast<int>(DomainAttribute::design) - 1] = 1;
+    fixed_air_marker[static_cast<int>(DomainAttribute::inlet) - 1] = 1;
+    fixed_air_marker[static_cast<int>(DomainAttribute::outlet) - 1] = 1;
 
     // Only DOFs exclusively supported by design elements are editable.
     Array<int> design_incidence(level_set_fes->GetVSize());
@@ -302,43 +309,71 @@ bool App::Solver::assembleSolutionSpace()
             / (1.0 - physics->poisson_ratio * physics->poisson_ratio);
     const real_t mu = physics->youngs_modulus
         / (2.0 * (1.0 + physics->poisson_ratio));
-    LevelSetScaledCoefficient solid_density(
-        *lset.phi, physics->rho_s, physics->epsilon, true);
-    LevelSetScaledCoefficient solid_lambda(
-        *lset.phi, lambda, physics->epsilon, true);
-    LevelSetScaledCoefficient solid_mu(
-        *lset.phi, mu, physics->epsilon, true);
-    LevelSetScaledCoefficient acoustic_mass(
-        *lset.phi,
-        1.0 / (physics->rho_a * physics->c_a * physics->c_a),
-        physics->epsilon,
-        false);
-    LevelSetScaledCoefficient acoustic_stiffness(
-        *lset.phi, 1.0 / physics->rho_a, physics->epsilon, false);
+    ConstantCoefficient solid_density(physics->rho_s);
+    ConstantCoefficient solid_lambda(lambda);
+    ConstantCoefficient solid_mu(mu);
+    ConstantCoefficient fictitious_solid_density(
+        physics->epsilon * physics->rho_s);
+    ConstantCoefficient fictitious_solid_lambda(physics->epsilon * lambda);
+    ConstantCoefficient fictitious_solid_mu(physics->epsilon * mu);
+    ConstantCoefficient acoustic_mass(
+        1.0 / (physics->rho_a * physics->c_a * physics->c_a));
+    ConstantCoefficient acoustic_stiffness(1.0 / physics->rho_a);
 
-    // The fictitious-domain coefficients select solid or air at each
-    // quadrature point. MFEM owns the element loops and sparse assembly.
+    // Algoim supplies the cut-volume rules while the ordinary MFEM
+    // integrators and forms own the element loops and sparse assembly.
     BilinearForm Muu_form(displacement_fes.get());
-    Muu_form.AddDomainIntegrator(new VectorMassIntegrator(solid_density));
+    Muu_form.AddDomainIntegrator(new ImplicitDomainIntegrator(
+        std::make_unique<VectorMassIntegrator>(solid_density),
+        *lset.phi,
+        cut_integration_order,
+        level_set_order,
+        physics->epsilon,
+        true), design_domain_marker);
+    Muu_form.AddDomainIntegrator(
+        new VectorMassIntegrator(fictitious_solid_density), fixed_air_marker);
     Muu_form.Assemble();
     Muu_form.Finalize();
     std::unique_ptr<SparseMatrix> Muu(Muu_form.LoseMat());
 
     BilinearForm Kuu_form(displacement_fes.get());
-    Kuu_form.AddDomainIntegrator(
-        new ElasticityIntegrator(solid_lambda, solid_mu));
+    Kuu_form.AddDomainIntegrator(new ImplicitDomainIntegrator(
+        std::make_unique<ElasticityIntegrator>(solid_lambda, solid_mu),
+        *lset.phi,
+        cut_integration_order,
+        level_set_order,
+        physics->epsilon,
+        true), design_domain_marker);
+    Kuu_form.AddDomainIntegrator(new ElasticityIntegrator(
+        fictitious_solid_lambda, fictitious_solid_mu), fixed_air_marker);
     Kuu_form.Assemble();
     Kuu_form.Finalize();
     std::unique_ptr<SparseMatrix> Kuu(Kuu_form.LoseMat());
 
     BilinearForm Mpp_form(scalar_fes.get());
-    Mpp_form.AddDomainIntegrator(new MassIntegrator(acoustic_mass));
+    Mpp_form.AddDomainIntegrator(new ImplicitDomainIntegrator(
+        std::make_unique<MassIntegrator>(acoustic_mass),
+        *lset.phi,
+        cut_integration_order,
+        level_set_order,
+        physics->epsilon,
+        false), design_domain_marker);
+    Mpp_form.AddDomainIntegrator(
+        new MassIntegrator(acoustic_mass), fixed_air_marker);
     Mpp_form.Assemble();
     Mpp_form.Finalize();
     std::unique_ptr<SparseMatrix> Mpp(Mpp_form.LoseMat());
 
     BilinearForm Kpp_form(scalar_fes.get());
-    Kpp_form.AddDomainIntegrator(new DiffusionIntegrator(acoustic_stiffness));
+    Kpp_form.AddDomainIntegrator(new ImplicitDomainIntegrator(
+        std::make_unique<DiffusionIntegrator>(acoustic_stiffness),
+        *lset.phi,
+        cut_integration_order,
+        level_set_order,
+        physics->epsilon,
+        false), design_domain_marker);
+    Kpp_form.AddDomainIntegrator(
+        new DiffusionIntegrator(acoustic_stiffness), fixed_air_marker);
     Kpp_form.Assemble();
     Kpp_form.Finalize();
     std::unique_ptr<SparseMatrix> Kpp(Kpp_form.LoseMat());
@@ -527,9 +562,11 @@ bool App::Solver::solve()
         return false;
     };
 
-    for (int analysis = 0; analysis < 2; ++analysis) {
+    const int first_analysis = reference_ready ? 1 : 0;
+    for (int analysis = first_analysis; analysis < 2; ++analysis) {
         const bool reference_analysis = analysis == 0;
         if (reference_analysis) {
+            reference_ready = false;
             lset.design = 0.0;
         }
         else {
@@ -798,6 +835,7 @@ bool App::Solver::solve()
         }
 
         if (reference_analysis) {
+            reference_ready = true;
             log(LogLevel::Message,
                 "Computed the deterministic empty-duct reference response.");
         }

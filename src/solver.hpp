@@ -63,6 +63,7 @@ namespace App {
         std::vector<double> reference_outlet_pressure;
         int pressure_offset = 0;
         bool design_initialized = false;
+        bool reference_ready = false;
         std::atomic<SolverStatus> status{SolverStatus::Idle};
 
         bool smooth_level_set(

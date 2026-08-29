@@ -1,8 +1,86 @@
 #pragma once
 
+#include <memory>
+#include <utility>
+
+#include "coeffs.hpp"
 #include "mfem.hpp"
 
 namespace App {
+
+/** @brief Apply an existing MFEM bilinear integrator on one side of an
+    implicit interface.
+
+    The assembled element operator is
+
+    @f[
+      a_e = \varepsilon a_e^{\Omega_e}
+          + (1-\varepsilon)a_e^{\Omega_e^{\pm}},
+    @f]
+
+    where Algoim supplies the cut-volume rule and the wrapped MFEM integrator
+    supplies the actual mass, diffusion, or elasticity operator. A fresh
+    Algoim rule is constructed for every element assembly so a changed level
+    set can never reuse stale cut quadrature.
+ */
+class ImplicitDomainIntegrator final : public mfem::BilinearFormIntegrator
+{
+public:
+    ImplicitDomainIntegrator(
+        std::unique_ptr<mfem::BilinearFormIntegrator> integrator_,
+        mfem::GridFunction& phi_,
+        int integration_order_,
+        int level_set_order_,
+        mfem::real_t epsilon_,
+        bool positive_)
+        : integrator(std::move(integrator_)),
+          phi(phi_),
+          integration_order(integration_order_),
+          level_set_order(level_set_order_),
+          epsilon(epsilon_),
+          positive(positive_)
+    {
+    }
+
+    void AssembleElementMatrix(
+        const mfem::FiniteElement& element,
+        mfem::ElementTransformation& transformation,
+        mfem::DenseMatrix& element_matrix) override
+    {
+        mfem::DenseMatrix full_matrix;
+        integrator->SetIntRule(nullptr);
+        integrator->AssembleElementMatrix(
+            element, transformation, full_matrix);
+
+        mfem::GridFunctionCoefficient phi_coefficient(&phi);
+        NegatedCoefficient negative_phi(phi_coefficient);
+        mfem::Coefficient& cut_coefficient = positive
+            ? static_cast<mfem::Coefficient&>(phi_coefficient)
+            : static_cast<mfem::Coefficient&>(negative_phi);
+        mfem::AlgoimIntegrationRules integration_rules(
+            integration_order, cut_coefficient, level_set_order);
+        mfem::IntegrationRule cut_rule;
+        integration_rules.GetVolumeIntegrationRule(
+            transformation, cut_rule);
+
+        mfem::DenseMatrix cut_matrix;
+        integrator->SetIntegrationRule(cut_rule);
+        integrator->AssembleElementMatrix(
+            element, transformation, cut_matrix);
+
+        element_matrix = full_matrix;
+        element_matrix *= epsilon;
+        element_matrix.Add(1.0 - epsilon, cut_matrix);
+    }
+
+private:
+    std::unique_ptr<mfem::BilinearFormIntegrator> integrator;
+    mfem::GridFunction& phi;
+    int integration_order;
+    int level_set_order;
+    mfem::real_t epsilon;
+    bool positive;
+};
 
 /** @brief Assemble a scalar-normal-vector product on an implicit surface.
 
@@ -28,8 +106,8 @@ class ImplicitSurfaceNormalIntegrator
 {
 private:
     mfem::GridFunction& phi;
-    mfem::GridFunctionCoefficient phi_coefficient;
-    mfem::AlgoimIntegrationRules integration_rules;
+    int integration_order;
+    int level_set_order;
     mfem::real_t scale;
     bool transpose;
 
@@ -55,12 +133,8 @@ public:
         bool transpose_
     )
         : phi(phi_),
-          phi_coefficient(&phi_),
-          integration_rules(
-              integrationOrder,
-              phi_coefficient,
-              levelSetOrder
-          ),
+          integration_order(integrationOrder),
+          level_set_order(levelSetOrder),
           scale(scale_),
           transpose(transpose_)
     {
@@ -96,6 +170,11 @@ public:
         }
         element_matrix = 0.0;
 
+        // Constructing this locally is intentional: Algoim caches the last
+        // element rule, while optimization changes phi between assemblies.
+        mfem::GridFunctionCoefficient phi_coefficient(&phi);
+        mfem::AlgoimIntegrationRules integration_rules(
+            integration_order, phi_coefficient, level_set_order);
         mfem::IntegrationRule interface_rule;
         integration_rules.GetSurfaceIntegrationRule(
             transformation,

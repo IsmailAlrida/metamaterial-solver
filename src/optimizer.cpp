@@ -1,7 +1,5 @@
 #include "optimizer.hpp"
 
-#include <algorithm>
-
 namespace App {
 
 Optimizer::Optimizer(const OptimizerSettings& settings,
@@ -21,42 +19,24 @@ void Optimizer::run()
 {
     cancel_requested.store(false);
     iteration.store(0);
+    pass_objective.store(0.0);
+    stop_objective.store(0.0);
+    mma_bound.store(0.0);
     status.store(OptimizerStatus::Working);
 
     try {
-        if (!solver.run()) {
+        if (!solver.setMesh()
+            || !solver.assembleSolutionSpace()
+            || !solver.solve()) {
             status.store(
                 solver.get_status() == SolverStatus::Diverged
                     ? OptimizerStatus::Diverged
                     : OptimizerStatus::Error);
             return;
         }
-
-        const int maximum_iterations = std::max(settings.maxIterations, 1);
-
-        while (iteration.load() < maximum_iterations) {
-            if (cancel_requested.load()) {
-                status.store(OptimizerStatus::Cancelled);
-                return;
-            }
-
-            // TODO: Stop early when the paper's objective convergence criterion is implemented.
-            optimize();
-
-            // Finish evaluating the updated design before observing Cancel so
-            // the retained level set and solver result describe the same iteration.
-            if (!solver.run()) {
-                status.store(
-                    solver.get_status() == SolverStatus::Diverged
-                        ? OptimizerStatus::Diverged
-                        : OptimizerStatus::Error);
-                return;
-            }
-
-            iteration.fetch_add(1);
-        }
-
-        status.store(OptimizerStatus::MaximumIterations);
+        status.store(cancel_requested.load()
+            ? OptimizerStatus::Cancelled
+            : OptimizerStatus::Converged);
     }
     catch (...) {
         status.store(OptimizerStatus::Error);
@@ -64,10 +44,11 @@ void Optimizer::run()
     }
 }
 
-void Optimizer::optimize()
+bool Optimizer::optimize()
 {
-    // TODO: Implement the paper's MMA optimization loop.
-    log(LogLevel::Warning, "The optimizer is not implemented yet.");
+    // TODO: Replace this forward-only seam with the ParOpt optimization update.
+    log(LogLevel::Warning, "Optimization is not implemented in the real backend yet.");
+    return false;
 }
 
 void Optimizer::request_cancel()
@@ -97,6 +78,21 @@ bool Optimizer::is_exportable() const
         || current_status == OptimizerStatus::MaximumIterations
         || (current_status == OptimizerStatus::Cancelled
             && solver.get_status() == SolverStatus::Converged);
+}
+
+double Optimizer::get_pass_objective() const
+{
+    return pass_objective.load();
+}
+
+double Optimizer::get_stop_objective() const
+{
+    return stop_objective.load();
+}
+
+double Optimizer::get_mma_bound() const
+{
+    return mma_bound.load();
 }
 
 } // namespace App
