@@ -126,7 +126,12 @@ inline bool runNewmarkAdjoint(
         bar_v.Add(a_3, bar_v_dot);
         bar_v.Add(a_6, bar_v_ddot);
         bar_v.SetSubVector(essential_dofs, 0.0);
-        adjoint[n] = n == time_steps ? 0.0 : adjoint[n + 1];
+        if (n == time_steps) {
+            adjoint[n] = 0.0;
+        }
+        else {
+            adjoint[n] = adjoint[n + 1];
+        }
 
         const LinearSolveResult solve =
             solve_effective_transpose(bar_v, adjoint[n]);
