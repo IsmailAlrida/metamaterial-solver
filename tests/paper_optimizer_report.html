@@ -173,6 +173,13 @@
       responseLayout.yaxis = {
         title: 'S(f)', type: 'log', range: [-5, 0.3], gridcolor: colors.grid
       };
+      if (valid.length === 0) {
+        responseLayout.annotations = [{
+          text: `No FFT was published.<br>${data.failure_message || data.optimizer_status}`,
+          x: 0.5, y: 0.5, xref: 'paper', yref: 'paper', showarrow: false,
+          font: { color: '#ff748c', size: 15 }
+        }];
+      }
       Plotly.newPlot('response', traces, responseLayout, config);
     }
 
@@ -186,13 +193,15 @@
 
     function comparisonRow(label, paper, implementation, format = scientific) {
       const row = document.createElement('tr');
-      const difference = Math.abs(implementation - paper);
-      const relative = paper === 0 ? NaN : 100 * difference / Math.abs(paper);
+      const comparable = Number.isFinite(paper) && Number.isFinite(implementation);
+      const difference = comparable ? Math.abs(implementation - paper) : NaN;
+      const relative = comparable && paper !== 0
+        ? 100 * difference / Math.abs(paper) : NaN;
       appendCells(row, [
         label,
-        format(paper),
-        format(implementation),
-        format(difference),
+        Number.isFinite(paper) ? format(paper) : 'n/a',
+        Number.isFinite(implementation) ? format(implementation) : 'n/a',
+        Number.isFinite(difference) ? format(difference) : 'n/a',
         Number.isFinite(relative) ? `${relative.toFixed(4)}%` : 'n/a'
       ]);
       document.getElementById('numerical-comparison').append(row);
@@ -243,10 +252,12 @@
         && data.settings.duration_s === referenceSettings.duration_s
         && data.settings.dt_s === referenceSettings.dt_s
         && data.settings.maximum_iterations === referenceSettings.maximum_iterations;
-      const relativeObjectiveDistance = Math.sqrt((
+      const objectivesAvailable = Number.isFinite(data.objectives.final_pass)
+        && Number.isFinite(data.objectives.final_stop);
+      const relativeObjectiveDistance = objectivesAvailable ? Math.sqrt((
         ((data.objectives.final_pass - paper.final_pass) / paper.final_pass) ** 2
         + ((data.objectives.final_stop - paper.final_stop) / paper.final_stop) ** 2
-      ) / 2) * 100;
+      ) / 2) * 100 : NaN;
       addCard('Mode', data.mode);
       addCard('Gate', data.gate_passed ? 'Passed' : 'Failed', data.gate_passed ? 'pass' : 'fail');
       addCard('Identical settings', paperMode ? 'Yes' : 'No — use --paper', paperMode ? 'pass' : 'fail');
@@ -257,9 +268,11 @@
       renderResponse(data);
       renderNumericalComparison(data);
       renderExecutionTime(data);
-      status.textContent = paperMode
-        ? `Loaded paper-equivalent result · ${data.optimizer_status}`
-        : `Loaded quick result · rerun with --paper for an identical-setting comparison`;
+      status.textContent = data.failure_message
+        ? `${data.optimizer_status}: ${data.failure_message}`
+        : paperMode
+          ? `Loaded paper-equivalent result · ${data.optimizer_status}`
+          : `Loaded quick result · rerun with --paper for an identical-setting comparison`;
     }
 
     document.getElementById('file').addEventListener('change', async event => {

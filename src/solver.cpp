@@ -1,9 +1,11 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <iomanip>
 #include <limits>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -640,7 +642,7 @@ bool App::Solver::solve()
         // ponytail: GSSmoother is the low-memory baseline; replace it with a
         // block preconditioner only if the paper-default residual gate fails.
         GSSmoother K_hat_preconditioner(*K_hat);
-        GMRESSolver K_hat_solver;
+        FGMRESSolver K_hat_solver;
         K_hat_solver.SetPreconditioner(K_hat_preconditioner);
         K_hat_solver.SetOperator(*K_hat);
         K_hat_solver.iterative_mode = true;
@@ -655,6 +657,11 @@ bool App::Solver::solve()
         const int time_steps = result.timeSteps;
         const double load_scale =
             2.0 / (physics->rho_a * physics->c_a);
+        log(LogLevel::Message,
+            std::string("Solving the ")
+                + (reference_analysis ? "empty-duct reference" : "designed duct")
+                + " transient (" + std::to_string(state_size) + " unknowns, "
+                + std::to_string(time_steps) + " time steps).");
 
         Vector v(state_size);
         Vector v_dot(state_size);
@@ -676,7 +683,7 @@ bool App::Solver::solve()
         M_system.EliminateBC(
             displacement_essential_tdofs, Operator::DIAG_ONE);
         GSSmoother M_preconditioner(M_system);
-        GMRESSolver M_solver;
+        FGMRESSolver M_solver;
         M_solver.SetPreconditioner(M_preconditioner);
         M_solver.SetOperator(M_system);
         M_solver.SetKDim(50);
@@ -686,8 +693,12 @@ bool App::Solver::solve()
         M_solver.SetPrintLevel(-1);
         M_solver.Mult(h, v_ddot);
         if (!M_solver.GetConverged()) {
-            log(LogLevel::Error,
-                "The initial-acceleration solve did not converge.");
+            std::ostringstream message;
+            message << "The initial-acceleration solve did not converge: "
+                    << M_solver.GetNumIterations() << " FGMRES iterations, "
+                    << "relative residual " << std::scientific
+                    << M_solver.GetFinalRelNorm() << ".";
+            log(LogLevel::Error, message.str());
             return fail(SolverStatus::Diverged);
         }
         v_ddot.SetSubVector(displacement_essential_tdofs, 0.0);
@@ -699,8 +710,14 @@ bool App::Solver::solve()
             / std::max(1.0, h.Norml2());
         if (!std::isfinite(initial_residual)
             || initial_residual > 1.0e-9) {
-            log(LogLevel::Error,
-                "The initial-acceleration solve exceeded the residual tolerance.");
+            std::ostringstream message;
+            message << "The initial-acceleration residual gate failed: physical "
+                    << "relative residual " << std::scientific
+                    << initial_residual << ", FGMRES relative residual "
+                    << M_solver.GetFinalRelNorm() << ", "
+                    << M_solver.GetNumIterations() << " FGMRES iterations "
+                    << "(limit 1.000000e-09).";
+            log(LogLevel::Error, message.str());
             return fail(SolverStatus::Diverged);
         }
 
@@ -736,6 +753,13 @@ bool App::Solver::solve()
         Vector R_1(state_size);
         Vector R_2(state_size);
         Vector R_3(state_size);
+        Vector linear_residual(state_size);
+        double maximum_equilibrium_residual = initial_residual;
+        double maximum_velocity_residual = 0.0;
+        double maximum_acceleration_residual = 0.0;
+        double maximum_linear_residual = initial_residual;
+        double maximum_solver_residual = M_solver.GetFinalRelNorm();
+        int maximum_fgmres_iterations = M_solver.GetNumIterations();
 
         for (int n = 1; n <= time_steps; ++n) {
             h = 0.0;
@@ -765,12 +789,21 @@ bool App::Solver::solve()
             v_n = v;
             K_hat_solver.Mult(h_hat, v_n);
             if (!K_hat_solver.GetConverged()) {
-                log(LogLevel::Error,
-                    "The Newmark solve failed at time step "
-                        + std::to_string(n) + ".");
+                std::ostringstream message;
+                message << "The Newmark linear solve failed at time step " << n
+                        << ": " << K_hat_solver.GetNumIterations()
+                        << " FGMRES iterations, relative residual "
+                        << std::scientific << K_hat_solver.GetFinalRelNorm()
+                        << ".";
+                log(LogLevel::Error, message.str());
                 return fail(SolverStatus::Diverged);
             }
             v_n.SetSubVector(displacement_essential_tdofs, 0.0);
+
+            K_hat->Mult(v_n, linear_residual);
+            linear_residual -= h_hat;
+            const double linear_residual_norm = linear_residual.Norml2()
+                / std::max(1.0, h_hat.Norml2());
 
             delta_v = v_n;
             delta_v -= v;
@@ -827,17 +860,42 @@ bool App::Solver::solve()
                     + std::abs(a_5) * v_ddot.Norml2()
                     + std::abs(a_6) * delta_v.Norml2()
             });
-            if (!std::isfinite(R_1_norm)
+            if (!std::isfinite(linear_residual_norm)
+                || !std::isfinite(R_1_norm)
                 || !std::isfinite(R_2_norm)
                 || !std::isfinite(R_3_norm)
+                || linear_residual_norm > 1.0e-9
                 || R_1_norm > 1.0e-9
                 || R_2_norm > 1.0e-9
                 || R_3_norm > 1.0e-9) {
-                log(LogLevel::Error,
-                    "The Newmark residual check failed at time step "
-                        + std::to_string(n) + ".");
+                std::ostringstream message;
+                message << "The Newmark residual gate failed at time step " << n
+                        << ": linear=" << std::scientific
+                        << linear_residual_norm << ", equilibrium=" << R_1_norm
+                        << ", velocity=" << R_2_norm
+                        << ", acceleration=" << R_3_norm
+                        << ", FGMRES="
+                        << K_hat_solver.GetFinalRelNorm() << ", iterations="
+                        << K_hat_solver.GetNumIterations()
+                        << " (limit 1.000000e-09).";
+                log(LogLevel::Error, message.str());
                 return fail(SolverStatus::Diverged);
             }
+
+            maximum_linear_residual = std::max(
+                maximum_linear_residual, linear_residual_norm);
+            maximum_equilibrium_residual = std::max(
+                maximum_equilibrium_residual, R_1_norm);
+            maximum_velocity_residual = std::max(
+                maximum_velocity_residual, R_2_norm);
+            maximum_acceleration_residual = std::max(
+                maximum_acceleration_residual, R_3_norm);
+            maximum_solver_residual = std::max(
+                maximum_solver_residual,
+                K_hat_solver.GetFinalRelNorm());
+            maximum_fgmres_iterations = std::max(
+                maximum_fgmres_iterations,
+                K_hat_solver.GetNumIterations());
 
             if (!reference_analysis) {
                 Vector& U_n = result.U[n];
@@ -852,6 +910,21 @@ bool App::Solver::solve()
             v_dot = v_dot_n;
             v_ddot = v_ddot_n;
         }
+
+        std::ostringstream summary;
+        summary << "Completed the "
+                << (reference_analysis ? "empty-duct reference" : "designed duct")
+                << " transient: maximum linear/equilibrium/velocity/acceleration "
+                << "residuals = " << std::scientific
+                << maximum_linear_residual << " / "
+                << maximum_equilibrium_residual << " / "
+                << maximum_velocity_residual << " / "
+                << maximum_acceleration_residual
+                << ", maximum FGMRES residual = "
+                << maximum_solver_residual
+                << ", maximum FGMRES iterations = "
+                << maximum_fgmres_iterations << ".";
+        log(LogLevel::Message, summary.str());
 
         if (reference_analysis) {
             reference_ready = true;
@@ -971,8 +1044,11 @@ bool App::Solver::smooth_level_set(
     filtered_centers = 0.0;
     solver.Mult(filter_rhs, filtered_centers);
     if (!solver.GetConverged()) {
-        log(LogLevel::Error,
-            "The cell-centered PDE filter did not converge.");
+        std::ostringstream message;
+        message << "The cell-centered PDE filter did not converge: "
+                << solver.GetNumIterations() << " CG iterations, relative residual "
+                << std::scientific << solver.GetFinalRelNorm() << ".";
+        log(LogLevel::Error, message.str());
         return false;
     }
 
@@ -1212,7 +1288,7 @@ bool App::Solver::differentiateFrequencyResponse(
         effective_matrix_transpose.reset(Transpose(*K_hat));
     }
     GSSmoother K_hat_preconditioner(*effective_matrix_transpose);
-    GMRESSolver K_hat_solver;
+    FGMRESSolver K_hat_solver;
     K_hat_solver.SetPreconditioner(K_hat_preconditioner);
     K_hat_solver.SetOperator(*effective_matrix_transpose);
     K_hat_solver.iterative_mode = true;
@@ -1274,9 +1350,15 @@ bool App::Solver::differentiateFrequencyResponse(
         if (!K_hat_solver.GetConverged()
             || !std::isfinite(relative_adjoint_residual)
             || relative_adjoint_residual > 1.0e-9) {
-            log(LogLevel::Error,
-                "The Newmark adjoint failed its residual gate at time step "
-                    + std::to_string(n) + ".");
+            std::ostringstream message;
+            message << "The Newmark adjoint residual gate failed at time step "
+                    << n << ": physical=" << std::scientific
+                    << relative_adjoint_residual << ", FGMRES="
+                    << K_hat_solver.GetFinalRelNorm() << ", iterations="
+                    << K_hat_solver.GetNumIterations() << ", converged="
+                    << (K_hat_solver.GetConverged() ? "yes" : "no")
+                    << " (limit 1.000000e-09).";
+            log(LogLevel::Error, message.str());
             return false;
         }
         adjoint[n].SetSubVector(displacement_essential_tdofs, 0.0);
@@ -1302,7 +1384,7 @@ bool App::Solver::differentiateFrequencyResponse(
         initial_matrix_transpose.reset(Transpose(initial_matrix));
     }
     GSSmoother initial_preconditioner(*initial_matrix_transpose);
-    GMRESSolver initial_solver;
+    FGMRESSolver initial_solver;
     initial_solver.SetPreconditioner(initial_preconditioner);
     initial_solver.SetOperator(*initial_matrix_transpose);
     initial_solver.SetKDim(50);
@@ -1321,8 +1403,15 @@ bool App::Solver::differentiateFrequencyResponse(
     if (!initial_solver.GetConverged()
         || !std::isfinite(initial_adjoint_residual)
         || initial_adjoint_residual > 1.0e-9) {
-        log(LogLevel::Error,
-            "The initial-acceleration adjoint failed its residual gate.");
+        std::ostringstream message;
+        message << "The initial-acceleration adjoint residual gate failed: "
+                << "physical=" << std::scientific << initial_adjoint_residual
+                << ", FGMRES=" << initial_solver.GetFinalRelNorm()
+                << ", iterations=" << initial_solver.GetNumIterations()
+                << ", converged="
+                << (initial_solver.GetConverged() ? "yes" : "no")
+                << " (limit 1.000000e-09).";
+        log(LogLevel::Error, message.str());
         return false;
     }
     initial_adjoint.SetSubVector(displacement_essential_tdofs, 0.0);
@@ -1570,8 +1659,12 @@ bool App::Solver::differentiateFrequencyResponse(
     filter_adjoint = 0.0;
     filter_solver.Mult(filtered_gradient, filter_adjoint);
     if (!filter_solver.GetConverged()) {
-        log(LogLevel::Error,
-            "The adjoint PDE filter solve did not converge.");
+        std::ostringstream message;
+        message << "The adjoint PDE filter solve did not converge: "
+                << filter_solver.GetNumIterations()
+                << " CG iterations, relative residual " << std::scientific
+                << filter_solver.GetFinalRelNorm() << ".";
+        log(LogLevel::Error, message.str());
         return false;
     }
     Vector center_gradient(filter_adjoint.Size());

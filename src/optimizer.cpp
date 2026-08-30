@@ -492,6 +492,12 @@ bool Optimizer::optimize()
         std::unique_ptr<ParOptOptimizer, decltype(release)> optimizer(
             new ParOptOptimizer(problem.get(), options.get()), release);
         optimizer->incref();
+        log(LogLevel::Message,
+            "Starting ParOpt MMA with "
+                + std::to_string(geometry.activeDesignDofs.Size())
+                + " active design variables and "
+                + std::to_string(settings.maxIterations)
+                + " requested iterations.");
         optimizer->optimize();
 
         if (cancel_requested.load()) {

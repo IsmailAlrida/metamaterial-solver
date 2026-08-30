@@ -61,6 +61,7 @@ bool write_report_data(
     const App::Solver& solver,
     const App::LevelSet& geometry,
     const std::vector<ObjectivePoint>& history,
+    const std::string& failure_message,
     double total_wall_seconds)
 {
     if (!geometry.phi || geometry.phi->FESpace() == nullptr) {
@@ -83,8 +84,13 @@ bool write_report_data(
     const double initial_worst = history.empty()
         ? std::numeric_limits<double>::quiet_NaN()
         : std::max(history.front().pass, history.front().stop);
-    const double final_worst = std::max(
-        optimizer.get_pass_objective(), optimizer.get_stop_objective());
+    const double final_pass = history.empty()
+        ? std::numeric_limits<double>::quiet_NaN()
+        : optimizer.get_pass_objective();
+    const double final_stop = history.empty()
+        ? std::numeric_limits<double>::quiet_NaN()
+        : optimizer.get_stop_objective();
+    const double final_worst = std::max(final_pass, final_stop);
     const double initial_forward_pair_seconds = history.empty()
         ? std::numeric_limits<double>::quiet_NaN()
         : history.front().elapsedSeconds;
@@ -94,11 +100,12 @@ bool write_report_data(
             / std::max(1, history.back().iteration);
 
     output << "{\n"
-           << "  \"schema_version\": 2,\n"
+           << "  \"schema_version\": 3,\n"
            << "  \"mode\": \"" << mode << "\",\n"
            << "  \"gate_passed\": " << (gate_passed ? "true" : "false") << ",\n"
            << "  \"optimizer_status\": \""
            << status_name(optimizer.get_status()) << "\",\n"
+           << "  \"failure_message\": " << std::quoted(failure_message) << ",\n"
            << "  \"settings\": {\n"
            << "    \"nx\": " << solver_settings.nx << ",\n"
            << "    \"ny\": " << solver_settings.ny << ",\n"
@@ -142,9 +149,9 @@ bool write_report_data(
            << "    \"initial_worst\": ";
     write_number(output, initial_worst);
     output << ",\n    \"final_pass\": ";
-    write_number(output, optimizer.get_pass_objective());
+    write_number(output, final_pass);
     output << ",\n    \"final_stop\": ";
-    write_number(output, optimizer.get_stop_objective());
+    write_number(output, final_stop);
     output << ",\n    \"final_worst\": ";
     write_number(output, final_worst);
     output << "\n  },\n";
@@ -261,9 +268,13 @@ int main(int argc, char** argv)
         App::SolverResult result;
         App::Optimizer* optimizer = nullptr;
         std::vector<ObjectivePoint> history;
+        std::string failure_message;
         auto started_at = std::chrono::steady_clock::now();
         App::LogFunction log = [&](App::LogLevel level, std::string message) {
             if (level == App::LogLevel::Error) {
+                if (failure_message.empty()) {
+                    failure_message = message;
+                }
                 std::cerr << message << '\n';
             }
             else {
@@ -331,6 +342,7 @@ int main(int argc, char** argv)
                 solver,
                 geometry,
                 history,
+                failure_message,
                 total_wall_seconds)) {
             std::cerr << "Could not write the optimizer report data.\n";
             exit_code = 1;
