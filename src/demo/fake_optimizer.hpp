@@ -35,9 +35,9 @@ class FakeOptimizer {
             mmaBound.store(0.0);
 
             try {
-                if (!solver.setMesh()
-                    || !solver.assembleSolutionSpace()
-                    || !solver.solve()) {
+                if (!solver.setMesh(METAMATERIAL_USE_MPI != 0)
+                    || !solver.assembleSolutionSpace(METAMATERIAL_USE_MPI != 0)
+                    || !solver.solve(METAMATERIAL_USE_MPI != 0)) {
                     status.store(
                         solver.get_status() == SolverStatus::Diverged
                             ? OptimizerStatus::Diverged
@@ -55,9 +55,9 @@ class FakeOptimizer {
 
                     optimize();
 
-                    if (!solver.setMesh()
-                        || !solver.assembleSolutionSpace()
-                        || !solver.solve()) {
+                    if (!solver.setMesh(METAMATERIAL_USE_MPI != 0)
+                        || !solver.assembleSolutionSpace(METAMATERIAL_USE_MPI != 0)
+                        || !solver.solve(METAMATERIAL_USE_MPI != 0)) {
                         status.store(
                             solver.get_status() == SolverStatus::Diverged
                                 ? OptimizerStatus::Diverged

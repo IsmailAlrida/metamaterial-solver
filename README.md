@@ -53,14 +53,13 @@ CUDA development targets Linux and WSL2. Native Windows builds intentionally rem
 | Platform | `serial` | `parallel-cpu` | `serial-cuda` | `parallel-cpu-cuda` |
 |---|---:|---:|---:|---:|
 | Windows 11 | Yes | Yes | No | No |
-| Linux / WSL2 | Yes | Yes | Yes | Yes |
+| Linux / WSL2 | Yes | Yes | Yes | Deferred |
 
 CUDA support is Linux-only for now. Native Windows builds intentionally reject
 CUDA backends instead of applying local patches to MFEM.
 
-`parallel-cpu` currently means MFEM/OpenMP inside one process. MPI is used by
-ParOpt with `MPI_COMM_SELF`; a distributed `ParMesh`/HYPRE solver is not yet
-implemented.
+`parallel-cpu` builds the MPI `ParMesh`/HYPRE path with OpenMP inside each rank.
+The runtime solver can use either iterative FGMRES or direct MUMPS.
 
 ### Windows 11: CPU builds
 
@@ -74,7 +73,17 @@ setup.bat check
 
 The setup wrapper installs or verifies Visual Studio C++ tools, Git, CMake,
 Ninja, [Microsoft MPI](https://www.microsoft.com/en-us/download/details.aspx?id=105289),
-and [Intel oneMKL](https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl-download.html).
+[Intel oneMKL](https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl-download.html),
+and the Intel Fortran Compiler. It accepts Visual Studio's bundled CMake and
+Ninja instead of downloading duplicate copies. The parallel build checks the
+exact oneMKL ScaLAPACK and MS-MPI BLACS libraries required by MUMPS.
+
+If WinGet cannot install the Intel components, install the
+[Intel Fortran Compiler](https://www.intel.com/content/www/us/en/developer/tools/oneapi/fortran-compiler-download.html)
+and [oneMKL](https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl-download.html)
+from Intel, or use the complete
+[oneAPI Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/oneapi-toolkit-download.html).
+Keep the ScaLAPACK and BLACS components selected, then rerun `setup.bat check`.
 
 Build an optimized Release configuration:
 
@@ -98,18 +107,53 @@ build.bat deps serial
 build.bat deps parallel-cpu
 ```
 
+Launch the parallel app through MPI. Only rank zero creates the SDL/ImGui
+window; the other ranks remain solver workers:
+
+```bat
+set OMP_NUM_THREADS=4
+mpiexec -n 2 build\parallel-cpu\metamaterial_app.exe
+```
+
+Keep `MPI ranks x OMP_NUM_THREADS` at or below the machine's logical processor
+count. Prove the parallel linear algebra and forward Solver before running the
+optimizer:
+
+```bat
+mpiexec -n 2 build\parallel-cpu\mumps_smoke_check.exe
+mpiexec -n 1 build\parallel-cpu\parallel_solver_check.exe
+mpiexec -n 2 build\parallel-cpu\parallel_solver_check.exe
+mpiexec -n 4 build\parallel-cpu\parallel_solver_check.exe
+```
+
+After building, the test wrapper runs the registered serial and/or MPI checks
+without configuring or compiling anything and merges the results into
+`test-results/tests.json`:
+
+```bat
+test.bat serial
+test.bat parallel-cpu
+test.bat all
+test.bat parallel-cpu debug
+```
+
+The optimizer miniapp uses FGMRES by default and accepts `--mumps` for the
+direct-solver comparison:
+
+```bat
+mpiexec -n 2 build\parallel-cpu\paper_optimizer_miniapp.exe
+mpiexec -n 2 build\parallel-cpu\paper_optimizer_miniapp.exe --mumps
+```
+
 ### Linux / WSL2
 
-Install the ordinary C++/OpenGL/MPI prerequisites. Package names below target
-Ubuntu:
+Install the C++, Fortran, OpenGL, OpenMPI, BLAS/LAPACK, and ScaLAPACK
+prerequisites. `setup.sh` is idempotent and currently targets Ubuntu/Debian:
 
 ```bash
-sudo apt update
-sudo apt install -y build-essential cmake ninja-build git curl pkg-config \
-  gfortran openmpi-bin libopenmpi-dev libopenblas-dev liblapack-dev \
-  libgl1-mesa-dev libx11-dev libxext-dev libxrandr-dev \
-  libxinerama-dev libxcursor-dev libxi-dev mesa-utils
-chmod +x build.sh
+chmod +x setup.sh build.sh
+./setup.sh
+./setup.sh check
 ```
 
 CPU builds:
@@ -121,12 +165,23 @@ CPU builds:
 ./build.sh deps serial
 ```
 
+Run the MPI backend with the same rank/worker model:
+
+```bash
+OMP_NUM_THREADS=4 mpiexec -n 2 build/linux/parallel-cpu/metamaterial_app
+mpiexec -n 2 build/linux/parallel-cpu/mumps_smoke_check
+mpiexec -n 1 build/linux/parallel-cpu/parallel_solver_check
+mpiexec -n 2 build/linux/parallel-cpu/parallel_solver_check
+mpiexec -n 4 build/linux/parallel-cpu/parallel_solver_check
+./test.sh parallel-cpu
+./test.sh all
+```
+
 CUDA builds additionally require a working Linux CUDA toolkit with `nvcc` on
 `PATH` and a compatible NVIDIA driver:
 
 ```bash
 ./build.sh serial-cuda
-./build.sh parallel-cpu-cuda
 ```
 
 An optional CUDA architecture can be supplied after the backend; Blackwell is

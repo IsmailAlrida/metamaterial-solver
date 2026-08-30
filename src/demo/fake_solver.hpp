@@ -13,11 +13,12 @@ namespace App::Demo {
 
 class FakeSolver {
     public:
-        FakeSolver(const SolverSettings& settings,
-                   const OptimizerSettings& optimizerSettings,
+        FakeSolver(SolverSettings& settings,
+                   OptimizerSettings& optimizerSettings,
                    LevelSet& lset,
                    SolverResult& result,
-                   const LogFunction& log)
+                   const LogFunction& log,
+                   bool = false)
             : settings(settings),
               optimizerSettings(optimizerSettings),
               lset(lset),
@@ -48,10 +49,20 @@ class FakeSolver {
             return true;
         }
 
+        bool setMesh(bool)
+        {
+            return setMesh();
+        }
+
         bool assembleSolutionSpace()
         {
             log(LogLevel::Message, "MFEM Example 1 prepared the Poisson problem.");
             return true;
+        }
+
+        bool assembleSolutionSpace(bool)
+        {
+            return assembleSolutionSpace();
         }
 
         bool solve()
@@ -126,6 +137,19 @@ class FakeSolver {
             status.store(SolverStatus::Converged);
             log(LogLevel::Message, "MFEM Example 1 solved and published its demo response.");
             return true;
+        }
+
+        bool solve(bool)
+        {
+            return solve();
+        }
+
+        void parallelWorkerLoop()
+        {
+        }
+
+        void shutdownParallelWorkers()
+        {
         }
 
         SolverStatus get_status() const

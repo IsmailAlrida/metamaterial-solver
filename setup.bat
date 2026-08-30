@@ -22,37 +22,50 @@ if errorlevel 1 (
 )
 
 call :ensure_tool git.exe Git.Git Git
-if errorlevel 1 exit /b 1
-call :ensure_tool cmake.exe Kitware.CMake CMake
-if errorlevel 1 exit /b 1
-call :ensure_tool ninja.exe Ninja-build.Ninja Ninja
-if errorlevel 1 exit /b 1
+if errorlevel 1 goto failed
 call :ensure_visual_studio
-if errorlevel 1 exit /b 1
+if errorlevel 1 goto failed
+call :ensure_tool cmake.exe Kitware.CMake CMake "%VS_INSTALL%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+if errorlevel 1 goto failed
+call :ensure_tool ninja.exe Ninja-build.Ninja Ninja "%VS_INSTALL%\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"
+if errorlevel 1 goto failed
 if exist "%ProgramFiles%\Microsoft MPI\Bin\mpiexec.exe" (
     echo Microsoft MPI runtime is already available.
 ) else (
     call :ensure_package Microsoft.msmpi "Microsoft MPI runtime"
-    if errorlevel 1 exit /b 1
+    if errorlevel 1 goto failed
 )
 call :ensure_mpi_sdk
-if errorlevel 1 exit /b 1
+if errorlevel 1 goto failed
 call :ensure_mkl
-if errorlevel 1 exit /b 1
+if errorlevel 1 goto failed
+call :ensure_fortran
+if errorlevel 1 goto failed
 call :record_sdk_environment
 
 echo.
 echo Setup completed. Open a new terminal, then run:
 echo   setup.bat check
 echo   build.bat deps serial
+echo   build.bat deps parallel-cpu
 echo.
 pause
 exit /b 0
+
+:failed
+echo.
+echo Setup failed. Fix the reported prerequisite, then run setup.bat again.
+pause
+exit /b 1
 
 :ensure_tool
 where %~1 >nul 2>nul
 if not errorlevel 1 (
     echo %~3 is already available.
+    exit /b 0
+)
+if exist "%~4" (
+    echo %~3 is already available through Visual Studio.
     exit /b 0
 )
 call :ensure_package %~2 "%~3"
@@ -79,6 +92,8 @@ if errorlevel 1 (
     echo Failed to install the Visual Studio C++ build tools.
     exit /b 1
 )
+call :find_visual_studio
+if not defined VS_INSTALL exit /b 1
 exit /b 0
 
 :ensure_mpi_sdk
@@ -110,13 +125,40 @@ if errorlevel 1 (
 exit /b 0
 
 :ensure_mkl
-if exist "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\include\mkl.h" goto mkl_available
+if not exist "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\include\mkl.h" goto install_mkl
+if not exist "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\lib\mkl_scalapack_lp64.lib" goto install_mkl
+if not exist "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\lib\mkl_blacs_msmpi_lp64.lib" goto install_mkl
+if not exist "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\bin\mkl_scalapack_lp64.2.dll" goto install_mkl
+if not exist "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\bin\mkl_blacs_msmpi_lp64.2.dll" goto install_mkl
+goto mkl_available
+
+:install_mkl
 call :ensure_package Intel.oneMKL "Intel oneMKL"
-exit /b %errorlevel%
+if errorlevel 1 exit /b 1
+if not exist "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\lib\mkl_scalapack_lp64.lib" goto incomplete_mkl
+if not exist "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\lib\mkl_blacs_msmpi_lp64.lib" goto incomplete_mkl
+exit /b 0
+
+:incomplete_mkl
+echo Intel oneMKL is installed without the ScaLAPACK/MS-MPI BLACS components.
+echo Repair the Intel oneMKL installation, then run setup.bat again.
+exit /b 1
 
 :mkl_available
 echo Intel oneMKL is already available.
 exit /b 0
+
+:ensure_fortran
+if exist "%ProgramFiles(x86)%\Intel\oneAPI\compiler\latest\bin\ifx.exe" (
+    echo Intel Fortran Compiler is already available.
+    exit /b 0
+)
+call :ensure_package Intel.FortranCompiler "Intel Fortran Compiler"
+if errorlevel 1 exit /b 1
+if exist "%ProgramFiles(x86)%\Intel\oneAPI\compiler\latest\bin\ifx.exe" exit /b 0
+echo Intel Fortran Compiler installed, but ifx.exe was not found.
+echo Repair the Intel Fortran Compiler installation, then run setup.bat again.
+exit /b 1
 
 :record_sdk_environment
 set "MPI_INC=%ProgramFiles(x86)%\Microsoft SDKs\MPI\Include"
@@ -129,16 +171,18 @@ if exist "%MKL_PATH%\include\mkl.h" (
     setx.exe /M MKLROOT "%MKL_PATH%" >nul
     powershell.exe -NoProfile -Command "$mklBin = '%MKL_PATH%\bin'; $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine'); if (($machinePath -split ';') -notcontains $mklBin) { [Environment]::SetEnvironmentVariable('Path', $machinePath.TrimEnd(';') + ';' + $mklBin, 'Machine') }"
 )
+set "COMPILER_PATH=%ProgramFiles(x86)%\Intel\oneAPI\compiler\latest"
+if exist "%COMPILER_PATH%\bin\ifx.exe" powershell.exe -NoProfile -Command "$compilerBin = '%COMPILER_PATH%\bin'; $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine'); if (($machinePath -split ';') -notcontains $compilerBin) { [Environment]::SetEnvironmentVariable('Path', $machinePath.TrimEnd(';') + ';' + $compilerBin, 'Machine') }"
 exit /b 0
 
 :check
 set "MISSING=0"
 echo Checking native build prerequisites...
-call :check_tool git.exe "%ProgramFiles%\Git\cmd\git.exe" Git
-call :check_tool cmake.exe "%ProgramFiles%\CMake\bin\cmake.exe" CMake
-call :check_tool ninja.exe "%LOCALAPPDATA%\Microsoft\WinGet\Links\ninja.exe" Ninja
-
 call :find_visual_studio
+call :check_tool git.exe "%ProgramFiles%\Git\cmd\git.exe" Git
+call :check_tool cmake.exe "!VS_INSTALL!\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" CMake
+call :check_tool ninja.exe "!VS_INSTALL!\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe" Ninja
+
 if defined VS_INSTALL (
     echo [ok] Visual Studio C++ tools: !VS_INSTALL!
 ) else (
@@ -152,6 +196,11 @@ call :check_file "%ProgramFiles(x86)%\Microsoft SDKs\MPI\Lib\x64\msmpi.lib" "Mic
 call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\include\mkl.h" "Intel oneMKL headers"
 call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\lib\mkl_core.lib" "Intel oneMKL libraries"
 call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\bin\mkl_sequential.3.dll" "Intel oneMKL runtime"
+call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\lib\mkl_scalapack_lp64.lib" "Intel oneMKL ScaLAPACK library"
+call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\lib\mkl_blacs_msmpi_lp64.lib" "Intel oneMKL MS-MPI BLACS library"
+call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\bin\mkl_scalapack_lp64.2.dll" "Intel oneMKL ScaLAPACK runtime"
+call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\bin\mkl_blacs_msmpi_lp64.2.dll" "Intel oneMKL MS-MPI BLACS runtime"
+call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\compiler\latest\bin\ifx.exe" "Intel Fortran Compiler"
 
 if not "!MISSING!"=="0" (
     echo.
@@ -197,6 +246,6 @@ exit /b 0
 :usage
 echo Usage: setup.bat [install^|check^|help]
 echo.
-echo   install  Install the Windows C++ toolchain, MS-MPI, and oneMKL.
+echo   install  Install the Windows C++/Fortran toolchain, MS-MPI, and oneMKL.
 echo   check    Check prerequisites without changing the machine.
 exit /b 1

@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.22)
+cmake_minimum_required(VERSION 3.25)
 
 set(_default_mfem_backend "serial")
 if(DEFINED ENV{METAMATERIAL_MFEM_BACKEND} AND NOT "$ENV{METAMATERIAL_MFEM_BACKEND}" STREQUAL "")
@@ -11,7 +11,16 @@ if(NOT METAMATERIAL_MFEM_BACKEND IN_LIST _valid_mfem_backends)
   message(FATAL_ERROR "METAMATERIAL_MFEM_BACKEND must be one of: serial, serial-cuda, parallel-cpu, parallel-cpu-cuda")
 endif()
 
+set(METAMATERIAL_USE_MPI OFF)
+if(METAMATERIAL_MFEM_BACKEND MATCHES "^parallel-cpu")
+  set(METAMATERIAL_USE_MPI ON)
+endif()
+
 project(metamaterial_solver LANGUAGES C CXX)
+
+if(METAMATERIAL_USE_MPI)
+  enable_language(Fortran)
+endif()
 
 if(WIN32 AND METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
   message(FATAL_ERROR
@@ -59,6 +68,7 @@ FetchContent_MakeAvailable(Eigen3)
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 set(SDL_STATIC ON CACHE BOOL "" FORCE)
 set(SDL_TEST OFF CACHE BOOL "" FORCE)
+set(SDL2_DISABLE_UNINSTALL ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
   SDL2
   GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
@@ -104,11 +114,7 @@ FetchContent_MakeAvailable(implot)
 # 6. Fetch FFTW
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
-if(METAMATERIAL_MFEM_BACKEND MATCHES "parallel-cpu")
-  set(ENABLE_OPENMP ON CACHE BOOL "" FORCE)
-else()
-  set(ENABLE_OPENMP OFF CACHE BOOL "" FORCE)
-endif()
+set(ENABLE_OPENMP OFF CACHE BOOL "" FORCE)
 set(ENABLE_THREADS OFF CACHE BOOL "" FORCE)
 set(WITH_COMBINED_THREADS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
@@ -141,12 +147,89 @@ FetchContent_MakeAvailable(nlopt)
 
 # 8. Fetch ParOpt and its METIS dependency. ParOpt requires a system MPI SDK
 # and BLAS/LAPACK implementation; setup.bat installs MS-MPI and oneMKL.
-find_package(MPI REQUIRED COMPONENTS CXX)
+if(WIN32 AND EXISTS "$ENV{ProgramFiles}/Microsoft MPI/Bin/mpiexec.exe")
+  set(MPIEXEC_EXECUTABLE
+      "$ENV{ProgramFiles}/Microsoft MPI/Bin/mpiexec.exe"
+      CACHE FILEPATH "Microsoft MPI launcher" FORCE)
+  set(MPI_GUESS_LIBRARY_NAME MSMPI CACHE STRING "Windows MPI implementation" FORCE)
+  file(TO_CMAKE_PATH "$ENV{MSMPI_INC}" _msmpi_include)
+  set(_msmpi_fortran_includes "${_msmpi_include};${_msmpi_include}/x64")
+  if(NOT "${MPI_Fortran_ADDITIONAL_INCLUDE_DIRS}" STREQUAL
+         "${_msmpi_fortran_includes}")
+    foreach(_probe F77_HEADER F90_MODULE F08_MODULE F77_HEADER_NOKIND)
+      unset(MPI_RESULT_Fortran_test_mpi_${_probe} CACHE)
+    endforeach()
+  endif()
+  set(MPI_Fortran_ADDITIONAL_INCLUDE_DIRS "${_msmpi_fortran_includes}"
+      CACHE STRING "Microsoft MPI Fortran include directories" FORCE)
+  unset(_msmpi_fortran_includes)
+  unset(_msmpi_include)
+endif()
+if(MSVC AND METAMATERIAL_USE_MPI)
+  set(OpenMP_RUNTIME_MSVC llvm)
+  if(DEFINED OpenMP_CXX_FLAGS AND
+     NOT OpenMP_CXX_FLAGS MATCHES "openmp:llvm")
+    unset(OpenMP_C_FLAGS CACHE)
+    unset(OpenMP_CXX_FLAGS CACHE)
+    unset(OpenMP_C_SPEC_DATE CACHE)
+    unset(OpenMP_CXX_SPEC_DATE CACHE)
+  endif()
+endif()
+if(METAMATERIAL_USE_MPI)
+  find_package(MPI REQUIRED COMPONENTS C CXX Fortran)
+  find_package(OpenMP REQUIRED COMPONENTS C CXX Fortran)
+else()
+  find_package(MPI REQUIRED COMPONENTS CXX)
+endif()
 if(WIN32 AND NOT DEFINED BLA_VENDOR)
   set(BLA_VENDOR Intel10_64lp_seq CACHE STRING "BLAS/LAPACK implementation" FORCE)
 endif()
 find_package(BLAS REQUIRED)
 find_package(LAPACK REQUIRED)
+
+# MUMPS is a normal compiled dependency of the true MPI backend. The upstream
+# superbuild builds the complete double-precision parallel library and exposes
+# MUMPS::MUMPS; MFEM and every parallel-cpu executable link it at build time.
+# The runtime setting only chooses between already-linked MUMPS and FGMRES.
+if(METAMATERIAL_USE_MPI)
+  set(BUILD_SINGLE OFF CACHE BOOL "" FORCE)
+  set(BUILD_DOUBLE ON CACHE BOOL "" FORCE)
+  set(BUILD_COMPLEX OFF CACHE BOOL "" FORCE)
+  set(BUILD_COMPLEX16 OFF CACHE BOOL "" FORCE)
+  set(MUMPS_parallel ON CACHE BOOL "" FORCE)
+  set(MUMPS_openmp ON CACHE BOOL "" FORCE)
+  set(MUMPS_scalapack ON CACHE BOOL "" FORCE)
+  set(MUMPS_scotch OFF CACHE BOOL "" FORCE)
+  set(MUMPS_ptscotch OFF CACHE BOOL "" FORCE)
+  set(MUMPS_metis OFF CACHE BOOL "" FORCE)
+  set(MUMPS_parmetis OFF CACHE BOOL "" FORCE)
+  set(MUMPS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+
+  FetchContent_Declare(
+    mumps_superbuild
+    GIT_REPOSITORY https://github.com/scivision/mumps-superbuild.git
+    GIT_TAG        v5.9.1.0
+    SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/mumps-superbuild-src"
+    BINARY_DIR     "${CMAKE_BINARY_DIR}/deps/mumps-build"
+  )
+  FetchContent_MakeAvailable(mumps_superbuild)
+
+  if(NOT TARGET MUMPS::MUMPS)
+    message(FATAL_ERROR "The pinned MUMPS superbuild did not expose MUMPS::MUMPS.")
+  endif()
+  # MFEM exports its build-tree target and therefore requires every linked
+  # non-imported dependency to belong to a build-tree export as well.
+  export(EXPORT MUMPS-targets
+      FILE "${CMAKE_BINARY_DIR}/deps/mumps-build/MUMPSBuildTargets.cmake"
+      NAMESPACE MUMPS::)
+  get_target_property(_mumps_include_dirs
+    MUMPS::MUMPS INTERFACE_INCLUDE_DIRECTORIES)
+  set(MUMPS_FOUND ON CACHE BOOL "" FORCE)
+  # MFEM's FindMUMPS strips dots for numeric preprocessor comparisons.
+  set(MUMPS_VERSION 591 CACHE STRING "" FORCE)
+  set(MUMPS_INCLUDE_DIRS "${_mumps_include_dirs}" CACHE STRING "" FORCE)
+  set(MUMPS_LIBRARIES MUMPS::MUMPS CACHE STRING "" FORCE)
+endif()
 
 FetchContent_Declare(
   gklib
@@ -301,11 +384,47 @@ set(BLITZ_INCLUDE_DIRS "${blitz_BINARY_DIR};${blitz_SOURCE_DIR}" CACHE STRING ""
 set(BLITZ_LIBRARIES "" CACHE STRING "" FORCE)
 set(ALGOIM_DIR "${algoim_SOURCE_DIR}" CACHE PATH "" FORCE)
 
+if(METAMATERIAL_USE_MPI)
+  set(HYPRE_ENABLE_MPI ON CACHE BOOL "" FORCE)
+  set(HYPRE_ENABLE_OPENMP ON CACHE BOOL "" FORCE)
+  set(HYPRE_ENABLE_FORTRAN OFF CACHE BOOL "" FORCE)
+  set(HYPRE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(HYPRE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(
+    hypre
+    GIT_REPOSITORY https://github.com/hypre-space/hypre.git
+    GIT_TAG        v2.33.0
+    SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/hypre-src"
+    BINARY_DIR     "${CMAKE_BINARY_DIR}/deps/hypre-build"
+    SOURCE_SUBDIR  src
+  )
+  FetchContent_MakeAvailable(hypre)
+  if(NOT TARGET HYPRE)
+    message(FATAL_ERROR "The pinned HYPRE source did not expose the HYPRE target.")
+  endif()
+  if(MSVC)
+    # MSVC does not define __STDC_VERSION__ in its default C mode, so HYPRE's
+    # legacy PILUT guard misses stdbool.h. Force that standard header into only
+    # the two affected translation units and preserve every cached HYPRE object.
+    set_source_files_properties(
+        "${hypre_SOURCE_DIR}/src/distributed_ls/pilut/trifactor.c"
+        "${hypre_SOURCE_DIR}/src/distributed_ls/pilut/parilut.c"
+        TARGET_DIRECTORY HYPRE
+        PROPERTIES COMPILE_OPTIONS "/FIstdbool.h")
+  endif()
+  get_target_property(_hypre_include_dirs HYPRE INTERFACE_INCLUDE_DIRECTORIES)
+  set(HYPRE_FOUND ON CACHE BOOL "" FORCE)
+  set(HYPRE_VERSION 23300 CACHE STRING "" FORCE)
+  set(HYPRE_INCLUDE_DIRS "${_hypre_include_dirs}" CACHE STRING "" FORCE)
+  set(HYPRE_LIBRARIES HYPRE CACHE STRING "" FORCE)
+endif()
+
 # 10. Fetch MFEM (Finite Element Method Library)
-set(MFEM_USE_MPI OFF CACHE BOOL "" FORCE)
+set(MFEM_USE_MPI ${METAMATERIAL_USE_MPI} CACHE BOOL "" FORCE)
 set(MFEM_FETCH_TPLS OFF CACHE BOOL "" FORCE)
 set(MFEM_USE_METIS OFF CACHE BOOL "" FORCE)
 set(MFEM_USE_LAPACK OFF CACHE BOOL "" FORCE)
+set(MFEM_USE_MUMPS ${METAMATERIAL_USE_MPI} CACHE BOOL "" FORCE)
 set(MFEM_USE_ALGOIM ON CACHE BOOL "" FORCE)
 if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
   set(MFEM_USE_CUDA ON CACHE BOOL "" FORCE)
@@ -317,7 +436,6 @@ if(METAMATERIAL_MFEM_BACKEND MATCHES "parallel-cpu")
 else()
   set(MFEM_USE_OPENMP OFF CACHE BOOL "" FORCE)
 endif()
-# TODO: Add MPI/HPC builds later with hypre/METIS. Keep normal local builds to serial/OpenMP and Linux CUDA.
 set(MFEM_ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(MFEM_ENABLE_MINIAPPS OFF CACHE BOOL "" FORCE)
 set(MFEM_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
@@ -333,9 +451,6 @@ FetchContent_Declare(
 set(CMAKE_SKIP_INSTALL_RULES ON)
 FetchContent_MakeAvailable(mfem)
 set(CMAKE_SKIP_INSTALL_RULES OFF)
-if(METAMATERIAL_MFEM_BACKEND MATCHES "parallel-cpu")
-  find_package(OpenMP REQUIRED)
-endif()
 find_package(OpenGL REQUIRED)
 
 # GLVis is a library internally, but its standalone build expects system copies
@@ -442,6 +557,7 @@ add_executable(metamaterial_app
 target_compile_definitions(metamaterial_app PRIVATE
     METAMATERIAL_DEMO_MODE=$<BOOL:${METAMATERIAL_DEMO_MODE}>
     METAMATERIAL_USE_CUDA=$<BOOL:${MFEM_USE_CUDA}>
+    METAMATERIAL_USE_MPI=$<BOOL:${METAMATERIAL_USE_MPI}>
 )
 message(STATUS "Interactive demo mode: ${METAMATERIAL_DEMO_MODE}")
 
@@ -472,8 +588,8 @@ if(TARGET SDL2::SDL2main)
   target_link_libraries(metamaterial_app PRIVATE SDL2::SDL2main)
 endif()
 
-if(METAMATERIAL_MFEM_BACKEND MATCHES "parallel-cpu" AND TARGET fftw3_omp)
-  target_link_libraries(metamaterial_app PRIVATE fftw3_omp OpenMP::OpenMP_CXX)
+if(METAMATERIAL_MFEM_BACKEND MATCHES "parallel-cpu")
+  target_link_libraries(metamaterial_app PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
 if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
@@ -485,6 +601,8 @@ if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
   )
 endif()
 
+enable_testing()
+
 add_executable(dispatcher_backend_check
     tests/dispatcher_backend_check.cpp
 )
@@ -492,36 +610,41 @@ target_include_directories(dispatcher_backend_check PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 target_link_libraries(dispatcher_backend_check PRIVATE mfem)
+add_test(NAME dispatcher_backend COMMAND dispatcher_backend_check)
 
 add_executable(paropt_smoke_check
     tests/paropt_smoke_check.cpp
 )
 target_link_libraries(paropt_smoke_check PRIVATE ParOpt::paropt)
+add_test(NAME paropt_smoke COMMAND paropt_smoke_check)
 
-add_executable(solver_adjoint_check
-    tests/solver_adjoint_check.cpp
-    src/solver.cpp
-)
-target_include_directories(solver_adjoint_check PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    "${fftw_SOURCE_DIR}/api"
-)
-target_link_libraries(solver_adjoint_check PRIVATE fftw3 mfem)
-target_compile_definitions(solver_adjoint_check PRIVATE
-    METAMATERIAL_USE_CUDA=$<BOOL:${MFEM_USE_CUDA}>
-)
-if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
-  target_link_libraries(solver_adjoint_check PRIVATE
-      CUDA::cudart CUDA::cublas CUDA::cusparse CUDA::cusolver)
-endif()
-if(METAMATERIAL_MFEM_BACKEND MATCHES "parallel-cpu")
-  target_link_libraries(solver_adjoint_check PRIVATE OpenMP::OpenMP_CXX)
+if(NOT METAMATERIAL_USE_MPI)
+  add_executable(solver_adjoint_check
+      tests/solver_adjoint_check.cpp
+      src/solver.cpp
+      src/par_solver.cpp
+  )
+  target_include_directories(solver_adjoint_check PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src"
+      "${fftw_SOURCE_DIR}/api"
+  )
+  target_link_libraries(solver_adjoint_check PRIVATE fftw3 mfem)
+  target_compile_definitions(solver_adjoint_check PRIVATE
+      METAMATERIAL_USE_CUDA=$<BOOL:${MFEM_USE_CUDA}>
+      METAMATERIAL_USE_MPI=0
+  )
+  if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
+    target_link_libraries(solver_adjoint_check PRIVATE
+        CUDA::cudart CUDA::cublas CUDA::cusparse CUDA::cusolver)
+  endif()
+  add_test(NAME solver_adjoint COMMAND solver_adjoint_check)
 endif()
 
 add_executable(paper_optimizer_miniapp
     tests/paper_optimizer_miniapp.cpp
     src/optimizer.cpp
     src/solver.cpp
+    src/par_solver.cpp
 )
 target_include_directories(paper_optimizer_miniapp PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -535,6 +658,7 @@ target_link_libraries(paper_optimizer_miniapp PRIVATE
 )
 target_compile_definitions(paper_optimizer_miniapp PRIVATE
     METAMATERIAL_USE_CUDA=$<BOOL:${MFEM_USE_CUDA}>
+    METAMATERIAL_USE_MPI=$<BOOL:${METAMATERIAL_USE_MPI}>
 )
 if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
   target_link_libraries(paper_optimizer_miniapp PRIVATE
@@ -542,4 +666,46 @@ if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
 endif()
 if(METAMATERIAL_MFEM_BACKEND MATCHES "parallel-cpu")
   target_link_libraries(paper_optimizer_miniapp PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
+if(METAMATERIAL_USE_MPI)
+  add_executable(mumps_smoke_check tests/mumps_smoke_check.cpp)
+  target_link_libraries(mumps_smoke_check PRIVATE mfem)
+
+  add_test(NAME mumps_2_ranks
+      COMMAND "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}" 2
+              ${MPIEXEC_PREFLAGS} $<TARGET_FILE:mumps_smoke_check>
+              ${MPIEXEC_POSTFLAGS})
+  set_tests_properties(mumps_2_ranks PROPERTIES
+      PROCESSORS 2
+      ENVIRONMENT "OMP_NUM_THREADS=2")
+
+  add_executable(parallel_solver_check
+      tests/parallel_solver_check.cpp
+      src/solver.cpp
+      src/par_solver.cpp
+  )
+  target_include_directories(parallel_solver_check PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src"
+      "${fftw_SOURCE_DIR}/api"
+  )
+  target_link_libraries(parallel_solver_check PRIVATE
+      fftw3
+      mfem
+      OpenMP::OpenMP_CXX
+  )
+  target_compile_definitions(parallel_solver_check PRIVATE
+      METAMATERIAL_USE_CUDA=0
+      METAMATERIAL_USE_MPI=1
+  )
+
+  foreach(_ranks 1 2 4)
+    add_test(NAME parallel_solver_${_ranks}_ranks
+        COMMAND "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}" ${_ranks}
+                ${MPIEXEC_PREFLAGS} $<TARGET_FILE:parallel_solver_check>
+                ${MPIEXEC_POSTFLAGS})
+    set_tests_properties(parallel_solver_${_ranks}_ranks PROPERTIES
+        PROCESSORS ${_ranks}
+        ENVIRONMENT "OMP_NUM_THREADS=2")
+  endforeach()
 endif()

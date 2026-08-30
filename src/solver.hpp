@@ -29,6 +29,11 @@ namespace App {
         double stopAdjointSeconds = 0.0;
         double cutDifferentiationSeconds = 0.0;
         double filterAdjointSeconds = 0.0;
+        double mumpsInitialFactorizationSeconds = 0.0;
+        double mumpsEffectiveFactorizationSeconds = 0.0;
+        double mumpsSolveSeconds = 0.0;
+        double maximumForwardResidual = 0.0;
+        int mpiRanks = 1;
         long long forwardFgmresIterations = 0;
         int forwardFgmresSolves = 0;
         int maximumForwardFgmresIterations = 0;
@@ -43,17 +48,29 @@ namespace App {
 
     public:
 
-        Solver(const SolverSettings& settings,
-               const OptimizerSettings& optimizer_settings,
+        Solver(SolverSettings& settings,
+               OptimizerSettings& optimizer_settings,
                LevelSet& lset,
                SolverResult& result,
-               const LogFunction& log);
+               const LogFunction& log,
+               bool manage_parallel_workers = false);
 
         ~Solver();
 
         bool setMesh();
         bool assembleSolutionSpace();
         bool solve();
+        bool setMesh(bool parallel);
+        bool assembleSolutionSpace(bool parallel);
+        bool solve(bool parallel);
+        bool differentiateFrequencyResponses(
+            const std::vector<std::complex<double>>& pass_spectrum_derivative,
+            const std::vector<std::complex<double>>& stop_spectrum_derivative,
+            mfem::Vector& pass_design_gradient,
+            mfem::Vector& stop_design_gradient,
+            bool parallel);
+        void parallelWorkerLoop();
+        void shutdownParallelWorkers();
         SolverStatus get_status() const;
         const FrequencyResponse& frequencyResponse() const;
         const SolverPerformance& performance() const;
@@ -70,8 +87,8 @@ namespace App {
 
 
         // Settings are edited by the UI and read at the start of each sequential solver step.
-        const SolverSettings& settings;
-        const OptimizerSettings& optimizer_settings;
+        SolverSettings& settings;
+        OptimizerSettings& optimizer_settings;
         LevelSet& lset;
         SolverResult& result;
         const LogFunction& log;
@@ -131,10 +148,17 @@ namespace App {
         bool reference_ready = false;
         std::atomic<SolverStatus> status{SolverStatus::Idle};
 
+        struct ParallelState;
+        std::shared_ptr<ParallelState> parallel_state;
+        bool manage_parallel_workers;
+        bool parallel_workers_shutdown = false;
+
         bool smooth_level_set(
             const mfem::GridFunction& level_set,
             mfem::GridFunction& smoothed_level_set);
+        bool prepareLevelSetAndSource();
         bool bindToGlvis();
+        void streamToGlvis();
         bool postprocessFourierResponse();
 
 

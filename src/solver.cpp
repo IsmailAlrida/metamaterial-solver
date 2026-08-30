@@ -11,8 +11,11 @@
 #include <vector>
 
 #include "fftw3.h"
+#include "adjoint.hpp"
+#include "cut_sensitivity.hpp"
 #include "glvis_adapter.hpp"
 #include "integrators.hpp"
+#include "newmark.hpp"
 #include "solver.hpp"
 
 using namespace mfem;
@@ -51,11 +54,12 @@ using PhysicsBlockSmoother = GSSmoother;
 
 // move this later outside?
 // TODO: Make comments doxygen-style with math and all to explain ur stuff
-App::Solver::Solver(const App::SolverSettings& settings,
-                    const App::OptimizerSettings& optimizer_settings,
+App::Solver::Solver(App::SolverSettings& settings,
+                    App::OptimizerSettings& optimizer_settings,
                     App::LevelSet& lset,
                     App::SolverResult& result,
-                    const App::LogFunction& log)
+                    const App::LogFunction& log,
+                    bool manage_parallel_workers)
     : settings(settings),
       optimizer_settings(optimizer_settings),
       lset(lset),
@@ -63,12 +67,16 @@ App::Solver::Solver(const App::SolverSettings& settings,
       log(log),
       fe_order(1),
       level_set_order(1),
-      cut_integration_order(4)
+      cut_integration_order(4),
+      manage_parallel_workers(manage_parallel_workers)
 {
 }
 
 App::Solver::~Solver()
 {
+    if (manage_parallel_workers) {
+        shutdownParallelWorkers();
+    }
     lset.detach();
 }
 
@@ -113,6 +121,26 @@ bool App::Solver::bindToGlvis()
     glvis_connection_failures = 0;
     log(LogLevel::Message, "Connected the solver to the local GLVis panel.");
     return true;
+}
+
+void App::Solver::streamToGlvis()
+{
+    if (!glvis_stream && !bindToGlvis()) {
+        return;
+    }
+    *glvis_stream << "solution\n" << *mesh << *lset.phi << std::flush;
+    if (glvis_stream->good()) {
+        log(LogLevel::Message,
+            "Streamed the filtered design geometry to GLVis.");
+        return;
+    }
+
+    glvis_stream.reset();
+    ++glvis_connection_failures;
+    log(LogLevel::Warning,
+        glvis_connection_failures >= 3
+            ? "The GLVis connection failed three times; disabling streaming."
+            : "The GLVis connection was lost; a later iteration will reconnect.");
 }
 
 // TODO: Do something about the mixed camelCase and snake_case. Choose one.
@@ -200,10 +228,8 @@ bool App::Solver::setMesh()
     return true;
 }
 
-// TODO: Make a bloch-floquet periodic boundary condition?
-bool App::Solver::assembleSolutionSpace()
+bool App::Solver::prepareLevelSetAndSource()
 {
-    const auto assembly_started_at = std::chrono::steady_clock::now();
     if (!mesh || settings.duration <= 0.0 || settings.dt <= 0.0) {
         log(LogLevel::Error,
             "The duration and time step must be positive before assembly.");
@@ -241,23 +267,6 @@ bool App::Solver::assembleSolutionSpace()
     }
 
     const int dim = mesh->Dimension();
-    M.reset();
-    C.reset();
-    K.reset();
-    Muu_block.reset();
-    Cuu_block.reset();
-    Kuu_block.reset();
-    Mpp_block.reset();
-    Cpp_block.reset();
-    Kpp_block.reset();
-    effective_displacement_block.reset();
-    effective_pressure_block.reset();
-    initial_displacement_block.reset();
-    initial_pressure_block.reset();
-    effective_matrix.reset();
-    effective_matrix_transpose.reset();
-    initial_matrix.reset();
-    initial_matrix_transpose.reset();
     if (!level_set_fes) {
         fec = std::make_unique<H1_FECollection>(fe_order, dim);
         level_set_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get());
@@ -380,14 +389,6 @@ bool App::Solver::assembleSolutionSpace()
         }
     }
 
-    Array<int> design_domain_marker(mesh->attributes.Max());
-    Array<int> fixed_air_marker(mesh->attributes.Max());
-    design_domain_marker = 0;
-    fixed_air_marker = 0;
-    design_domain_marker[static_cast<int>(DomainAttribute::design) - 1] = 1;
-    fixed_air_marker[static_cast<int>(DomainAttribute::inlet) - 1] = 1;
-    fixed_air_marker[static_cast<int>(DomainAttribute::outlet) - 1] = 1;
-
     GridFunction unsmoothed_level_set(level_set_fes.get());
     unsmoothed_level_set.SetFromTrueDofs(lset.design);
     const auto smoothing_started_at = std::chrono::steady_clock::now();
@@ -397,6 +398,66 @@ bool App::Solver::assembleSolutionSpace()
     performance_data.levelSetSmoothingSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - smoothing_started_at).count();
 
+    if (source_pressure.empty()) {
+        std::mt19937 generator(settings.sourceSeed);
+        std::uniform_real_distribution<double> distribution(
+            -settings.sourceAmplitude, settings.sourceAmplitude);
+        source_pressure.resize(time_steps + 1);
+        source_pressure_derivative.resize(time_steps + 1);
+        for (double& value : source_pressure) {
+            value = distribution(generator);
+        }
+        source_pressure_derivative[0] =
+            (source_pressure[1] - source_pressure[0]) / settings.dt;
+        for (int step = 1; step < time_steps; ++step) {
+            source_pressure_derivative[step] =
+                (source_pressure[step + 1] - source_pressure[step - 1])
+                / (2.0 * settings.dt);
+        }
+        source_pressure_derivative[time_steps] =
+            (source_pressure[time_steps] - source_pressure[time_steps - 1])
+            / settings.dt;
+    }
+    result.timeSteps = time_steps;
+    result.dt = settings.dt;
+    return true;
+}
+
+// TODO: Make a bloch-floquet periodic boundary condition?
+bool App::Solver::assembleSolutionSpace()
+{
+    const auto assembly_started_at = std::chrono::steady_clock::now();
+    if (!prepareLevelSetAndSource()) {
+        return false;
+    }
+    const auto* physics = std::get_if<VibroacousticSettings>(&settings.physics);
+    const int dim = mesh->Dimension();
+    const int time_steps = result.timeSteps;
+    M.reset();
+    C.reset();
+    K.reset();
+    Muu_block.reset();
+    Cuu_block.reset();
+    Kuu_block.reset();
+    Mpp_block.reset();
+    Cpp_block.reset();
+    Kpp_block.reset();
+    effective_displacement_block.reset();
+    effective_pressure_block.reset();
+    initial_displacement_block.reset();
+    initial_pressure_block.reset();
+    effective_matrix.reset();
+    effective_matrix_transpose.reset();
+    initial_matrix.reset();
+    initial_matrix_transpose.reset();
+
+    Array<int> design_domain_marker(mesh->attributes.Max());
+    Array<int> fixed_air_marker(mesh->attributes.Max());
+    design_domain_marker = 0;
+    fixed_air_marker = 0;
+    design_domain_marker[static_cast<int>(DomainAttribute::design) - 1] = 1;
+    fixed_air_marker[static_cast<int>(DomainAttribute::inlet) - 1] = 1;
+    fixed_air_marker[static_cast<int>(DomainAttribute::outlet) - 1] = 1;
 
     const int displacement_size = displacement_fes->GetVSize();
     const int pressure_size = scalar_fes->GetVSize();
@@ -602,24 +663,6 @@ bool App::Solver::assembleSolutionSpace()
             return false;
         }
 
-        std::mt19937 generator(settings.sourceSeed);
-        std::uniform_real_distribution<double> distribution(
-            -settings.sourceAmplitude, settings.sourceAmplitude);
-        source_pressure.resize(time_steps + 1);
-        source_pressure_derivative.resize(time_steps + 1);
-        for (double& value : source_pressure) {
-            value = distribution(generator);
-        }
-        source_pressure_derivative[0] =
-            (source_pressure[1] - source_pressure[0]) / settings.dt;
-        for (int step = 1; step < time_steps; ++step) {
-            source_pressure_derivative[step] =
-                (source_pressure[step + 1] - source_pressure[step - 1])
-                / (2.0 * settings.dt);
-        }
-        source_pressure_derivative[time_steps] =
-            (source_pressure[time_steps] - source_pressure[time_steps - 1])
-            / settings.dt;
     }
 
     system_inlet_load.SetSize(M->Height());
@@ -648,6 +691,12 @@ bool App::Solver::solve()
     status.store(SolverStatus::Working);
     result.success = 0;
     frequency_response = {};
+    if (settings.linearSolveMethod == LinearSolveMethod::mumps) {
+        log(LogLevel::Error,
+            "MUMPS requires the parallel-cpu backend.");
+        status.store(SolverStatus::Error);
+        return false;
+    }
     if (!reference_ready) {
         performance_data.referenceTransientSeconds = 0.0;
     }
@@ -692,20 +741,8 @@ bool App::Solver::solve()
         }
         designed_assembly_ready = !reference_analysis;
 
-        if (!reference_analysis && (glvis_stream || bindToGlvis())) {
-            *glvis_stream << "solution\n" << *mesh << *lset.phi << std::flush;
-            if (glvis_stream->good()) {
-                log(LogLevel::Message,
-                    "Streamed the filtered paper initial geometry to GLVis.");
-            }
-            else {
-                glvis_stream.reset();
-                ++glvis_connection_failures;
-                log(LogLevel::Warning,
-                    glvis_connection_failures >= 3
-                        ? "The GLVis connection failed three times; disabling streaming."
-                        : "The GLVis connection was lost; a later iteration will reconnect.");
-            }
+        if (!reference_analysis) {
+            streamToGlvis();
         }
 
         const auto* physics =
@@ -719,13 +756,8 @@ bool App::Solver::solve()
             return fail(SolverStatus::Error);
         }
 
-        // Paper Eqs. (14)-(19).
-        const double a_1 = 1.0 - gamma / beta;
-        const double a_2 =
-            (1.0 - gamma / (2.0 * beta)) * settings.dt;
+        // Paper Eqs. (16) and (19), needed to form the effective matrix.
         const double a_3 = gamma / (beta * settings.dt);
-        const double a_4 = 1.0 / (beta * settings.dt);
-        const double a_5 = 1.0 / (2.0 * beta) - 1.0;
         const double a_6 =
             1.0 / (beta * settings.dt * settings.dt);
 
@@ -770,27 +802,12 @@ bool App::Solver::solve()
 
         const int state_size = M->Height();
         const int time_steps = result.timeSteps;
-        const double load_scale =
-            2.0 / (physics->rho_a * physics->c_a);
         log(LogLevel::Message,
             std::string("Solving the ")
                 + (reference_analysis ? "empty-duct reference" : "designed duct")
                 + " transient (" + std::to_string(state_size) + " unknowns, "
                 + std::to_string(time_steps) + " time steps).");
         const auto transient_started_at = std::chrono::steady_clock::now();
-
-        Vector v(state_size);
-        Vector v_dot(state_size);
-        Vector v_ddot(state_size);
-        v = 0.0;
-        v_dot = 0.0;
-        v_ddot = 0.0;
-
-        Vector h(state_size);
-        h = 0.0;
-        h.Add(load_scale * source_pressure_derivative[0], system_inlet_load);
-        // The load is not zero: only the clamped displacement rows are.
-        h.SetSubVector(displacement_essential_tdofs, 0.0);
 
         // Paper Eq. (21): M v_ddot^0 = h^0.
         auto M_system = std::make_unique<SparseMatrix>(*M);
@@ -819,248 +836,52 @@ bool App::Solver::solve()
         M_solver.SetAbsTol(1.0e-12);
         M_solver.SetMaxIter(1500);
         M_solver.SetPrintLevel(-1);
-        M_solver.Mult(h, v_ddot);
-        performance_data.forwardFgmresIterations +=
-            M_solver.GetNumIterations();
-        ++performance_data.forwardFgmresSolves;
-        performance_data.maximumForwardFgmresIterations = std::max(
-            performance_data.maximumForwardFgmresIterations,
-            M_solver.GetNumIterations());
-        if (!M_solver.GetConverged()) {
-            std::ostringstream message;
-            message << "The initial-acceleration solve did not converge: "
-                    << M_solver.GetNumIterations() << " FGMRES iterations, "
-                    << "relative residual " << std::scientific
-                    << M_solver.GetFinalRelNorm() << ".";
-            log(LogLevel::Error, message.str());
-            return fail(SolverStatus::Diverged);
-        }
-        v_ddot.SetSubVector(displacement_essential_tdofs, 0.0);
-
-        Vector R_0(state_size);
-        M_system->Mult(v_ddot, R_0);
-        R_0 -= h;
-        const double initial_residual = R_0.Norml2()
-            / std::max(1.0, h.Norml2());
-        if (!std::isfinite(initial_residual)
-            || initial_residual > 1.0e-9) {
-            std::ostringstream message;
-            message << "The initial-acceleration residual gate failed: physical "
-                    << "relative residual " << std::scientific
-                    << initial_residual << ", FGMRES relative residual "
-                    << M_solver.GetFinalRelNorm() << ", "
-                    << M_solver.GetNumIterations() << " FGMRES iterations "
-                    << "(limit 1.000000e-09).";
-            log(LogLevel::Error, message.str());
-            return fail(SolverStatus::Diverged);
-        }
-
-        if (!reference_analysis) {
-            result.U.resize(time_steps + 1);
-            result.residualNorms.resize(time_steps + 1);
-            for (Vector& state : result.U) {
-                state.SetSize(3 * state_size);
-            }
-            Vector& U_0 = result.U[0];
-            U_0.SetVector(v, 0);
-            U_0.SetVector(v_dot, state_size);
-            U_0.SetVector(v_ddot, 2 * state_size);
-            result.residualNorms[0] = {initial_residual, 0.0, 0.0};
-        }
-
         std::vector<double>& measured_outlet = reference_analysis
             ? reference_outlet_pressure
             : outlet_pressure;
-        measured_outlet.clear();
-        measured_outlet.reserve(time_steps);
-
-        Vector h_hat(state_size);
-        Vector x_M(state_size);
-        Vector x_C(state_size);
-        Vector y_M(state_size);
-        Vector y_C(state_size);
-        Vector v_n(state_size);
-        Vector v_dot_n(state_size);
-        Vector v_ddot_n(state_size);
-        Vector delta_v(state_size);
-        Vector K_v(state_size);
-        Vector R_1(state_size);
-        Vector R_2(state_size);
-        Vector R_3(state_size);
-        Vector linear_residual(state_size);
-        double maximum_equilibrium_residual = initial_residual;
-        double maximum_velocity_residual = 0.0;
-        double maximum_acceleration_residual = 0.0;
-        double maximum_linear_residual = initial_residual;
-        double maximum_solver_residual = M_solver.GetFinalRelNorm();
-        int maximum_fgmres_iterations = M_solver.GetNumIterations();
-
-        for (int n = 1; n <= time_steps; ++n) {
-            h = 0.0;
-            h.Add(
-                load_scale * source_pressure_derivative[n], system_inlet_load);
-
-            x_M = 0.0;
-            x_M.Add(a_4, v_dot);
-            x_M.Add(a_5, v_ddot);
-            x_M.Add(a_6, v);
-            M->Mult(x_M, y_M);
-
-            x_C = 0.0;
-            x_C.Add(-a_1, v_dot);
-            x_C.Add(-a_2, v_ddot);
-            x_C.Add(a_3, v);
-            C->Mult(x_C, y_C);
-
-            h_hat = h;
-            h_hat += y_M;
-            h_hat += y_C;
-            // The essential boundary rows impose v = 0, so their RHS is 0.
-            h_hat.SetSubVector(displacement_essential_tdofs, 0.0);
-
-            v_n = v;
-            K_hat_solver.Mult(h_hat, v_n);
-            performance_data.forwardFgmresIterations +=
-                K_hat_solver.GetNumIterations();
-            ++performance_data.forwardFgmresSolves;
-            performance_data.maximumForwardFgmresIterations = std::max(
-                performance_data.maximumForwardFgmresIterations,
-                K_hat_solver.GetNumIterations());
-            if (!K_hat_solver.GetConverged()) {
-                std::ostringstream message;
-                message << "The Newmark linear solve failed at time step " << n
-                        << ": " << K_hat_solver.GetNumIterations()
-                        << " FGMRES iterations, relative residual "
-                        << std::scientific << K_hat_solver.GetFinalRelNorm()
-                        << ".";
-                log(LogLevel::Error, message.str());
-                return fail(SolverStatus::Diverged);
-            }
-            v_n.SetSubVector(displacement_essential_tdofs, 0.0);
-
-            K_hat->Mult(v_n, linear_residual);
-            linear_residual -= h_hat;
-            const double linear_residual_norm = linear_residual.Norml2()
-                / std::max(1.0, h_hat.Norml2());
-
-            delta_v = v_n;
-            delta_v -= v;
-            v_dot_n = 0.0;
-            v_dot_n.Add(a_1, v_dot);
-            v_dot_n.Add(a_2, v_ddot);
-            v_dot_n.Add(a_3, delta_v);
-            v_ddot_n = 0.0;
-            v_ddot_n.Add(-a_4, v_dot);
-            v_ddot_n.Add(-a_5, v_ddot);
-            v_ddot_n.Add(a_6, delta_v);
-            v_dot_n.SetSubVector(displacement_essential_tdofs, 0.0);
-            v_ddot_n.SetSubVector(displacement_essential_tdofs, 0.0);
-
-            measured_outlet.push_back(system_outlet_functional * v_n);
-
-            M->Mult(v_ddot_n, y_M);
-            C->Mult(v_dot_n, y_C);
-            K->Mult(v_n, K_v);
-            R_1 = y_M;
-            R_1 += y_C;
-            R_1 += K_v;
-            R_1 -= h;
-            R_1.SetSubVector(displacement_essential_tdofs, 0.0);
-
-            R_2 = v_dot_n;
-            R_2.Add(-a_1, v_dot);
-            R_2.Add(-a_2, v_ddot);
-            R_2.Add(-a_3, delta_v);
-
-            R_3 = v_ddot_n;
-            R_3.Add(a_4, v_dot);
-            R_3.Add(a_5, v_ddot);
-            R_3.Add(-a_6, delta_v);
-
-            const double R_1_norm = R_1.Norml2() / std::max({
-                1.0,
-                h.Norml2(),
-                y_M.Norml2() + y_C.Norml2() + K_v.Norml2()
-            });
-            const double R_2_norm = R_2.Norml2() / std::max({
-                1.0,
-                v_dot_n.Norml2(),
-                std::abs(a_1) * v_dot.Norml2()
-                    + std::abs(a_2) * v_ddot.Norml2()
-                    + std::abs(a_3) * delta_v.Norml2()
-            });
-            const double R_3_norm = R_3.Norml2() / std::max({
-                1.0,
-                v_ddot_n.Norml2(),
-                std::abs(a_4) * v_dot.Norml2()
-                    + std::abs(a_5) * v_ddot.Norml2()
-                    + std::abs(a_6) * delta_v.Norml2()
-            });
-            if (!std::isfinite(linear_residual_norm)
-                || !std::isfinite(R_1_norm)
-                || !std::isfinite(R_2_norm)
-                || !std::isfinite(R_3_norm)
-                || linear_residual_norm > 1.0e-9
-                || R_1_norm > 1.0e-9
-                || R_2_norm > 1.0e-9
-                || R_3_norm > 1.0e-9) {
-                std::ostringstream message;
-                message << "The Newmark residual gate failed at time step " << n
-                        << ": linear=" << std::scientific
-                        << linear_residual_norm << ", equilibrium=" << R_1_norm
-                        << ", velocity=" << R_2_norm
-                        << ", acceleration=" << R_3_norm
-                        << ", FGMRES="
-                        << K_hat_solver.GetFinalRelNorm() << ", iterations="
-                        << K_hat_solver.GetNumIterations()
-                        << " (limit 1.000000e-09).";
-                log(LogLevel::Error, message.str());
-                return fail(SolverStatus::Diverged);
-            }
-
-            maximum_linear_residual = std::max(
-                maximum_linear_residual, linear_residual_norm);
-            maximum_equilibrium_residual = std::max(
-                maximum_equilibrium_residual, R_1_norm);
-            maximum_velocity_residual = std::max(
-                maximum_velocity_residual, R_2_norm);
-            maximum_acceleration_residual = std::max(
-                maximum_acceleration_residual, R_3_norm);
-            maximum_solver_residual = std::max(
-                maximum_solver_residual,
-                K_hat_solver.GetFinalRelNorm());
-            maximum_fgmres_iterations = std::max(
-                maximum_fgmres_iterations,
-                K_hat_solver.GetNumIterations());
-
-            if (!reference_analysis) {
-                Vector& U_n = result.U[n];
-                U_n.SetVector(v_n, 0);
-                U_n.SetVector(v_dot_n, state_size);
-                U_n.SetVector(v_ddot_n, 2 * state_size);
-                result.residualNorms[n] = {
-                    R_1_norm, R_2_norm, R_3_norm};
-            }
-
-            v = v_n;
-            v_dot = v_dot_n;
-            v_ddot = v_ddot_n;
+        const auto solve_initial = [&M_solver](
+                                       const Vector& rhs, Vector& solution) {
+            M_solver.Mult(rhs, solution);
+            return detail::LinearSolveResult{
+                M_solver.GetConverged(),
+                M_solver.GetNumIterations(),
+                M_solver.GetFinalRelNorm()};
+        };
+        const auto solve_effective = [&K_hat_solver](
+                                         const Vector& rhs, Vector& solution) {
+            K_hat_solver.Mult(rhs, solution);
+            return detail::LinearSolveResult{
+                K_hat_solver.GetConverged(),
+                K_hat_solver.GetNumIterations(),
+                K_hat_solver.GetFinalRelNorm()};
+        };
+        if (!detail::runNewmark(
+                settings,
+                *physics,
+                *M,
+                *C,
+                *K,
+                *M_system,
+                *K_hat,
+                displacement_essential_tdofs,
+                system_inlet_load,
+                system_outlet_functional,
+                source_pressure_derivative,
+                solve_initial,
+                solve_effective,
+                [](const Vector& value) { return value.Norml2(); },
+                [](const Vector& left, const Vector& right) {
+                    return left * right;
+                },
+                !reference_analysis,
+                result.U,
+                result.residualNorms,
+                measured_outlet,
+                performance_data,
+                log,
+                reference_analysis ? "empty-duct reference" : "designed duct")) {
+            return fail(SolverStatus::Diverged);
         }
-
-        std::ostringstream summary;
-        summary << "Completed the "
-                << (reference_analysis ? "empty-duct reference" : "designed duct")
-                << " transient: maximum linear/equilibrium/velocity/acceleration "
-                << "residuals = " << std::scientific
-                << maximum_linear_residual << " / "
-                << maximum_equilibrium_residual << " / "
-                << maximum_velocity_residual << " / "
-                << maximum_acceleration_residual
-                << ", maximum FGMRES residual = "
-                << maximum_solver_residual
-                << ", maximum FGMRES iterations = "
-                << maximum_fgmres_iterations << ".";
-        log(LogLevel::Message, summary.str());
 
         const double transient_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - transient_started_at).count();
@@ -1408,68 +1229,21 @@ bool App::Solver::differentiateFrequencyResponses(
         }
     }
 
-    // The complex input stores dPhi/dRe + i*dPhi/dIm. FFTW's unnormalized
-    // C2R transform applies the transpose of the unnormalized forward R2C
-    // transform after the interior bins are halved.
-    auto inverse_transform = [this, time_steps](
-                                 const std::vector<std::complex<double>>& spectrum,
-                                 std::vector<double>& outlet_derivative) {
-        if (spectrum.empty()) {
-            outlet_derivative.clear();
-            return true;
-        }
-        fftw_complex* fft_derivative = fftw_alloc_complex(spectrum.size());
-        if (fft_derivative == nullptr) {
-            return false;
-        }
-        const bool has_nyquist_bin = time_steps % 2 == 0;
-        for (int bin = 0; bin < static_cast<int>(spectrum.size()); ++bin) {
-            const bool single_sided = bin == 0
-                || (has_nyquist_bin
-                    && bin == static_cast<int>(spectrum.size()) - 1);
-            const double scale = single_sided ? 1.0 : 0.5;
-            fft_derivative[bin][0] = scale * spectrum[bin].real();
-            fft_derivative[bin][1] = single_sided
-                ? 0.0
-                : scale * spectrum[bin].imag();
-        }
-        outlet_derivative.resize(time_steps);
-        fftw_plan inverse_plan = fftw_plan_dft_c2r_1d(
-            time_steps,
-            fft_derivative,
-            outlet_derivative.data(),
-            FFTW_ESTIMATE);
-        if (inverse_plan == nullptr) {
-            fftw_free(fft_derivative);
-            return false;
-        }
-        fftw_execute(inverse_plan);
-        fftw_destroy_plan(inverse_plan);
-        fftw_free(fft_derivative);
-        for (int sample = 0; sample < time_steps; ++sample) {
-            outlet_derivative[sample] *= fft_window[sample];
-        }
-        return true;
-    };
     std::vector<double> pass_outlet_derivative;
     std::vector<double> stop_outlet_derivative;
-    if (!inverse_transform(
-            pass_spectrum_derivative, pass_outlet_derivative)
-        || !inverse_transform(
-            stop_spectrum_derivative, stop_outlet_derivative)) {
+    if (!detail::inverseOutletDerivative(
+            pass_spectrum_derivative,
+            time_steps,
+            fft_window,
+            pass_outlet_derivative)
+        || !detail::inverseOutletDerivative(
+            stop_spectrum_derivative,
+            time_steps,
+            fft_window,
+            stop_outlet_derivative)) {
         log(LogLevel::Error, "FFTW could not create the adjoint transform.");
         return false;
     }
-
-    const double beta = settings.newmarkBeta;
-    const double gamma = settings.newmarkGamma;
-    const double a_1 = 1.0 - gamma / beta;
-    const double a_2 =
-        (1.0 - gamma / (2.0 * beta)) * settings.dt;
-    const double a_3 = gamma / (beta * settings.dt);
-    const double a_4 = 1.0 / (beta * settings.dt);
-    const double a_5 = 1.0 / (2.0 * beta) - 1.0;
-    const double a_6 = 1.0 / (beta * settings.dt * settings.dt);
 
     if (!effective_matrix_transpose) {
         effective_matrix_transpose.reset(Transpose(*effective_matrix));
@@ -1523,550 +1297,129 @@ bool App::Solver::differentiateFrequencyResponses(
     performance_data.adjointFgmresIterations = 0;
     performance_data.adjointFgmresSolves = 0;
     performance_data.maximumAdjointFgmresIterations = 0;
-    auto solve_adjoint = [&](const char* objective_name,
-                             const std::vector<double>& outlet_derivative,
-                             std::vector<Vector>& adjoint,
-                             Vector& initial_adjoint,
-                             double& elapsed_seconds) {
-        const auto started_at = std::chrono::steady_clock::now();
-        adjoint.resize(time_steps + 1);
-        for (Vector& state : adjoint) {
-            state.SetSize(state_size);
-        }
-        adjoint[0] = 0.0;
-
-        Vector bar_v(state_size);
-        Vector bar_v_dot(state_size);
-        Vector bar_v_ddot(state_size);
-        Vector previous_bar_v(state_size);
-        Vector previous_bar_v_dot(state_size);
-        Vector previous_bar_v_ddot(state_size);
-        Vector M_transpose_adjoint(state_size);
-        Vector C_transpose_adjoint(state_size);
-        Vector adjoint_residual(state_size);
-        bar_v = 0.0;
-        bar_v_dot = 0.0;
-        bar_v_ddot = 0.0;
-
-        for (int n = time_steps; n >= 1; --n) {
-            bar_v.Add(
-                outlet_derivative[n - 1], system_outlet_functional);
-
-            previous_bar_v = 0.0;
-            previous_bar_v.Add(-a_3, bar_v_dot);
-            previous_bar_v.Add(-a_6, bar_v_ddot);
-            previous_bar_v_dot = 0.0;
-            previous_bar_v_dot.Add(a_1, bar_v_dot);
-            previous_bar_v_dot.Add(-a_4, bar_v_ddot);
-            previous_bar_v_ddot = 0.0;
-            previous_bar_v_ddot.Add(a_2, bar_v_dot);
-            previous_bar_v_ddot.Add(-a_5, bar_v_ddot);
-
-            bar_v.Add(a_3, bar_v_dot);
-            bar_v.Add(a_6, bar_v_ddot);
-            bar_v.SetSubVector(displacement_essential_tdofs, 0.0);
-
-            if (n == time_steps) {
-                adjoint[n] = 0.0;
-            }
-            else {
-                adjoint[n] = adjoint[n + 1];
-            }
-            K_hat_solver.Mult(bar_v, adjoint[n]);
-            performance_data.adjointFgmresIterations +=
-                K_hat_solver.GetNumIterations();
-            ++performance_data.adjointFgmresSolves;
-            performance_data.maximumAdjointFgmresIterations = std::max(
-                performance_data.maximumAdjointFgmresIterations,
-                K_hat_solver.GetNumIterations());
-            effective_matrix_transpose->Mult(adjoint[n], adjoint_residual);
-            adjoint_residual -= bar_v;
-            const double relative_adjoint_residual = adjoint_residual.Norml2()
-                / std::max(1.0, bar_v.Norml2());
-            if (!K_hat_solver.GetConverged()
-                || !std::isfinite(relative_adjoint_residual)
-                || relative_adjoint_residual > 1.0e-9) {
-                std::ostringstream message;
-                message << "The " << objective_name
-                        << " Newmark adjoint residual gate failed at time step "
-                        << n << ": physical=" << std::scientific
-                        << relative_adjoint_residual << ", FGMRES="
-                        << K_hat_solver.GetFinalRelNorm() << ", iterations="
-                        << K_hat_solver.GetNumIterations() << ", converged="
-                        << (K_hat_solver.GetConverged() ? "yes" : "no")
-                        << " (limit 1.000000e-09).";
-                log(LogLevel::Error, message.str());
-                return false;
-            }
-            adjoint[n].SetSubVector(displacement_essential_tdofs, 0.0);
-
-            M->MultTranspose(adjoint[n], M_transpose_adjoint);
-            C->MultTranspose(adjoint[n], C_transpose_adjoint);
-            previous_bar_v.Add(a_6, M_transpose_adjoint);
-            previous_bar_v.Add(a_3, C_transpose_adjoint);
-            previous_bar_v_dot.Add(a_4, M_transpose_adjoint);
-            previous_bar_v_dot.Add(-a_1, C_transpose_adjoint);
-            previous_bar_v_ddot.Add(a_5, M_transpose_adjoint);
-            previous_bar_v_ddot.Add(-a_2, C_transpose_adjoint);
-
-            bar_v = previous_bar_v;
-            bar_v_dot = previous_bar_v_dot;
-            bar_v_ddot = previous_bar_v_ddot;
-        }
-
-        initial_adjoint.SetSize(state_size);
-        initial_adjoint = 0.0;
-        bar_v_ddot.SetSubVector(displacement_essential_tdofs, 0.0);
-        initial_solver.Mult(bar_v_ddot, initial_adjoint);
-        performance_data.adjointFgmresIterations +=
-            initial_solver.GetNumIterations();
-        ++performance_data.adjointFgmresSolves;
-        performance_data.maximumAdjointFgmresIterations = std::max(
-            performance_data.maximumAdjointFgmresIterations,
-            initial_solver.GetNumIterations());
-        initial_matrix_transpose->Mult(initial_adjoint, adjoint_residual);
-        adjoint_residual -= bar_v_ddot;
-        const double initial_adjoint_residual = adjoint_residual.Norml2()
-            / std::max(1.0, bar_v_ddot.Norml2());
-        if (!initial_solver.GetConverged()
-            || !std::isfinite(initial_adjoint_residual)
-            || initial_adjoint_residual > 1.0e-9) {
-            std::ostringstream message;
-            message << "The " << objective_name
-                    << " initial-acceleration adjoint residual gate failed: "
-                    << "physical=" << std::scientific
-                    << initial_adjoint_residual << ", FGMRES="
-                    << initial_solver.GetFinalRelNorm() << ", iterations="
-                    << initial_solver.GetNumIterations() << ", converged="
-                    << (initial_solver.GetConverged() ? "yes" : "no")
-                    << " (limit 1.000000e-09).";
-            log(LogLevel::Error, message.str());
-            return false;
-        }
-        initial_adjoint.SetSubVector(displacement_essential_tdofs, 0.0);
-        elapsed_seconds = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - started_at).count();
-        return true;
+    detail::LinearSolve solve_effective_transpose =
+        [&K_hat_solver](const Vector& rhs, Vector& solution) {
+            K_hat_solver.Mult(rhs, solution);
+            return detail::LinearSolveResult{
+                K_hat_solver.GetConverged(),
+                K_hat_solver.GetNumIterations(),
+                K_hat_solver.GetFinalRelNorm()};
+        };
+    detail::LinearSolve solve_initial_transpose =
+        [&initial_solver](const Vector& rhs, Vector& solution) {
+            initial_solver.Mult(rhs, solution);
+            return detail::LinearSolveResult{
+                initial_solver.GetConverged(),
+                initial_solver.GetNumIterations(),
+                initial_solver.GetFinalRelNorm()};
+        };
+    const detail::GlobalNorm norm = [](const Vector& value) {
+        return value.Norml2();
     };
 
     Vector pass_initial_adjoint;
     Vector stop_initial_adjoint;
-    if (has_pass && !solve_adjoint(
-            "pass-band", pass_outlet_derivative, pass_adjoint_history,
-            pass_initial_adjoint, performance_data.passAdjointSeconds)) {
+    if (has_pass && !detail::runNewmarkAdjoint(
+            settings,
+            *M,
+            *C,
+            *effective_matrix_transpose,
+            *initial_matrix_transpose,
+            displacement_essential_tdofs,
+            system_outlet_functional,
+            pass_outlet_derivative,
+            solve_effective_transpose,
+            solve_initial_transpose,
+            norm,
+            pass_adjoint_history,
+            pass_initial_adjoint,
+            performance_data,
+            performance_data.passAdjointSeconds,
+            log,
+            "pass-band")) {
         return false;
     }
-    if (has_stop && !solve_adjoint(
-            "stop-band", stop_outlet_derivative, stop_adjoint_history,
-            stop_initial_adjoint, performance_data.stopAdjointSeconds)) {
+    if (has_stop && !detail::runNewmarkAdjoint(
+            settings,
+            *M,
+            *C,
+            *effective_matrix_transpose,
+            *initial_matrix_transpose,
+            displacement_essential_tdofs,
+            system_outlet_functional,
+            stop_outlet_derivative,
+            solve_effective_transpose,
+            solve_initial_transpose,
+            norm,
+            stop_adjoint_history,
+            stop_initial_adjoint,
+            performance_data,
+            performance_data.stopAdjointSeconds,
+            log,
+            "stop-band")) {
         return false;
     }
 
-    const auto* physics =
-        std::get_if<VibroacousticSettings>(&settings.physics);
-    if (physics == nullptr || level_set_scale <= 0.0
-        || optimizer_settings.cutDerivativeRelativeStep <= 0.0) {
-        log(LogLevel::Error,
-            "The cut derivative settings are invalid.");
-        return false;
-    }
-    const double lambda = physics->youngs_modulus * physics->poisson_ratio
-        / (1.0 - physics->poisson_ratio * physics->poisson_ratio);
-    const double mu = physics->youngs_modulus
-        / (2.0 * (1.0 + physics->poisson_ratio));
-    const double omega_1 = 2.0 * std::acos(-1.0) * physics->f1;
-    const double omega_2 = 2.0 * std::acos(-1.0) * physics->f2;
-    const double alpha_d = 2.0 * physics->zeta * omega_1 * omega_2
-        / (omega_1 + omega_2);
-    const double beta_d = 2.0 * physics->zeta / (omega_1 + omega_2);
-    const double perturbation =
-        optimizer_settings.cutDerivativeRelativeStep * level_set_scale;
-    const double inverse_perturbation = 0.5 / perturbation;
-
-    Array<int> active(level_set_fes->GetTrueVSize());
+    Array<int> active(level_set_fes->GetVSize());
     active = 0;
     for (int i = 0; i < lset.activeDesignDofs.Size(); ++i) {
         active[lset.activeDesignDofs[i]] = 1;
     }
-    const int level_set_size = level_set_fes->GetTrueVSize();
-    Vector pass_physical_gradient(level_set_size);
-    Vector stop_physical_gradient(level_set_size);
-    pass_physical_gradient.UseDevice(false);
-    stop_physical_gradient.UseDevice(false);
-    pass_physical_gradient = 0.0;
-    stop_physical_gradient = 0.0;
 
-    std::vector<const real_t*> forward_state_data(result.U.size());
-    for (std::size_t state = 0; state < result.U.size(); ++state) {
-        forward_state_data[state] = result.U[state].HostRead();
-    }
-    std::vector<const real_t*> pass_adjoint_data;
-    std::vector<const real_t*> stop_adjoint_data;
-    if (has_pass) {
-        pass_adjoint_data.resize(pass_adjoint_history.size());
-        for (std::size_t state = 0; state < pass_adjoint_history.size(); ++state) {
-            pass_adjoint_data[state] = pass_adjoint_history[state].HostRead();
-        }
-    }
-    if (has_stop) {
-        stop_adjoint_data.resize(stop_adjoint_history.size());
-        for (std::size_t state = 0; state < stop_adjoint_history.size(); ++state) {
-            stop_adjoint_data[state] = stop_adjoint_history[state].HostRead();
-        }
-    }
-    const real_t* pass_initial_data = has_pass
-        ? pass_initial_adjoint.HostRead() : nullptr;
-    const real_t* stop_initial_data = has_stop
-        ? stop_initial_adjoint.HostRead() : nullptr;
-    const real_t* phi_data = lset.phi->HostRead();
-
+    Vector pass_physical_gradient;
+    Vector stop_physical_gradient;
     int cut_element_count = 0;
     int differentiated_dof_count = 0;
     const auto differentiation_started_at = std::chrono::steady_clock::now();
-#ifdef _OPENMP
-#pragma omp parallel
-#endif
-    {
-        GridFunction thread_phi(level_set_fes.get());
-        thread_phi.UseDevice(false);
-        std::copy(
-            phi_data, phi_data + lset.phi->Size(), thread_phi.HostWrite());
-        ConstantCoefficient solid_density(physics->rho_s);
-        ConstantCoefficient solid_lambda(lambda);
-        ConstantCoefficient solid_mu(mu);
-        ConstantCoefficient acoustic_mass(
-            1.0 / (physics->rho_a * physics->c_a * physics->c_a));
-        ConstantCoefficient acoustic_stiffness(1.0 / physics->rho_a);
-        ImplicitDomainIntegrator Muu_integrator(
-            std::make_unique<VectorMassIntegrator>(solid_density),
-            thread_phi, cut_integration_order, level_set_order,
-            physics->epsilon, true);
-        ImplicitDomainIntegrator Kuu_integrator(
-            std::make_unique<ElasticityIntegrator>(solid_lambda, solid_mu),
-            thread_phi, cut_integration_order, level_set_order,
-            physics->epsilon, true);
-        ImplicitDomainIntegrator Mpp_integrator(
-            std::make_unique<MassIntegrator>(acoustic_mass),
-            thread_phi, cut_integration_order, level_set_order,
-            physics->epsilon, false);
-        ImplicitDomainIntegrator Kpp_integrator(
-            std::make_unique<DiffusionIntegrator>(acoustic_stiffness),
-            thread_phi, cut_integration_order, level_set_order,
-            physics->epsilon, false);
-        ImplicitSurfaceNormalIntegrator Kup_integrator(
-            thread_phi, cut_integration_order, level_set_order, -1.0, false);
-        ImplicitSurfaceNormalIntegrator Mpu_integrator(
-            thread_phi, cut_integration_order, level_set_order, 1.0, true);
-
-        Vector thread_pass_gradient(level_set_size);
-        Vector thread_stop_gradient(level_set_size);
-        thread_pass_gradient.UseDevice(false);
-        thread_stop_gradient.UseDevice(false);
-        thread_pass_gradient = 0.0;
-        thread_stop_gradient = 0.0;
-        int thread_cut_elements = 0;
-        int thread_differentiated_dofs = 0;
-        Array<int> phi_dofs;
-        Array<int> displacement_dofs;
-        Array<int> pressure_dofs;
-        Vector matrix_product;
-        matrix_product.UseDevice(false);
-        IsoparametricTransformation transformation;
-        auto contract = [&matrix_product](
-                            const Vector& left,
-                            const DenseMatrix& matrix,
-                            const Vector& right) {
-            matrix_product.SetSize(matrix.Height());
-            matrix.Mult(right, matrix_product);
-            return left * matrix_product;
-        };
-        auto difference = [inverse_perturbation](
-                              DenseMatrix& plus,
-                              const DenseMatrix& minus) {
-            plus -= minus;
-            plus *= inverse_perturbation;
-        };
-        auto gather = [](const real_t* source,
-                         const Array<int>& dofs,
-                         Vector& values,
-                         int offset = 0) {
-            values.SetSize(dofs.Size());
-            for (int i = 0; i < dofs.Size(); ++i) {
-                const int encoded = dofs[i];
-                const int dof = encoded >= 0 ? encoded : -1 - encoded;
-                values[i] = encoded >= 0
-                    ? source[offset + dof]
-                    : -source[offset + dof];
-            }
-        };
-
-#ifdef _OPENMP
-#pragma omp for schedule(dynamic)
-#endif
-        for (int element = 0; element < mesh->GetNE(); ++element) {
-        if (mesh->GetAttribute(element)
-            != static_cast<int>(DomainAttribute::design)) {
-            continue;
-        }
-        level_set_fes->GetElementDofs(element, phi_dofs);
-        double minimum_phi = std::numeric_limits<double>::max();
-        double maximum_phi = std::numeric_limits<double>::lowest();
-        for (int dof = 0; dof < phi_dofs.Size(); ++dof) {
-            minimum_phi = std::min(minimum_phi, thread_phi[phi_dofs[dof]]);
-            maximum_phi = std::max(maximum_phi, thread_phi[phi_dofs[dof]]);
-        }
-        if (minimum_phi > perturbation || maximum_phi < -perturbation) {
-            continue;
-        }
-        ++thread_cut_elements;
-        displacement_fes->GetElementVDofs(element, displacement_dofs);
-        scalar_fes->GetElementDofs(element, pressure_dofs);
-        mesh->GetElementTransformation(element, &transformation);
-        const FiniteElement& scalar_element = *scalar_fes->GetFE(element);
-        const FiniteElement& displacement_element =
-            *displacement_fes->GetFE(element);
-
-        Array<int> pressure_state_dofs(pressure_dofs.Size());
-        for (int i = 0; i < pressure_dofs.Size(); ++i) {
-            pressure_state_dofs[i] = pressure_offset + pressure_dofs[i];
-        }
-
-        for (int local_dof = 0; local_dof < phi_dofs.Size(); ++local_dof) {
-            const int phi_dof = phi_dofs[local_dof];
-            if (active[phi_dof] == 0) {
-                continue;
-            }
-            ++thread_differentiated_dofs;
-            const double original_phi = thread_phi[phi_dof];
-
-            DenseMatrix Muu_plus, Kuu_plus, Mpp_plus, Kpp_plus;
-            DenseMatrix Kup_plus, Mpu_plus;
-            thread_phi[phi_dof] = original_phi + perturbation;
-            Muu_integrator.AssembleElementMatrix(
-                displacement_element, transformation, Muu_plus);
-            Kuu_integrator.AssembleElementMatrix(
-                displacement_element, transformation, Kuu_plus);
-            Mpp_integrator.AssembleElementMatrix(
-                scalar_element, transformation, Mpp_plus);
-            Kpp_integrator.AssembleElementMatrix(
-                scalar_element, transformation, Kpp_plus);
-            Kup_integrator.AssembleElementMatrix2(
-                scalar_element, displacement_element,
-                transformation, Kup_plus);
-            Mpu_integrator.AssembleElementMatrix2(
-                displacement_element, scalar_element,
-                transformation, Mpu_plus);
-
-            DenseMatrix Muu_minus, Kuu_minus, Mpp_minus, Kpp_minus;
-            DenseMatrix Kup_minus, Mpu_minus;
-            thread_phi[phi_dof] = original_phi - perturbation;
-            Muu_integrator.AssembleElementMatrix(
-                displacement_element, transformation, Muu_minus);
-            Kuu_integrator.AssembleElementMatrix(
-                displacement_element, transformation, Kuu_minus);
-            Mpp_integrator.AssembleElementMatrix(
-                scalar_element, transformation, Mpp_minus);
-            Kpp_integrator.AssembleElementMatrix(
-                scalar_element, transformation, Kpp_minus);
-            Kup_integrator.AssembleElementMatrix2(
-                scalar_element, displacement_element,
-                transformation, Kup_minus);
-            Mpu_integrator.AssembleElementMatrix2(
-                displacement_element, scalar_element,
-                transformation, Mpu_minus);
-            thread_phi[phi_dof] = original_phi;
-
-            difference(Muu_plus, Muu_minus);
-            difference(Kuu_plus, Kuu_minus);
-            difference(Mpp_plus, Mpp_minus);
-            difference(Kpp_plus, Kpp_minus);
-            difference(Kup_plus, Kup_minus);
-            difference(Mpu_plus, Mpu_minus);
-
-            Vector initial_u, initial_p, acceleration_u, acceleration_p;
-            initial_u.UseDevice(false);
-            initial_p.UseDevice(false);
-            acceleration_u.UseDevice(false);
-            acceleration_p.UseDevice(false);
-            gather(forward_state_data[0], displacement_dofs,
-                acceleration_u, 2 * state_size);
-            gather(forward_state_data[0], pressure_state_dofs,
-                acceleration_p, 2 * state_size);
-            auto initial_sensitivity = [&](const real_t* initial_data) {
-                gather(initial_data, displacement_dofs, initial_u);
-                gather(initial_data, pressure_state_dofs, initial_p);
-                double sensitivity = -contract(
-                    initial_u, Muu_plus, acceleration_u);
-                sensitivity -= contract(initial_p, Mpu_plus, acceleration_u);
-                sensitivity -= contract(initial_p, Mpp_plus, acceleration_p);
-                return sensitivity;
-            };
-            double pass_sensitivity = has_pass
-                ? initial_sensitivity(pass_initial_data) : 0.0;
-            double stop_sensitivity = has_stop
-                ? initial_sensitivity(stop_initial_data) : 0.0;
-
-            Vector lambda_u, lambda_p;
-            Vector v_u, v_p, previous_v_u, previous_v_p;
-            Vector previous_dot_u, previous_dot_p;
-            Vector previous_ddot_u, previous_ddot_p;
-            Vector mass_u, mass_p, damping_u;
-            lambda_u.UseDevice(false);
-            lambda_p.UseDevice(false);
-            v_u.UseDevice(false);
-            v_p.UseDevice(false);
-            previous_v_u.UseDevice(false);
-            previous_v_p.UseDevice(false);
-            previous_dot_u.UseDevice(false);
-            previous_dot_p.UseDevice(false);
-            previous_ddot_u.UseDevice(false);
-            previous_ddot_p.UseDevice(false);
-            mass_u.UseDevice(false);
-            mass_p.UseDevice(false);
-            damping_u.UseDevice(false);
-            for (int n = 1; n <= time_steps; ++n) {
-                gather(forward_state_data[n], displacement_dofs, v_u);
-                gather(forward_state_data[n], pressure_state_dofs, v_p);
-                gather(forward_state_data[n - 1], displacement_dofs,
-                    previous_v_u);
-                gather(forward_state_data[n - 1], pressure_state_dofs,
-                    previous_v_p);
-                gather(forward_state_data[n - 1], displacement_dofs,
-                    previous_dot_u, state_size);
-                gather(forward_state_data[n - 1], pressure_state_dofs,
-                    previous_dot_p, state_size);
-                gather(forward_state_data[n - 1], displacement_dofs,
-                    previous_ddot_u, 2 * state_size);
-                gather(forward_state_data[n - 1], pressure_state_dofs,
-                    previous_ddot_p, 2 * state_size);
-
-                mass_u.SetSize(previous_v_u.Size());
-                mass_u = 0.0;
-                mass_u.Add(a_4, previous_dot_u);
-                mass_u.Add(a_5, previous_ddot_u);
-                mass_u.Add(a_6, previous_v_u);
-                mass_u.Add(-a_6, v_u);
-                mass_p.SetSize(previous_v_p.Size());
-                mass_p = 0.0;
-                mass_p.Add(a_4, previous_dot_p);
-                mass_p.Add(a_5, previous_ddot_p);
-                mass_p.Add(a_6, previous_v_p);
-                mass_p.Add(-a_6, v_p);
-                damping_u.SetSize(previous_v_u.Size());
-                damping_u = 0.0;
-                damping_u.Add(-a_1, previous_dot_u);
-                damping_u.Add(-a_2, previous_ddot_u);
-                damping_u.Add(a_3, previous_v_u);
-                damping_u.Add(-a_3, v_u);
-
-                auto accumulate_sensitivity = [&](const real_t* adjoint_data,
-                                                   double& sensitivity) {
-                    gather(adjoint_data, displacement_dofs, lambda_u);
-                    gather(adjoint_data, pressure_state_dofs, lambda_p);
-                    sensitivity += contract(lambda_u, Muu_plus, mass_u);
-                    sensitivity += contract(lambda_p, Mpu_plus, mass_u);
-                    sensitivity += contract(lambda_p, Mpp_plus, mass_p);
-                    sensitivity += alpha_d
-                        * contract(lambda_u, Muu_plus, damping_u);
-                    sensitivity += beta_d
-                        * contract(lambda_u, Kuu_plus, damping_u);
-                    sensitivity -= contract(lambda_u, Kuu_plus, v_u);
-                    sensitivity -= contract(lambda_u, Kup_plus, v_p);
-                    sensitivity -= contract(lambda_p, Kpp_plus, v_p);
-                };
-                if (has_pass) {
-                    accumulate_sensitivity(
-                        pass_adjoint_data[n], pass_sensitivity);
-                }
-                if (has_stop) {
-                    accumulate_sensitivity(
-                        stop_adjoint_data[n], stop_sensitivity);
-                }
-            }
-            thread_pass_gradient[phi_dof] += pass_sensitivity;
-            thread_stop_gradient[phi_dof] += stop_sensitivity;
-        }
-    }
-
-#ifdef _OPENMP
-#pragma omp critical
-#endif
-        {
-            pass_physical_gradient += thread_pass_gradient;
-            stop_physical_gradient += thread_stop_gradient;
-            cut_element_count += thread_cut_elements;
-            differentiated_dof_count += thread_differentiated_dofs;
-        }
+    if (!detail::differentiateCutElements(
+            settings,
+            optimizer_settings,
+            *mesh,
+            *level_set_fes,
+            *displacement_fes,
+            *scalar_fes,
+            *lset.phi,
+            active,
+            result.U,
+            has_pass ? &pass_adjoint_history : nullptr,
+            has_stop ? &stop_adjoint_history : nullptr,
+            has_pass ? &pass_initial_adjoint : nullptr,
+            has_stop ? &stop_initial_adjoint : nullptr,
+            pressure_offset,
+            time_steps,
+            static_cast<int>(DomainAttribute::design),
+            cut_integration_order,
+            level_set_order,
+            level_set_scale,
+            pass_physical_gradient,
+            stop_physical_gradient,
+            cut_element_count,
+            differentiated_dof_count)) {
+        log(LogLevel::Error,
+            "The cut-element design differentiation failed.");
+        return false;
     }
     performance_data.cutElements = cut_element_count;
     performance_data.differentiatedDofs = differentiated_dof_count;
     performance_data.cutDifferentiationSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - differentiation_started_at).count();
-
-    // Reverse the paper's node -> cell -> finite-volume filter -> node map.
-#if METAMATERIAL_USE_CUDA
-    DSmoother filter_preconditioner(*filter_matrix);
-#else
-    GSSmoother filter_preconditioner(*filter_matrix);
-#endif
-    CGSolver filter_solver;
-    filter_solver.SetPreconditioner(filter_preconditioner);
-    filter_solver.SetOperator(*filter_matrix);
-    filter_solver.SetRelTol(1.0e-10);
-    filter_solver.SetAbsTol(1.0e-12);
-    filter_solver.SetMaxIter(1500);
-    filter_solver.SetPrintLevel(-1);
-    const auto filter_started_at = std::chrono::steady_clock::now();
-    auto reverse_filter = [&](const char* objective_name,
-                              bool active_objective,
-                              const Vector& physical_gradient,
-                              Vector& design_gradient) {
-        design_gradient.SetSize(design_to_cell->Width());
-        design_gradient = 0.0;
-        if (!active_objective) {
-            return true;
-        }
-        Vector filtered_gradient(cell_to_level_set->Width());
-        cell_to_level_set->MultTranspose(
-            physical_gradient, filtered_gradient);
-        Vector filter_adjoint(filtered_gradient.Size());
-        filter_adjoint = 0.0;
-        filter_solver.Mult(filtered_gradient, filter_adjoint);
-        if (!filter_solver.GetConverged()) {
-            std::ostringstream message;
-            message << "The " << objective_name
-                    << " adjoint PDE filter solve did not converge: "
-                    << filter_solver.GetNumIterations()
-                    << " CG iterations, relative residual " << std::scientific
-                    << filter_solver.GetFinalRelNorm() << ".";
-            log(LogLevel::Error, message.str());
-            return false;
-        }
-        Vector center_gradient(filter_adjoint.Size());
-        for (int cell = 0; cell < center_gradient.Size(); ++cell) {
-            center_gradient[cell] = cell_volumes[cell] * filter_adjoint[cell];
-        }
-        design_to_cell->MultTranspose(center_gradient, design_gradient);
-        design_gradient *= level_set_scale;
-        design_gradient.SetSubVectorComplement(lset.activeDesignDofs, 0.0);
-        if (design_gradient.CheckFinite() != 0) {
-            log(LogLevel::Error,
-                std::string("The ") + objective_name
-                    + " discrete-adjoint design gradient is non-finite.");
-            return false;
-        }
-        return true;
-    };
-    if (!reverse_filter(
-            "pass-band", has_pass, pass_physical_gradient,
-            pass_design_gradient)
-        || !reverse_filter(
-            "stop-band", has_stop, stop_physical_gradient,
-            stop_design_gradient)) {
+    if (!detail::reverseFilterGradients(
+            *filter_matrix,
+            *design_to_cell,
+            *cell_to_level_set,
+            cell_volumes,
+            lset.activeDesignDofs,
+            level_set_scale,
+            has_pass,
+            has_stop,
+            pass_physical_gradient,
+            stop_physical_gradient,
+            pass_design_gradient,
+            stop_design_gradient,
+            performance_data,
+            log)) {
         return false;
     }
-    performance_data.filterAdjointSeconds = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - filter_started_at).count();
     log(LogLevel::Message,
         "Completed pass/stop adjoints in "
             + std::to_string(performance_data.passAdjointSeconds) + " / "

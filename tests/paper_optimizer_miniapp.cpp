@@ -252,6 +252,11 @@ bool write_report_data(
            << "    \"height_m\": " << solver_settings.sy << ",\n"
            << "    \"duration_s\": " << solver_settings.duration << ",\n"
            << "    \"dt_s\": " << solver_settings.dt << ",\n"
+           << "    \"linear_solver\": \""
+           << (solver_settings.linearSolveMethod
+                    == App::LinearSolveMethod::mumps ? "mumps" : "fgmres")
+           << "\",\n"
+           << "    \"mpi_ranks\": " << solver_performance.mpiRanks << ",\n"
            << "    \"filter_radius_m\": " << optimizer_settings.filterRadius << ",\n"
            << "    \"maximum_iterations\": " << optimizer_settings.maxIterations << "\n"
            << "  },\n"
@@ -287,6 +292,14 @@ bool write_report_data(
            << solver_performance.cutDifferentiationSeconds << ",\n"
            << "      \"filter_adjoint_seconds\": "
            << solver_performance.filterAdjointSeconds << ",\n"
+           << "      \"mumps_initial_factorization_seconds\": "
+           << solver_performance.mumpsInitialFactorizationSeconds << ",\n"
+           << "      \"mumps_effective_factorization_seconds\": "
+           << solver_performance.mumpsEffectiveFactorizationSeconds << ",\n"
+           << "      \"mumps_solve_seconds\": "
+           << solver_performance.mumpsSolveSeconds << ",\n"
+           << "      \"maximum_forward_residual\": "
+           << solver_performance.maximumForwardResidual << ",\n"
            << "      \"forward_fgmres_solves\": "
            << solver_performance.forwardFgmresSolves << ",\n"
            << "      \"forward_fgmres_iterations\": "
@@ -472,11 +485,28 @@ bool write_report_data(
 
 int main(int argc, char** argv)
 {
-    const bool paper_mode = argc > 1 && std::string(argv[1]) == "--paper";
-    if (argc > 1 && !paper_mode) {
-        std::cerr << "Usage: paper_optimizer_miniapp [--paper]\n";
+    bool paper_mode = false;
+    bool use_mumps = false;
+    for (int argument = 1; argument < argc; ++argument) {
+        const std::string option = argv[argument];
+        if (option == "--paper") {
+            paper_mode = true;
+        }
+        else if (option == "--mumps") {
+            use_mumps = true;
+        }
+        else {
+            std::cerr
+                << "Usage: paper_optimizer_miniapp [--paper] [--mumps]\n";
+            return 1;
+        }
+    }
+#if !METAMATERIAL_USE_MPI
+    if (use_mumps) {
+        std::cerr << "--mumps requires the parallel-cpu build.\n";
         return 1;
     }
+#endif
 
     int provided = 0;
     if (MPI_Init_thread(&argc, &argv, MPI_THREAD_SERIALIZED, &provided)
@@ -489,6 +519,8 @@ int main(int argc, char** argv)
         MPI_Finalize();
         return 1;
     }
+    int rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
     int exit_code = 0;
     {
@@ -497,6 +529,9 @@ int main(int argc, char** argv)
 
         App::SolverSettings solver_settings;
         App::OptimizerSettings optimizer_settings;
+        solver_settings.linearSolveMethod = use_mumps
+            ? App::LinearSolveMethod::mumps
+            : App::LinearSolveMethod::fgmres;
         if (!paper_mode) {
             solver_settings.nx = 100;
             solver_settings.ny = 20;
@@ -540,61 +575,76 @@ int main(int argc, char** argv)
         };
 
         App::Solver solver(
-            solver_settings, optimizer_settings, geometry, result, log);
-        App::Optimizer optimizer_instance(
-            optimizer_settings, solver, geometry, result, log);
-        optimizer = &optimizer_instance;
-        started_at = std::chrono::steady_clock::now();
-        optimizer->run();
-        const double total_wall_seconds = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - started_at).count();
-
-        bool bounds_hold = true;
-        for (int i = 0; i < geometry.activeDesignDofs.Size(); ++i) {
-            const double value = geometry.design[geometry.activeDesignDofs[i]];
-            bounds_hold = bounds_hold
-                && std::isfinite(value) && value >= 0.0 && value <= 1.0;
-        }
-        const double initial_worst = history.empty()
-            ? std::numeric_limits<double>::quiet_NaN()
-            : std::max(history.front().pass, history.front().stop);
-        const double final_worst = std::max(
-            optimizer->get_pass_objective(), optimizer->get_stop_objective());
-        const bool gate_passed =
-            optimizer->get_status() == App::OptimizerStatus::MaximumIterations
-            && optimizer->get_iteration() == optimizer_settings.maxIterations
-            && optimizer->is_exportable()
-            && bounds_hold
-            && std::isfinite(initial_worst)
-            && std::isfinite(final_worst)
-            && final_worst < initial_worst;
-
-        const char* mode = paper_mode ? "paper" : "quick";
-        const std::filesystem::path output_path =
-            std::filesystem::path("test-results")
-            / "paper-optimizer" / (std::string(mode) + ".json");
-        if (!write_report_data(
-                output_path,
-                mode,
-                gate_passed,
-                solver_settings,
-                optimizer_settings,
-                *optimizer,
-                solver,
-                geometry,
-                history,
-                failure_message,
-                total_wall_seconds)) {
-            std::cerr << "Could not write the optimizer report data.\n";
-            exit_code = 1;
+            solver_settings,
+            optimizer_settings,
+            geometry,
+            result,
+            log,
+            METAMATERIAL_USE_MPI != 0);
+        if (rank != 0) {
+            solver.parallelWorkerLoop();
         }
         else {
-            std::cout << "Wrote " << std::filesystem::absolute(output_path)
-                      << '\n';
-        }
-        if (!gate_passed) {
-            std::cerr << "The optimizer did not improve the app-like objective.\n";
-            exit_code = 1;
+            App::Optimizer optimizer_instance(
+                optimizer_settings, solver, geometry, result, log);
+            optimizer = &optimizer_instance;
+            started_at = std::chrono::steady_clock::now();
+            optimizer->run();
+#if METAMATERIAL_USE_MPI
+            solver.shutdownParallelWorkers();
+#endif
+            const double total_wall_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - started_at).count();
+
+            bool bounds_hold = true;
+            for (int i = 0; i < geometry.activeDesignDofs.Size(); ++i) {
+                const double value = geometry.design[geometry.activeDesignDofs[i]];
+                bounds_hold = bounds_hold
+                    && std::isfinite(value) && value >= 0.0 && value <= 1.0;
+            }
+            const double initial_worst = history.empty()
+                ? std::numeric_limits<double>::quiet_NaN()
+                : std::max(history.front().pass, history.front().stop);
+            const double final_worst = std::max(
+                optimizer->get_pass_objective(), optimizer->get_stop_objective());
+            const bool gate_passed =
+                optimizer->get_status() == App::OptimizerStatus::MaximumIterations
+                && optimizer->get_iteration() == optimizer_settings.maxIterations
+                && optimizer->is_exportable()
+                && bounds_hold
+                && std::isfinite(initial_worst)
+                && std::isfinite(final_worst)
+                && final_worst < initial_worst;
+
+            const std::string mode = std::string(
+                paper_mode ? "paper" : "quick")
+                + (use_mumps ? "-mumps" : "");
+            const std::filesystem::path output_path =
+                std::filesystem::path("test-results")
+                / "paper-optimizer" / (mode + ".json");
+            if (!write_report_data(
+                    output_path,
+                    mode.c_str(),
+                    gate_passed,
+                    solver_settings,
+                    optimizer_settings,
+                    *optimizer,
+                    solver,
+                    geometry,
+                    history,
+                    failure_message,
+                    total_wall_seconds)) {
+                std::cerr << "Could not write the optimizer report data.\n";
+                exit_code = 1;
+            }
+            else {
+                std::cout << "Wrote " << std::filesystem::absolute(output_path)
+                          << '\n';
+            }
+            if (!gate_passed) {
+                std::cerr << "The optimizer did not improve the app-like objective.\n";
+                exit_code = 1;
+            }
         }
     }
 

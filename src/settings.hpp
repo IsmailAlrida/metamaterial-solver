@@ -15,6 +15,11 @@ enum class SolverDevice {
     parallelCuda
 };
 
+enum class LinearSolveMethod {
+    fgmres,
+    mumps
+};
+
 enum class PhysicsProblem {
     vibroacoustic,
     electromagnetic
@@ -126,6 +131,7 @@ struct SolverSettings {
     bool useHannWindow = true;
     PhysicsSettings physics;
     SolverDevice device = SolverDevice::serial;
+    LinearSolveMethod linearSolveMethod = LinearSolveMethod::fgmres;
     
 };
 

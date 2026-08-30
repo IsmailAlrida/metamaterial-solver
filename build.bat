@@ -26,6 +26,10 @@ if not "%BACKEND%"=="serial" if not "%BACKEND%"=="parallel-cpu" (
 
 call :activate_msvc
 if errorlevel 1 exit /b 1
+if /I "%BACKEND%"=="parallel-cpu" (
+    call :activate_oneapi
+    if errorlevel 1 exit /b 1
+)
 
 set "BUILD_ROOT=build"
 set "BUILD_DIR=%BUILD_ROOT%\%BACKEND%"
@@ -80,7 +84,7 @@ exit /b 1
 
 :activate_msvc
 where cl.exe >nul 2>nul
-if not errorlevel 1 exit /b 0
+if not errorlevel 1 if defined INCLUDE exit /b 0
 
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 if exist "%VSWHERE%" goto find_msvc
@@ -97,6 +101,31 @@ exit /b 1
 :load_msvc
 call "%VS_INSTALL%\Common7\Tools\VsDevCmd.bat" -no_logo -arch=x64 -host_arch=x64
 exit /b %errorlevel%
+
+:activate_oneapi
+set "ONEAPI_COMPILER_VARS=%ProgramFiles(x86)%\Intel\oneAPI\compiler\latest\env\vars.bat"
+set "ONEAPI_MKL_VARS=%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\env\vars.bat"
+if not exist "%ONEAPI_COMPILER_VARS%" (
+    echo Intel oneAPI environment is missing. Run setup.bat first.
+    exit /b 1
+)
+if not exist "%ONEAPI_MKL_VARS%" (
+    echo Intel oneMKL environment is missing. Run setup.bat first.
+    exit /b 1
+)
+call "%ONEAPI_COMPILER_VARS%" >nul
+if errorlevel 1 exit /b %errorlevel%
+call "%ONEAPI_MKL_VARS%" >nul
+if errorlevel 1 exit /b %errorlevel%
+set "MSMPI_INC=%ProgramFiles(x86)%\Microsoft SDKs\MPI\Include"
+set "MSMPI_LIB64=%ProgramFiles(x86)%\Microsoft SDKs\MPI\Lib\x64"
+set "PATH=%ProgramFiles%\Microsoft MPI\Bin;%PATH%"
+where ifx.exe >nul 2>nul
+if errorlevel 1 (
+    echo Intel Fortran Compiler is missing. Run setup.bat first.
+    exit /b 1
+)
+exit /b 0
 
 :fetch_glvis
 if not exist extern mkdir extern

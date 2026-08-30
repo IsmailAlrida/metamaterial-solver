@@ -198,8 +198,8 @@ private:
         }
         optimizer.geometry.enforceDesignConstraints();
 
-        if (!optimizer.solver.assembleSolutionSpace()
-            || !optimizer.solver.solve()) {
+        if (!optimizer.solver.assembleSolutionSpace(METAMATERIAL_USE_MPI != 0)
+            || !optimizer.solver.solve(METAMATERIAL_USE_MPI != 0)) {
             optimizer.geometry.design = previous_design;
             optimizer.geometry.enforceDesignConstraints();
             throw std::runtime_error("The forward analysis failed inside ParOpt.");
@@ -238,7 +238,8 @@ private:
                 objective.has_stop
                     ? objective.stop_spectrum_derivative : no_derivative,
                 pass_gradient,
-                stop_gradient)) {
+                stop_gradient,
+                METAMATERIAL_USE_MPI != 0)) {
             throw std::runtime_error(
                 "The pass/stop discrete adjoint failed.");
         }
@@ -285,9 +286,9 @@ void Optimizer::run()
     status.store(OptimizerStatus::Working);
 
     try {
-        if (!solver.setMesh()
-            || !solver.assembleSolutionSpace()
-            || !solver.solve()) {
+        if (!solver.setMesh(METAMATERIAL_USE_MPI != 0)
+            || !solver.assembleSolutionSpace(METAMATERIAL_USE_MPI != 0)
+            || !solver.solve(METAMATERIAL_USE_MPI != 0)) {
             status.store(
                 solver.get_status() == SolverStatus::Diverged
                     ? OptimizerStatus::Diverged
@@ -479,6 +480,7 @@ bool Optimizer::optimize()
         ParOptOptimizer::addDefaultOptions(options.get());
         int option_error = 0;
         option_error |= options->setOption("algorithm", "mma");
+        option_error |= options->setOption("output_file", "");
         option_error |= options->setOption("mma_output_file", "");
         option_error |= options->setOption(
             "mma_max_iterations", settings.maxIterations);
