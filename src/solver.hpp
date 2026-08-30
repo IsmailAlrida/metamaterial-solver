@@ -90,6 +90,16 @@ namespace App {
         std::unique_ptr<mfem::SparseMatrix> M;
         std::unique_ptr<mfem::SparseMatrix> C;
         std::unique_ptr<mfem::SparseMatrix> K;
+        std::unique_ptr<mfem::SparseMatrix> Muu_block;
+        std::unique_ptr<mfem::SparseMatrix> Cuu_block;
+        std::unique_ptr<mfem::SparseMatrix> Kuu_block;
+        std::unique_ptr<mfem::SparseMatrix> Mpp_block;
+        std::unique_ptr<mfem::SparseMatrix> Cpp_block;
+        std::unique_ptr<mfem::SparseMatrix> Kpp_block;
+        std::unique_ptr<mfem::SparseMatrix> effective_displacement_block;
+        std::unique_ptr<mfem::SparseMatrix> effective_pressure_block;
+        std::unique_ptr<mfem::SparseMatrix> initial_displacement_block;
+        std::unique_ptr<mfem::SparseMatrix> initial_pressure_block;
         std::unique_ptr<mfem::SparseMatrix> effective_matrix;
         std::unique_ptr<mfem::SparseMatrix> effective_matrix_transpose;
         std::unique_ptr<mfem::SparseMatrix> initial_matrix;

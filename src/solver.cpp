@@ -41,6 +41,12 @@ enum class CartesianBoundary3D {
     top = 6
 };
 
+#if METAMATERIAL_USE_CUDA
+using PhysicsBlockSmoother = DSmoother;
+#else
+using PhysicsBlockSmoother = GSSmoother;
+#endif
+
 } // namespace
 
 // move this later outside?
@@ -146,6 +152,16 @@ bool App::Solver::setMesh()
     M.reset();
     C.reset();
     K.reset();
+    Muu_block.reset();
+    Cuu_block.reset();
+    Kuu_block.reset();
+    Mpp_block.reset();
+    Cpp_block.reset();
+    Kpp_block.reset();
+    effective_displacement_block.reset();
+    effective_pressure_block.reset();
+    initial_displacement_block.reset();
+    initial_pressure_block.reset();
     effective_matrix.reset();
     effective_matrix_transpose.reset();
     initial_matrix.reset();
@@ -228,6 +244,16 @@ bool App::Solver::assembleSolutionSpace()
     M.reset();
     C.reset();
     K.reset();
+    Muu_block.reset();
+    Cuu_block.reset();
+    Kuu_block.reset();
+    Mpp_block.reset();
+    Cpp_block.reset();
+    Kpp_block.reset();
+    effective_displacement_block.reset();
+    effective_pressure_block.reset();
+    initial_displacement_block.reset();
+    initial_pressure_block.reset();
     effective_matrix.reset();
     effective_matrix_transpose.reset();
     initial_matrix.reset();
@@ -408,7 +434,7 @@ bool App::Solver::assembleSolutionSpace()
         new VectorMassIntegrator(fictitious_solid_density), fixed_air_marker);
     Muu_form.Assemble();
     Muu_form.Finalize();
-    std::unique_ptr<SparseMatrix> Muu(Muu_form.LoseMat());
+    Muu_block.reset(Muu_form.LoseMat());
 
     BilinearForm Kuu_form(displacement_fes.get());
     Kuu_form.AddDomainIntegrator(new ImplicitDomainIntegrator(
@@ -422,7 +448,7 @@ bool App::Solver::assembleSolutionSpace()
         fictitious_solid_lambda, fictitious_solid_mu), fixed_air_marker);
     Kuu_form.Assemble();
     Kuu_form.Finalize();
-    std::unique_ptr<SparseMatrix> Kuu(Kuu_form.LoseMat());
+    Kuu_block.reset(Kuu_form.LoseMat());
 
     BilinearForm Mpp_form(scalar_fes.get());
     Mpp_form.AddDomainIntegrator(new ImplicitDomainIntegrator(
@@ -436,7 +462,7 @@ bool App::Solver::assembleSolutionSpace()
         new MassIntegrator(acoustic_mass), fixed_air_marker);
     Mpp_form.Assemble();
     Mpp_form.Finalize();
-    std::unique_ptr<SparseMatrix> Mpp(Mpp_form.LoseMat());
+    Mpp_block.reset(Mpp_form.LoseMat());
 
     BilinearForm Kpp_form(scalar_fes.get());
     Kpp_form.AddDomainIntegrator(new ImplicitDomainIntegrator(
@@ -450,7 +476,7 @@ bool App::Solver::assembleSolutionSpace()
         new DiffusionIntegrator(acoustic_stiffness), fixed_air_marker);
     Kpp_form.Assemble();
     Kpp_form.Finalize();
-    std::unique_ptr<SparseMatrix> Kpp(Kpp_form.LoseMat());
+    Kpp_block.reset(Kpp_form.LoseMat());
 
     MixedBilinearForm Kup_form(scalar_fes.get(), displacement_fes.get());
     Kup_form.AddDomainIntegrator(new ImplicitSurfaceNormalIntegrator(
@@ -473,8 +499,8 @@ bool App::Solver::assembleSolutionSpace()
     const real_t alpha_d = 2.0 * physics->zeta * omega_1 * omega_2
         / (omega_1 + omega_2);
     const real_t beta_d = 2.0 * physics->zeta / (omega_1 + omega_2);
-    std::unique_ptr<SparseMatrix> Cuu(
-        Add(alpha_d, *Muu, beta_d, *Kuu));
+    Cuu_block.reset(Add(
+        alpha_d, *Muu_block, beta_d, *Kuu_block));
 
     Array<int> absorbing_marker(mesh->bdr_attributes.Max());
     absorbing_marker = 0;
@@ -493,7 +519,7 @@ bool App::Solver::assembleSolutionSpace()
         new BoundaryMassIntegrator(inverse_impedance), absorbing_marker);
     Cpp_form.Assemble();
     Cpp_form.Finalize();
-    std::unique_ptr<SparseMatrix> Cpp(Cpp_form.LoseMat());
+    Cpp_block.reset(Cpp_form.LoseMat());
     std::unique_ptr<SparseMatrix> Kup_transpose(Transpose(*Kup));
     std::unique_ptr<SparseMatrix> coupling_residual(
         Add(1.0, *Mpu, 1.0, *Kup_transpose));
@@ -512,18 +538,18 @@ bool App::Solver::assembleSolutionSpace()
     offsets[2] = displacement_size + pressure_size;
     pressure_offset = displacement_size;
     BlockMatrix M_blocks(offsets);
-    M_blocks.SetBlock(0, 0, Muu.get());
+    M_blocks.SetBlock(0, 0, Muu_block.get());
     M_blocks.SetBlock(1, 0, Mpu.get());
-    M_blocks.SetBlock(1, 1, Mpp.get());
+    M_blocks.SetBlock(1, 1, Mpp_block.get());
     M.reset(M_blocks.CreateMonolithic());
     BlockMatrix C_blocks(offsets);
-    C_blocks.SetBlock(0, 0, Cuu.get());
-    C_blocks.SetBlock(1, 1, Cpp.get());
+    C_blocks.SetBlock(0, 0, Cuu_block.get());
+    C_blocks.SetBlock(1, 1, Cpp_block.get());
     C.reset(C_blocks.CreateMonolithic());
     BlockMatrix K_blocks(offsets);
-    K_blocks.SetBlock(0, 0, Kuu.get());
+    K_blocks.SetBlock(0, 0, Kuu_block.get());
     K_blocks.SetBlock(0, 1, Kup.get());
-    K_blocks.SetBlock(1, 1, Kpp.get());
+    K_blocks.SetBlock(1, 1, Kpp_block.get());
     K.reset(K_blocks.CreateMonolithic());
     if (M->CheckFinite() != 0 || C->CheckFinite() != 0 || K->CheckFinite() != 0) {
         log(LogLevel::Error, "The assembled global matrices contain non-finite values.");
@@ -631,7 +657,9 @@ bool App::Solver::solve()
     performance_data.forwardFgmresSolves = 0;
     performance_data.maximumForwardFgmresIterations = 0;
 
-    if (!mesh || !M || !C || !K) {
+    if (!mesh || !M || !C || !K
+        || !Muu_block || !Cuu_block || !Kuu_block
+        || !Mpp_block || !Cpp_block || !Kpp_block) {
         log(LogLevel::Error,
             "Call setMesh() and assembleSolutionSpace() before solve().");
         status.store(SolverStatus::Error);
@@ -706,13 +734,30 @@ bool App::Solver::solve()
         K_hat->EliminateBC(
             displacement_essential_tdofs, Operator::DIAG_ONE);
 
-        // ponytail: Jacobi keeps CUDA data on-device; use a physics block
-        // preconditioner only if its measured iteration count is excessive.
-#if METAMATERIAL_USE_CUDA
-        DSmoother K_hat_preconditioner(*K_hat);
-#else
-        GSSmoother K_hat_preconditioner(*K_hat);
-#endif
+        std::unique_ptr<SparseMatrix> Muu_and_Cuu(
+            Add(a_6, *Muu_block, a_3, *Cuu_block));
+        effective_displacement_block.reset(
+            Add(1.0, *Kuu_block, 1.0, *Muu_and_Cuu));
+        std::unique_ptr<SparseMatrix> Mpp_and_Cpp(
+            Add(a_6, *Mpp_block, a_3, *Cpp_block));
+        effective_pressure_block.reset(
+            Add(1.0, *Kpp_block, 1.0, *Mpp_and_Cpp));
+        effective_displacement_block->EliminateBC(
+            displacement_essential_tdofs, Operator::DIAG_ONE);
+
+        Array<int> block_offsets(3);
+        block_offsets[0] = 0;
+        block_offsets[1] = pressure_offset;
+        block_offsets[2] = K_hat->Height();
+        PhysicsBlockSmoother displacement_preconditioner(
+            *effective_displacement_block);
+        PhysicsBlockSmoother pressure_preconditioner(
+            *effective_pressure_block);
+        BlockDiagonalPreconditioner K_hat_preconditioner(block_offsets);
+        K_hat_preconditioner.SetDiagonalBlock(
+            0, &displacement_preconditioner);
+        K_hat_preconditioner.SetDiagonalBlock(
+            1, &pressure_preconditioner);
         FGMRESSolver K_hat_solver;
         K_hat_solver.SetPreconditioner(K_hat_preconditioner);
         K_hat_solver.SetOperator(*K_hat);
@@ -751,11 +796,21 @@ bool App::Solver::solve()
         auto M_system = std::make_unique<SparseMatrix>(*M);
         M_system->EliminateBC(
             displacement_essential_tdofs, Operator::DIAG_ONE);
-#if METAMATERIAL_USE_CUDA
-        DSmoother M_preconditioner(*M_system);
-#else
-        GSSmoother M_preconditioner(*M_system);
-#endif
+        initial_displacement_block =
+            std::make_unique<SparseMatrix>(*Muu_block);
+        initial_pressure_block =
+            std::make_unique<SparseMatrix>(*Mpp_block);
+        initial_displacement_block->EliminateBC(
+            displacement_essential_tdofs, Operator::DIAG_ONE);
+        PhysicsBlockSmoother initial_displacement_preconditioner(
+            *initial_displacement_block);
+        PhysicsBlockSmoother initial_pressure_preconditioner(
+            *initial_pressure_block);
+        BlockDiagonalPreconditioner M_preconditioner(block_offsets);
+        M_preconditioner.SetDiagonalBlock(
+            0, &initial_displacement_preconditioner);
+        M_preconditioner.SetDiagonalBlock(
+            1, &initial_pressure_preconditioner);
         FGMRESSolver M_solver;
         M_solver.SetPreconditioner(M_preconditioner);
         M_solver.SetOperator(*M_system);
@@ -1332,6 +1387,8 @@ bool App::Solver::differentiateFrequencyResponses(
     };
     if (!mesh || mesh->Dimension() != 2 || !M || !C || !K
         || !effective_matrix || !initial_matrix
+        || !effective_displacement_block || !effective_pressure_block
+        || !initial_displacement_block || !initial_pressure_block
         || !design_to_cell || !cell_to_level_set || !filter_matrix
         || time_steps <= 0 || state_size <= 0
         || (!has_pass && !has_stop)
@@ -1417,11 +1474,19 @@ bool App::Solver::differentiateFrequencyResponses(
     if (!effective_matrix_transpose) {
         effective_matrix_transpose.reset(Transpose(*effective_matrix));
     }
-#if METAMATERIAL_USE_CUDA
-    DSmoother K_hat_preconditioner(*effective_matrix_transpose);
-#else
-    GSSmoother K_hat_preconditioner(*effective_matrix_transpose);
-#endif
+    Array<int> block_offsets(3);
+    block_offsets[0] = 0;
+    block_offsets[1] = pressure_offset;
+    block_offsets[2] = state_size;
+    PhysicsBlockSmoother displacement_preconditioner(
+        *effective_displacement_block);
+    PhysicsBlockSmoother pressure_preconditioner(
+        *effective_pressure_block);
+    BlockDiagonalPreconditioner K_hat_preconditioner(block_offsets);
+    K_hat_preconditioner.SetDiagonalBlock(
+        0, &displacement_preconditioner);
+    K_hat_preconditioner.SetDiagonalBlock(
+        1, &pressure_preconditioner);
     FGMRESSolver K_hat_solver;
     K_hat_solver.SetPreconditioner(K_hat_preconditioner);
     K_hat_solver.SetOperator(*effective_matrix_transpose);
@@ -1435,11 +1500,15 @@ bool App::Solver::differentiateFrequencyResponses(
     if (!initial_matrix_transpose) {
         initial_matrix_transpose.reset(Transpose(*initial_matrix));
     }
-#if METAMATERIAL_USE_CUDA
-    DSmoother initial_preconditioner(*initial_matrix_transpose);
-#else
-    GSSmoother initial_preconditioner(*initial_matrix_transpose);
-#endif
+    PhysicsBlockSmoother initial_displacement_preconditioner(
+        *initial_displacement_block);
+    PhysicsBlockSmoother initial_pressure_preconditioner(
+        *initial_pressure_block);
+    BlockDiagonalPreconditioner initial_preconditioner(block_offsets);
+    initial_preconditioner.SetDiagonalBlock(
+        0, &initial_displacement_preconditioner);
+    initial_preconditioner.SetDiagonalBlock(
+        1, &initial_pressure_preconditioner);
     FGMRESSolver initial_solver;
     initial_solver.SetPreconditioner(initial_preconditioner);
     initial_solver.SetOperator(*initial_matrix_transpose);
