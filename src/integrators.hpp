@@ -111,6 +111,7 @@ private:
     int level_set_order;
     mfem::real_t scale;
     bool transpose;
+    int degenerate_normal_count = 0;
 
 public:
     /** @brief Construct an implicit-surface normal coupling integrator.
@@ -139,6 +140,12 @@ public:
           scale(scale_),
           transpose(transpose_)
     {
+    }
+
+    /** @brief Return the number of interface points with no usable normal. */
+    int GetDegenerateNormalCount() const
+    {
+        return degenerate_normal_count;
     }
 
     /** @brief Assemble the local mixed matrix on @f$\{\phi=0\}@f$.
@@ -209,6 +216,7 @@ public:
             phi.GetGradient(transformation, normal);
             const mfem::real_t normal_length = normal.Norml2();
             if (normal_length <= 1.0e-12) {
+                ++degenerate_normal_count;
                 continue;
             }
             normal /= normal_length;

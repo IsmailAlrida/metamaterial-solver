@@ -666,8 +666,10 @@ add_executable(paper_optimizer_miniapp
 target_include_directories(paper_optimizer_miniapp PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${fftw_SOURCE_DIR}/api"
+    "${assimp_SOURCE_DIR}/contrib/zip/src"
 )
 target_link_libraries(paper_optimizer_miniapp PRIVATE
+    assimp
     Eigen3::Eigen
     ParOpt::paropt
     fftw3

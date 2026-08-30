@@ -19,6 +19,7 @@
 
 #include <Eigen/Dense>
 #include "mpi.h"
+#include "zip.h"
 
 #include "optimizer.hpp"
 #include "solver.hpp"
@@ -254,6 +255,8 @@ bool write_report_data(
     const int paper_page = high_pass ? 18 : 13;
     const double paper_final_pass = high_pass ? 13.7815 : 5.06428;
     const double paper_final_stop = high_pass ? 11.6695 : 4.99466;
+    const bool has_paper_reference =
+        std::string(mode).rfind("high-pass-20db", 0) != 0;
 
     output << "{\n"
            << "  \"schema_version\": 5,\n"
@@ -360,25 +363,30 @@ bool write_report_data(
            << "    },\n"
            << "    \"paper_wall_seconds\": null,\n"
            << "    \"paper_runtime_note\": \"Not reported in the paper.\"\n"
-           << "  },\n"
-           << "  \"paper_reference\": {\n"
-           << "    \"case\": " << std::quoted(paper_case) << ",\n"
-           << "    \"figure\": " << std::quoted(paper_figure) << ",\n"
-           << "    \"page\": " << paper_page << ",\n"
-           << "    \"settings\": {\n"
-           << "      \"nx\": 250,\n"
-           << "      \"ny\": 50,\n"
-           << "      \"duration_s\": 0.02,\n"
-           << "      \"dt_s\": 0.00002,\n"
-           << "      \"maximum_iterations\": 400\n"
-           << "    },\n"
-           << "    \"objectives\": {\n"
-           << "      \"final_pass\": " << paper_final_pass << ",\n"
-           << "      \"final_stop\": " << paper_final_stop << "\n"
-           << "    },\n"
-           << "    \"optimizer_wall_seconds\": null\n"
-           << "  },\n"
-           << "  \"objectives\": {\n"
+           << "  },\n";
+    if (has_paper_reference) {
+        output << "  \"paper_reference\": {\n"
+               << "    \"case\": " << std::quoted(paper_case) << ",\n"
+               << "    \"figure\": " << std::quoted(paper_figure) << ",\n"
+               << "    \"page\": " << paper_page << ",\n"
+               << "    \"settings\": {\n"
+               << "      \"nx\": 250,\n"
+               << "      \"ny\": 50,\n"
+               << "      \"duration_s\": 0.02,\n"
+               << "      \"dt_s\": 0.00002,\n"
+               << "      \"maximum_iterations\": 400\n"
+               << "    },\n"
+               << "    \"objectives\": {\n"
+               << "      \"final_pass\": " << paper_final_pass << ",\n"
+               << "      \"final_stop\": " << paper_final_stop << "\n"
+               << "    },\n"
+               << "    \"optimizer_wall_seconds\": null\n"
+               << "  },\n";
+    }
+    else {
+        output << "  \"paper_reference\": null,\n";
+    }
+    output << "  \"objectives\": {\n"
            << "    \"initial_worst\": ";
     write_number(output, initial_worst);
     output << ",\n    \"final_pass\": ";
@@ -500,13 +508,42 @@ bool write_report_data(
     return static_cast<bool>(output);
 }
 
+bool write_response_bundle(
+    const std::filesystem::path& archive_path,
+    const std::filesystem::path& response_path)
+{
+    zip_t* archive = zip_open(
+        archive_path.string().c_str(), ZIP_DEFAULT_COMPRESSION_LEVEL, 'w');
+    if (archive == nullptr) {
+        return false;
+    }
+
+    const auto add_file = [&](const char* name,
+                              const std::filesystem::path& source) {
+        if (zip_entry_open(archive, name) != 0) {
+            return false;
+        }
+        const bool written =
+            zip_entry_fwrite(archive, source.string().c_str()) == 0;
+        return zip_entry_close(archive) == 0 && written;
+    };
+    const bool written = add_file("response.json", response_path)
+        && add_file("metamaterial_response.py",
+                    "scripts/metamaterial_response.py")
+        && add_file("Metamaterial.m", "scripts/Metamaterial.m");
+    zip_close(archive);
+    return written;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
 {
     bool paper_mode = false;
     bool high_pass = false;
+    bool high_pass_20db = false;
     bool use_mumps = false;
+    int requested_iterations = 0;
     for (int argument = 1; argument < argc; ++argument) {
         const std::string option = argv[argument];
         if (option == "--paper") {
@@ -516,12 +553,30 @@ int main(int argc, char** argv)
             paper_mode = true;
             high_pass = true;
         }
+        else if (option == "--high-pass-20db") {
+            paper_mode = true;
+            high_pass_20db = true;
+        }
         else if (option == "--mumps") {
             use_mumps = true;
         }
+        else if (option == "--iterations" && argument + 1 < argc) {
+            try {
+                requested_iterations = std::stoi(argv[++argument]);
+            }
+            catch (...) {
+                requested_iterations = 0;
+            }
+            if (requested_iterations <= 0) {
+                std::cerr << "--iterations requires a positive integer.\n";
+                return 1;
+            }
+        }
         else {
             std::cerr
-                << "Usage: paper_optimizer_miniapp [--paper|--high-pass] [--mumps]\n";
+                << "Usage: paper_optimizer_miniapp "
+                   "[--paper|--high-pass|--high-pass-20db] "
+                   "[--iterations N] [--mumps]\n";
             return 1;
         }
     }
@@ -557,7 +612,16 @@ int main(int argc, char** argv)
         solver_settings.linearSolveMethod = use_mumps
             ? App::LinearSolveMethod::mumps
             : App::LinearSolveMethod::fgmres;
-        if (high_pass) {
+        if (high_pass_20db) {
+            solver_settings.duration = 0.05;
+            optimizer_settings.frequencyMin = 60.0f;
+            optimizer_settings.frequencyMax = 4000.0f;
+            optimizer_settings.frequencyBands = {
+                {App::FrequencyBandType::stop, 60.0, 1000.0, 0.1},
+                {App::FrequencyBandType::pass, 1000.0, 4000.0, 1.0}
+            };
+        }
+        else if (high_pass) {
             solver_settings.initialPatternX = 7;
             solver_settings.initialPatternY = 7;
             optimizer_settings.frequencyMin = 1000.0f;
@@ -575,6 +639,9 @@ int main(int argc, char** argv)
             solver_settings.duration = 0.008;
             solver_settings.dt = 0.0001;
             optimizer_settings.maxIterations = 20;
+        }
+        if (requested_iterations > 0) {
+            optimizer_settings.maxIterations = requested_iterations;
         }
 
         App::LevelSet geometry;
@@ -666,7 +733,9 @@ int main(int argc, char** argv)
                 && final_worst < initial_worst;
 
             const std::string mode = std::string(
-                high_pass ? "high-pass" : (paper_mode ? "paper" : "quick"))
+                high_pass_20db ? "high-pass-20db"
+                    : high_pass ? "high-pass"
+                    : paper_mode ? "paper" : "quick")
                 + (use_mumps ? "-mumps" : "");
             const std::filesystem::path output_path =
                 std::filesystem::path("test-results")
@@ -690,6 +759,16 @@ int main(int argc, char** argv)
             else {
                 std::cout << "Wrote " << std::filesystem::absolute(output_path)
                           << '\n';
+                const std::filesystem::path archive_path =
+                    output_path.parent_path() / (mode + "-bundle.zip");
+                if (!write_response_bundle(archive_path, output_path)) {
+                    std::cerr << "Could not write the response ZIP bundle.\n";
+                    exit_code = 1;
+                }
+                else {
+                    std::cout << "Wrote "
+                              << std::filesystem::absolute(archive_path) << '\n';
+                }
             }
             if (interrupt_requested != 0
                 && optimizer->get_status() == App::OptimizerStatus::Cancelled) {

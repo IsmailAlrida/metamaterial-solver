@@ -58,7 +58,6 @@ int main(int argc, char** argv)
         solver.SetPrintLevel(0);
         solver.SetMatrixSymType(mfem::MUMPSSolver::UNSYMMETRIC);
         solver.SetReorderingStrategy(mfem::MUMPSSolver::PORD);
-        solver.SetReorderingReuse(true);
         solver.SetOperator(*matrix);
         solver.Mult(right_hand_side, solution);
 

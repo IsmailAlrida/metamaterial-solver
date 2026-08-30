@@ -104,15 +104,17 @@ public:
         ParOptScalar* constraints) override
     {
         evaluate(variables);
-        if (objective_evaluations > 0) {
-            optimizer.iteration.store(objective_evaluations);
+        if (initial_mma_evaluation) {
+            initial_mma_evaluation = false;
+        }
+        else {
+            const int completed_iteration = optimizer.iteration.fetch_add(1) + 1;
             optimizer.log(LogLevel::Message,
-                "Completed optimization iteration "
-                    + std::to_string(objective_evaluations)
+                "Completed MMA iteration "
+                    + std::to_string(completed_iteration)
                     + ": pass/stop = " + std::to_string(objective.pass)
                     + " / " + std::to_string(objective.stop) + ".");
         }
-        ++objective_evaluations;
 
         ParOptScalar* x;
         variables->getArray(&x);
@@ -272,7 +274,7 @@ private:
     double initial_bound = 1.0;
     int active_design_size = 0;
     int constraint_size = 0;
-    int objective_evaluations = 0;
+    bool initial_mma_evaluation = true;
     bool gradients_ready = false;
 };
 
@@ -287,7 +289,6 @@ void Optimizer::run()
 
     try {
         if (!solver.setMesh(METAMATERIAL_USE_MPI != 0)
-            || !solver.assembleSolutionSpace(METAMATERIAL_USE_MPI != 0)
             || !solver.solve(METAMATERIAL_USE_MPI != 0)) {
             status.store(
                 solver.get_status() == SolverStatus::Diverged
@@ -329,6 +330,8 @@ bool Optimizer::evaluateObjectives(ObjectiveEvaluation& objective) const
 
     std::vector<const FrequencyBand*> bands;
     bands.reserve(settings.frequencyBands.size());
+    bool pass_configured = false;
+    bool stop_configured = false;
     for (const FrequencyBand& band : settings.frequencyBands) {
         if (!std::isfinite(band.startHz)
             || !std::isfinite(band.endHz)
@@ -340,6 +343,8 @@ bool Optimizer::evaluateObjectives(ObjectiveEvaluation& objective) const
                 "Every frequency band needs a positive target and ordered finite bounds.");
             return false;
         }
+        pass_configured |= band.type == FrequencyBandType::pass;
+        stop_configured |= band.type == FrequencyBandType::stop;
         bands.push_back(&band);
     }
     std::sort(bands.begin(), bands.end(),
@@ -358,7 +363,8 @@ bool Optimizer::evaluateObjectives(ObjectiveEvaluation& objective) const
 
     objective.pass_spectrum_derivative.assign(bin_count, {0.0, 0.0});
     objective.stop_spectrum_derivative.assign(bin_count, {0.0, 0.0});
-    int active_bins = 0;
+    int pass_bins = 0;
+    int stop_bins = 0;
     for (std::size_t bin = 0; bin < bin_count; ++bin) {
         if (response.valid[bin] == 0) {
             continue;
@@ -406,18 +412,21 @@ bool Optimizer::evaluateObjectives(ObjectiveEvaluation& objective) const
             objective.pass += error;
             objective.has_pass = true;
             objective.pass_spectrum_derivative[bin] = derivative;
+            ++pass_bins;
         }
         else {
             objective.stop += error;
             objective.has_stop = true;
             objective.stop_spectrum_derivative[bin] = derivative;
+            ++stop_bins;
         }
-        ++active_bins;
     }
 
-    if (active_bins == 0) {
+    if ((!pass_configured && !stop_configured)
+        || (pass_configured && pass_bins == 0)
+        || (stop_configured && stop_bins == 0)) {
         log(LogLevel::Error,
-            "No valid FFT bins fall inside the configured objective bands.");
+            "Every configured objective group needs at least one valid FFT bin.");
         return false;
     }
     return true;

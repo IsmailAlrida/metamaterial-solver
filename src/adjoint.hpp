@@ -15,6 +15,39 @@
 
 namespace App::detail {
 
+inline bool forwardWindowedSignal(
+    const std::vector<double>& signal,
+    const std::vector<double>& window,
+    std::vector<std::complex<double>>& spectrum)
+{
+    if (signal.empty() || signal.size() != window.size()) {
+        return false;
+    }
+    std::vector<double> windowed(signal.size());
+    for (std::size_t sample = 0; sample < signal.size(); ++sample) {
+        windowed[sample] = signal[sample] * window[sample];
+    }
+
+    fftw_complex* output = fftw_alloc_complex(signal.size() / 2 + 1);
+    if (output == nullptr) {
+        return false;
+    }
+    fftw_plan plan = fftw_plan_dft_r2c_1d(
+        static_cast<int>(signal.size()), windowed.data(), output, FFTW_ESTIMATE);
+    if (plan == nullptr) {
+        fftw_free(output);
+        return false;
+    }
+    fftw_execute(plan);
+    spectrum.resize(signal.size() / 2 + 1);
+    for (std::size_t bin = 0; bin < spectrum.size(); ++bin) {
+        spectrum[bin] = {output[bin][0], output[bin][1]};
+    }
+    fftw_destroy_plan(plan);
+    fftw_free(output);
+    return true;
+}
+
 inline bool inverseOutletDerivative(
     const std::vector<std::complex<double>>& spectrum,
     int time_steps,
@@ -111,7 +144,9 @@ inline bool runNewmarkAdjoint(
     bar_v_ddot = 0.0;
 
     for (int n = time_steps; n >= 1; --n) {
-        bar_v.Add(outlet_derivative[n - 1], outlet_functional);
+        if (n < time_steps) {
+            bar_v.Add(outlet_derivative[n], outlet_functional);
+        }
 
         previous_bar_v = 0.0;
         previous_bar_v.Add(-a_3, bar_v_dot);

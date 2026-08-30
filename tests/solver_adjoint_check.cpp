@@ -4,16 +4,107 @@
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "adjoint.hpp"
+#include "integrators.hpp"
 #include "solver.hpp"
+
+namespace {
+
+bool check_cut_volume_integration()
+{
+    mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(
+        1, 1, mfem::Element::QUADRILATERAL, true, 1.0, 1.0);
+    mfem::H1_FECollection collection(1, 2);
+    mfem::FiniteElementSpace space(&mesh, &collection);
+    mfem::GridFunction phi(&space);
+    mfem::FunctionCoefficient cut([](const mfem::Vector& x) {
+        return x[0] - 0.5;
+    });
+    phi.ProjectCoefficient(cut);
+
+    auto assemble = [&](bool positive) {
+        mfem::ConstantCoefficient one(1.0);
+        mfem::BilinearForm form(&space);
+        form.AddDomainIntegrator(new App::ImplicitDomainIntegrator(
+            std::make_unique<mfem::MassIntegrator>(one),
+            phi, 4, 1, 0.0, positive));
+        form.Assemble();
+        form.Finalize();
+        return std::unique_ptr<mfem::SparseMatrix>(form.LoseMat());
+    };
+    auto assemble_full = [&] {
+        mfem::ConstantCoefficient one(1.0);
+        mfem::BilinearForm form(&space);
+        form.AddDomainIntegrator(new mfem::MassIntegrator(one));
+        form.Assemble();
+        form.Finalize();
+        return std::unique_ptr<mfem::SparseMatrix>(form.LoseMat());
+    };
+
+    const auto full = assemble_full();
+    auto positive = assemble(true);
+    auto negative = assemble(false);
+    std::unique_ptr<mfem::SparseMatrix> complement(
+        mfem::Add(1.0, *positive, 1.0, *negative));
+    complement->Add(-1.0, *full);
+    const double tolerance = 1.0e-10 * std::max(1.0, full->MaxNorm());
+    if (complement->MaxNorm() > tolerance) {
+        return false;
+    }
+
+    phi = 1.0;
+    positive = assemble(true);
+    negative = assemble(false);
+    positive->Add(-1.0, *full);
+    return positive->MaxNorm() <= tolerance
+        && negative->MaxNorm() <= tolerance;
+}
+
+bool check_fft_convention()
+{
+    constexpr int sample_count = 32;
+    constexpr int frequency_bin = 3;
+    constexpr double amplitude = 2.5;
+    constexpr double phase = 0.37;
+    const double pi = std::acos(-1.0);
+    std::vector<double> signal(sample_count);
+    std::vector<double> window(sample_count, 1.0);
+    for (int sample = 0; sample < sample_count; ++sample) {
+        signal[sample] = amplitude * std::cos(
+            2.0 * pi * frequency_bin * sample / sample_count + phase);
+    }
+    std::vector<std::complex<double>> spectrum;
+    if (!App::detail::forwardWindowedSignal(signal, window, spectrum)) {
+        return false;
+    }
+    const double measured_amplitude =
+        2.0 * std::abs(spectrum[frequency_bin]) / sample_count;
+    const double measured_phase = std::arg(
+        spectrum[frequency_bin] / std::polar(1.0, phase));
+    return std::abs(measured_amplitude - amplitude) <= 1.0e-12
+        && std::abs(measured_phase) <= 1.0e-12;
+}
+
+} // namespace
 
 int main()
 {
     mfem::Device device(METAMATERIAL_USE_CUDA ? "cuda" : "cpu");
     device.Print();
+
+    if (!check_cut_volume_integration()) {
+        std::cerr << "Algoim cut-volume integration failed its complement check.\n";
+        return 1;
+    }
+    if (!check_fft_convention()) {
+        std::cerr << "The FFT amplitude/phase convention is inconsistent.\n";
+        return 1;
+    }
 
     App::SolverSettings solver_settings;
     solver_settings.nx = 20;
@@ -38,6 +129,34 @@ int main()
         || !solver.assembleSolutionSpace()
         || !solver.solve()) {
         std::cerr << "The coarse baseline solve failed.\n";
+        return 1;
+    }
+
+    for (int i = 0; i < geometry.activeDesignDofs.Size(); ++i) {
+        geometry.design[geometry.activeDesignDofs[i]] = 0.0;
+    }
+    geometry.enforceDesignConstraints();
+    if (!solver.assembleSolutionSpace() || !solver.solve()) {
+        std::cerr << "The coarse empty-duct solve failed.\n";
+        return 1;
+    }
+    int valid_empty_bins = 0;
+    const App::FrequencyResponse& empty_response = solver.frequencyResponse();
+    for (std::size_t bin = 0; bin < empty_response.valid.size(); ++bin) {
+        if (empty_response.valid[bin] == 0) {
+            continue;
+        }
+        ++valid_empty_bins;
+        const double transmission = std::abs(
+            empty_response.outlet[bin] / empty_response.reference[bin]);
+        if (!std::isfinite(transmission)
+            || std::abs(transmission - 1.0) > 1.0e-8) {
+            std::cerr << "The empty duct does not reproduce its reference FFT.\n";
+            return 1;
+        }
+    }
+    if (valid_empty_bins == 0) {
+        std::cerr << "The empty duct has no valid FFT bins.\n";
         return 1;
     }
 

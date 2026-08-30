@@ -113,7 +113,7 @@ class PaperAdjointTest(unittest.TestCase):
             acceleration = load[0] / mass
             states = [(displacement, velocity, acceleration)]
             effective = stiffness + a6 * mass + a3 * damping
-            outlet = []
+            outlet = [displacement]
             for step in range(1, steps + 1):
                 mass_state = (
                     a4 * velocity + a5 * acceleration + a6 * displacement
@@ -134,7 +134,8 @@ class PaperAdjointTest(unittest.TestCase):
                     - a5 * acceleration
                     + a6 * (next_displacement - displacement)
                 )
-                outlet.append(next_displacement)
+                if step < steps:
+                    outlet.append(next_displacement)
                 displacement = next_displacement
                 velocity = next_velocity
                 acceleration = next_acceleration
@@ -168,7 +169,8 @@ class PaperAdjointTest(unittest.TestCase):
             displacement_bar = velocity_bar = acceleration_bar = 0.0
             adjoint = [0.0] * (steps + 1)
             for step in range(steps, 0, -1):
-                displacement_bar += outlet_derivative[step - 1]
+                if step < steps:
+                    displacement_bar += outlet_derivative[step]
                 previous_displacement_bar = (
                     -a3 * velocity_bar - a6 * acceleration_bar
                 )

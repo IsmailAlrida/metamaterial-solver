@@ -10,7 +10,6 @@
 #include <string>
 #include <vector>
 
-#include "fftw3.h"
 #include "adjoint.hpp"
 #include "cut_sensitivity.hpp"
 #include "glvis_adapter.hpp"
@@ -440,7 +439,6 @@ bool App::Solver::assembleSolutionSpace()
     Cuu_block.reset();
     Kuu_block.reset();
     Mpp_block.reset();
-    Cpp_block.reset();
     Kpp_block.reset();
     effective_displacement_block.reset();
     effective_pressure_block.reset();
@@ -540,20 +538,30 @@ bool App::Solver::assembleSolutionSpace()
     Kpp_block.reset(Kpp_form.LoseMat());
 
     MixedBilinearForm Kup_form(scalar_fes.get(), displacement_fes.get());
-    Kup_form.AddDomainIntegrator(new ImplicitSurfaceNormalIntegrator(
-        *lset.phi, cut_integration_order, level_set_order, -1.0, false),
-        design_domain_marker);
+    auto* Kup_integrator = new ImplicitSurfaceNormalIntegrator(
+        *lset.phi, cut_integration_order, level_set_order, -1.0, false);
+    Kup_form.AddDomainIntegrator(Kup_integrator, design_domain_marker);
     Kup_form.Assemble();
     Kup_form.Finalize();
     std::unique_ptr<SparseMatrix> Kup(Kup_form.LoseMat());
 
     MixedBilinearForm Mpu_form(displacement_fes.get(), scalar_fes.get());
-    Mpu_form.AddDomainIntegrator(new ImplicitSurfaceNormalIntegrator(
-        *lset.phi, cut_integration_order, level_set_order, 1.0, true),
-        design_domain_marker);
+    auto* Mpu_integrator = new ImplicitSurfaceNormalIntegrator(
+        *lset.phi, cut_integration_order, level_set_order, 1.0, true);
+    Mpu_form.AddDomainIntegrator(Mpu_integrator, design_domain_marker);
     Mpu_form.Assemble();
     Mpu_form.Finalize();
     std::unique_ptr<SparseMatrix> Mpu(Mpu_form.LoseMat());
+    const int degenerate_normals = std::max(
+        Kup_integrator->GetDegenerateNormalCount(),
+        Mpu_integrator->GetDegenerateNormalCount());
+    if (degenerate_normals != 0) {
+        log(LogLevel::Error,
+            "The implicit interface contains "
+                + std::to_string(degenerate_normals)
+                + " quadrature points with an undefined normal.");
+        return false;
+    }
 
     const real_t omega_1 = 2.0 * std::acos(-1.0) * physics->f1;
     const real_t omega_2 = 2.0 * std::acos(-1.0) * physics->f2;
@@ -563,24 +571,26 @@ bool App::Solver::assembleSolutionSpace()
     Cuu_block.reset(Add(
         alpha_d, *Muu_block, beta_d, *Kuu_block));
 
-    Array<int> absorbing_marker(mesh->bdr_attributes.Max());
-    absorbing_marker = 0;
     const int inlet_boundary = dim == 3
         ? static_cast<int>(CartesianBoundary3D::left)
         : static_cast<int>(CartesianBoundary2D::left);
     const int outlet_boundary = dim == 3
         ? static_cast<int>(CartesianBoundary3D::right)
         : static_cast<int>(CartesianBoundary2D::right);
-    absorbing_marker[inlet_boundary - 1] = 1;
-    absorbing_marker[outlet_boundary - 1] = 1;
-    ConstantCoefficient inverse_impedance(
-        1.0 / (physics->rho_a * physics->c_a));
-    BilinearForm Cpp_form(scalar_fes.get());
-    Cpp_form.AddBoundaryIntegrator(
-        new BoundaryMassIntegrator(inverse_impedance), absorbing_marker);
-    Cpp_form.Assemble();
-    Cpp_form.Finalize();
-    Cpp_block.reset(Cpp_form.LoseMat());
+    if (!Cpp_block) {
+        Array<int> absorbing_marker(mesh->bdr_attributes.Max());
+        absorbing_marker = 0;
+        absorbing_marker[inlet_boundary - 1] = 1;
+        absorbing_marker[outlet_boundary - 1] = 1;
+        ConstantCoefficient inverse_impedance(
+            1.0 / (physics->rho_a * physics->c_a));
+        BilinearForm Cpp_form(scalar_fes.get());
+        Cpp_form.AddBoundaryIntegrator(
+            new BoundaryMassIntegrator(inverse_impedance), absorbing_marker);
+        Cpp_form.Assemble();
+        Cpp_form.Finalize();
+        Cpp_block.reset(Cpp_form.LoseMat());
+    }
     std::unique_ptr<SparseMatrix> Kup_transpose(Transpose(*Kup));
     std::unique_ptr<SparseMatrix> coupling_residual(
         Add(1.0, *Mpu, 1.0, *Kup_transpose));
@@ -706,11 +716,9 @@ bool App::Solver::solve()
     performance_data.forwardFgmresSolves = 0;
     performance_data.maximumForwardFgmresIterations = 0;
 
-    if (!mesh || !M || !C || !K
-        || !Muu_block || !Cuu_block || !Kuu_block
-        || !Mpp_block || !Cpp_block || !Kpp_block) {
+    if (!mesh) {
         log(LogLevel::Error,
-            "Call setMesh() and assembleSolutionSpace() before solve().");
+            "Call setMesh() before solve().");
         status.store(SolverStatus::Error);
         return false;
     }
@@ -724,7 +732,9 @@ bool App::Solver::solve()
     };
 
     const int first_analysis = reference_ready ? 1 : 0;
-    bool designed_assembly_ready = true;
+    bool designed_assembly_ready = M && C && K
+        && Muu_block && Cuu_block && Kuu_block
+        && Mpp_block && Cpp_block && Kpp_block;
     for (int analysis = first_analysis; analysis < 2; ++analysis) {
         const bool reference_analysis = analysis == 0;
         if (reference_analysis) {
@@ -1062,38 +1072,12 @@ bool App::Solver::postprocessFourierResponse()
             : 1.0;
     }
 
-    auto transform = [this, sample_count](
-                         const std::vector<double>& signal,
-                         std::vector<std::complex<double>>& spectrum) {
-        std::vector<double> windowed(sample_count);
-        for (int sample = 0; sample < sample_count; ++sample) {
-            windowed[sample] = signal[sample] * fft_window[sample];
-        }
-
-        fftw_complex* output = fftw_alloc_complex(sample_count / 2 + 1);
-        if (output == nullptr) {
-            return false;
-        }
-        fftw_plan plan = fftw_plan_dft_r2c_1d(
-            sample_count, windowed.data(), output, FFTW_ESTIMATE);
-        if (plan == nullptr) {
-            fftw_free(output);
-            return false;
-        }
-        fftw_execute(plan);
-        spectrum.resize(sample_count / 2 + 1);
-        for (int bin = 0; bin < static_cast<int>(spectrum.size()); ++bin) {
-            spectrum[bin] = {output[bin][0], output[bin][1]};
-        }
-        fftw_destroy_plan(plan);
-        fftw_free(output);
-        return true;
-    };
-
     std::vector<std::complex<double>> response_spectrum;
     std::vector<std::complex<double>> reference_spectrum;
-    if (!transform(outlet_pressure, response_spectrum)
-        || !transform(reference_outlet_pressure, reference_spectrum)) {
+    if (!detail::forwardWindowedSignal(
+            outlet_pressure, fft_window, response_spectrum)
+        || !detail::forwardWindowedSignal(
+            reference_outlet_pressure, fft_window, reference_spectrum)) {
         log(LogLevel::Error, "FFTW could not produce the frequency response.");
         return false;
     }
@@ -1113,7 +1097,10 @@ bool App::Solver::postprocessFourierResponse()
         maximum_reference = std::max(maximum_reference, std::abs(value));
     }
     const double reference_floor =
-        std::max(1.0e-14, 1.0e-12 * maximum_reference);
+        std::max(
+            std::numeric_limits<double>::min(),
+            std::sqrt(std::numeric_limits<double>::epsilon())
+                * maximum_reference);
     const double window_sum =
         std::accumulate(fft_window.begin(), fft_window.end(), 0.0);
     if (window_sum <= 0.0) {
@@ -1161,16 +1148,14 @@ bool App::Solver::postprocessFourierResponse()
     }
 
     auto make_signal = [this, sample_count](
-                           const std::vector<double>& amplitude,
-                           bool skip_initial_sample) {
+                           const std::vector<double>& amplitude) {
         auto signal = std::make_shared<SignalTD>();
         signal->size = sample_count;
         signal->time.resize(sample_count);
         signal->amplitude.resize(sample_count);
         for (int sample = 0; sample < sample_count; ++sample) {
-            signal->time[sample] = (sample + 1) * settings.dt;
-            signal->amplitude[sample] =
-                amplitude[sample + (skip_initial_sample ? 1 : 0)];
+            signal->time[sample] = sample * settings.dt;
+            signal->amplitude[sample] = amplitude[sample];
         }
         return std::shared_ptr<const SignalTD>(std::move(signal));
     };
@@ -1179,12 +1164,12 @@ bool App::Solver::postprocessFourierResponse()
     std::atomic_store(
         &result.materialImpulseResponse, std::move(published_response));
     std::atomic_store(
-        &result.inletPressure, make_signal(source_pressure, true));
+        &result.inletPressure, make_signal(source_pressure));
     std::atomic_store(
-        &result.outletPressure, make_signal(outlet_pressure, false));
+        &result.outletPressure, make_signal(outlet_pressure));
     std::atomic_store(
         &result.referenceOutletPressure,
-        make_signal(reference_outlet_pressure, false));
+        make_signal(reference_outlet_pressure));
     return true;
 }
 

@@ -114,6 +114,8 @@ inline bool runNewmark(
 
     measured_outlet.clear();
     measured_outlet.reserve(time_steps);
+    // Paper Eq. (29) transforms U^0, ..., U^(N-1).
+    measured_outlet.push_back(dot(outlet_functional, v));
     mfem::Vector h_hat(state_size);
     mfem::Vector x_M(state_size);
     mfem::Vector x_C(state_size);
@@ -190,7 +192,9 @@ inline bool runNewmark(
         v_dot_n.SetSubVector(essential_dofs, 0.0);
         v_ddot_n.SetSubVector(essential_dofs, 0.0);
 
-        measured_outlet.push_back(dot(outlet_functional, v_n));
+        if (n < time_steps) {
+            measured_outlet.push_back(dot(outlet_functional, v_n));
+        }
 
         M.Mult(v_ddot_n, y_M);
         C.Mult(v_dot_n, y_C);

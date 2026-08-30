@@ -10,6 +10,7 @@
 #include <random>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "integrators.hpp"
@@ -304,12 +305,17 @@ struct App::Solver::ParallelState {
     std::unique_ptr<HypreParMatrix> effective_pressure;
     std::unique_ptr<MUMPSSolver> initial_mumps;
     std::unique_ptr<MUMPSSolver> effective_mumps;
+    std::unique_ptr<HypreBoomerAMG> initial_u_amg;
+    std::unique_ptr<HypreBoomerAMG> initial_p_amg;
+    std::unique_ptr<HypreBoomerAMG> effective_u_amg;
+    std::unique_ptr<HypreBoomerAMG> effective_p_amg;
 
     Vector inlet_load;
     Vector outlet_functional;
     Vector system_inlet_load;
     Vector system_outlet_functional;
     Array<int> displacement_essential_tdofs;
+    bool boundary_data_ready = false;
     bool reference_ready = false;
     int command_depth = 0;
 };
@@ -449,7 +455,8 @@ bool App::Solver::assembleSolutionSpace(bool parallel)
         rank,
         parallel_state ? parallel_state->command_depth : 0,
         ParallelCommand::assemble);
-    if (!parallel_state || !mesh) {
+    const bool assembly_ready = parallel_state && mesh;
+    if (!all_succeeded(MPI_COMM_WORLD, assembly_ready)) {
         if (rank == 0) {
             log(LogLevel::Error,
                 "Call setMesh(true) before parallel assembly.");
@@ -560,6 +567,8 @@ bool App::Solver::assembleSolutionSpace(bool parallel)
         1.0 / (physics->rho_a * physics->c_a * physics->c_a));
     ConstantCoefficient acoustic_stiffness(1.0 / physics->rho_a);
 
+    // ponytail: fixed-air terms reassemble to avoid retaining four extra
+    // sparse matrices; cache them only if assembly time outweighs peak RAM.
     ParBilinearForm Muu_form(state.displacement_fes.get());
     Muu_form.AddDomainIntegrator(new ImplicitDomainIntegrator(
         std::make_unique<VectorMassIntegrator>(solid_density),
@@ -618,21 +627,36 @@ bool App::Solver::assembleSolutionSpace(bool parallel)
 
     ParMixedBilinearForm Kup_form(
         state.scalar_fes.get(), state.displacement_fes.get());
-    Kup_form.AddDomainIntegrator(new ImplicitSurfaceNormalIntegrator(
-        *state.phi, cut_integration_order, level_set_order, -1.0, false),
-        design_marker);
+    auto* Kup_integrator = new ImplicitSurfaceNormalIntegrator(
+        *state.phi, cut_integration_order, level_set_order, -1.0, false);
+    Kup_form.AddDomainIntegrator(Kup_integrator, design_marker);
     Kup_form.Assemble();
     Kup_form.Finalize();
     std::unique_ptr<HypreParMatrix> Kup(Kup_form.ParallelAssemble());
 
     ParMixedBilinearForm Mpu_form(
         state.displacement_fes.get(), state.scalar_fes.get());
-    Mpu_form.AddDomainIntegrator(new ImplicitSurfaceNormalIntegrator(
-        *state.phi, cut_integration_order, level_set_order, 1.0, true),
-        design_marker);
+    auto* Mpu_integrator = new ImplicitSurfaceNormalIntegrator(
+        *state.phi, cut_integration_order, level_set_order, 1.0, true);
+    Mpu_form.AddDomainIntegrator(Mpu_integrator, design_marker);
     Mpu_form.Assemble();
     Mpu_form.Finalize();
     std::unique_ptr<HypreParMatrix> Mpu(Mpu_form.ParallelAssemble());
+    int local_degenerate_normals = std::max(
+        Kup_integrator->GetDegenerateNormalCount(),
+        Mpu_integrator->GetDegenerateNormalCount());
+    int degenerate_normals = 0;
+    MPI_Allreduce(&local_degenerate_normals, &degenerate_normals,
+                  1, MPI_INT, MPI_SUM, state.comm);
+    if (degenerate_normals != 0) {
+        if (state.rank == 0) {
+            log(LogLevel::Error,
+                "The distributed implicit interface contains "
+                    + std::to_string(degenerate_normals)
+                    + " quadrature points with an undefined normal.");
+        }
+        return false;
+    }
 
     const real_t omega_1 = 2.0 * std::acos(-1.0) * physics->f1;
     const real_t omega_2 = 2.0 * std::acos(-1.0) * physics->f2;
@@ -641,32 +665,38 @@ bool App::Solver::assembleSolutionSpace(bool parallel)
     const real_t beta_d = 2.0 * physics->zeta / (omega_1 + omega_2);
     state.Cuu.reset(Add(alpha_d, *state.Muu, beta_d, *state.Kuu));
 
-    Array<int> absorbing_marker(state.mesh->bdr_attributes.Max());
-    absorbing_marker = 0;
     const int inlet_boundary = dim == 3
         ? static_cast<int>(CartesianBoundary3D::left)
         : static_cast<int>(CartesianBoundary2D::left);
     const int outlet_boundary = dim == 3
         ? static_cast<int>(CartesianBoundary3D::right)
         : static_cast<int>(CartesianBoundary2D::right);
-    absorbing_marker[inlet_boundary - 1] = 1;
-    absorbing_marker[outlet_boundary - 1] = 1;
-    ConstantCoefficient inverse_impedance(
-        1.0 / (physics->rho_a * physics->c_a));
-    ParBilinearForm Cpp_form(state.scalar_fes.get());
-    Cpp_form.AddBoundaryIntegrator(
-        new BoundaryMassIntegrator(inverse_impedance), absorbing_marker);
-    Cpp_form.Assemble();
-    Cpp_form.Finalize();
-    state.Cpp.reset(Cpp_form.ParallelAssemble());
+    bool cpp_is_finite = true;
+    if (!state.Cpp) {
+        Array<int> absorbing_marker(state.mesh->bdr_attributes.Max());
+        absorbing_marker = 0;
+        absorbing_marker[inlet_boundary - 1] = 1;
+        absorbing_marker[outlet_boundary - 1] = 1;
+        ConstantCoefficient inverse_impedance(
+            1.0 / (physics->rho_a * physics->c_a));
+        ParBilinearForm Cpp_form(state.scalar_fes.get());
+        Cpp_form.AddBoundaryIntegrator(
+            new BoundaryMassIntegrator(inverse_impedance), absorbing_marker);
+        Cpp_form.Assemble();
+        Cpp_form.Finalize();
+        cpp_is_finite = Cpp_form.SpMat().CheckFinite() == 0;
+        state.Cpp.reset(Cpp_form.ParallelAssemble());
+    }
 
     std::unique_ptr<SparseMatrix> Kup_transpose(
         Transpose(Kup_form.SpMat()));
     std::unique_ptr<SparseMatrix> coupling_residual(
         Add(1.0, Mpu_form.SpMat(), 1.0, *Kup_transpose));
-    if (coupling_residual->MaxNorm() > 1.0e-10 * std::max({
+    const bool coupling_ready = coupling_residual->MaxNorm()
+        <= 1.0e-10 * std::max({
             real_t{1.0}, Mpu_form.SpMat().MaxNorm(),
-            Kup_transpose->MaxNorm()})) {
+            Kup_transpose->MaxNorm()});
+    if (!all_succeeded(state.comm, coupling_ready)) {
         if (state.rank == 0) {
             log(LogLevel::Error,
                 "The parallel coupling matrices do not satisfy Mpu = -Kup^T.");
@@ -677,13 +707,14 @@ bool App::Solver::assembleSolutionSpace(bool parallel)
     state.M = block_matrix(state.Muu.get(), nullptr, Mpu.get(), state.Mpp.get());
     state.C = block_matrix(state.Cuu.get(), nullptr, nullptr, state.Cpp.get());
     state.K = block_matrix(state.Kuu.get(), Kup.get(), nullptr, state.Kpp.get());
-    if (Muu_form.SpMat().CheckFinite() != 0
-        || Kuu_form.SpMat().CheckFinite() != 0
-        || Mpp_form.SpMat().CheckFinite() != 0
-        || Kpp_form.SpMat().CheckFinite() != 0
-        || Kup_form.SpMat().CheckFinite() != 0
-        || Mpu_form.SpMat().CheckFinite() != 0
-        || Cpp_form.SpMat().CheckFinite() != 0) {
+    const bool matrices_are_finite = Muu_form.SpMat().CheckFinite() == 0
+        && Kuu_form.SpMat().CheckFinite() == 0
+        && Mpp_form.SpMat().CheckFinite() == 0
+        && Kpp_form.SpMat().CheckFinite() == 0
+        && Kup_form.SpMat().CheckFinite() == 0
+        && Mpu_form.SpMat().CheckFinite() == 0
+        && cpp_is_finite;
+    if (!all_succeeded(state.comm, matrices_are_finite)) {
         if (state.rank == 0) {
             log(LogLevel::Error,
                 "The assembled finite element matrices contain non-finite values.");
@@ -691,64 +722,69 @@ bool App::Solver::assembleSolutionSpace(bool parallel)
         return false;
     }
 
-    Array<int> clamped_marker(state.mesh->bdr_attributes.Max());
-    clamped_marker = 0;
-    if (dim == 3) {
-        clamped_marker[static_cast<int>(CartesianBoundary3D::bottom) - 1] = 1;
-        clamped_marker[static_cast<int>(CartesianBoundary3D::top) - 1] = 1;
-    }
-    else {
-        clamped_marker[static_cast<int>(CartesianBoundary2D::bottom) - 1] = 1;
-        clamped_marker[static_cast<int>(CartesianBoundary2D::top) - 1] = 1;
-    }
-    state.displacement_fes->GetEssentialTrueDofs(
-        clamped_marker, state.displacement_essential_tdofs);
-
-    Array<int> inlet_marker(state.mesh->bdr_attributes.Max());
-    Array<int> outlet_marker(state.mesh->bdr_attributes.Max());
-    inlet_marker = 0;
-    outlet_marker = 0;
-    inlet_marker[inlet_boundary - 1] = 1;
-    outlet_marker[outlet_boundary - 1] = 1;
-    ConstantCoefficient one(1.0);
-    ParLinearForm inlet_form(state.scalar_fes.get());
-    inlet_form.AddBoundaryIntegrator(
-        new BoundaryLFIntegrator(one), inlet_marker);
-    inlet_form.Assemble();
-    inlet_form.ParallelAssemble(state.inlet_load);
-    ParLinearForm outlet_form(state.scalar_fes.get());
-    outlet_form.AddBoundaryIntegrator(
-        new BoundaryLFIntegrator(one), outlet_marker);
-    outlet_form.Assemble();
-    outlet_form.ParallelAssemble(state.outlet_functional);
-
     const int displacement_size = state.displacement_fes->GetTrueVSize();
     const int pressure_size = state.scalar_fes->GetTrueVSize();
-    state.system_inlet_load.SetSize(displacement_size + pressure_size);
-    state.system_inlet_load = 0.0;
-    state.system_inlet_load.SetVector(state.inlet_load, displacement_size);
-    state.system_outlet_functional.SetSize(displacement_size + pressure_size);
-    state.system_outlet_functional = 0.0;
-    state.system_outlet_functional.SetVector(
-        state.outlet_functional, displacement_size);
-
-    Vector ones(state.outlet_functional.Size());
-    ones = 1.0;
-    const double inlet_measure = global_dot(
-        state.comm, state.inlet_load, ones);
-    const double outlet_measure = global_dot(
-        state.comm, state.outlet_functional, ones);
-    const double expected_measure = dim == 3
-        ? settings.sy * settings.sz : settings.sy;
-    const double measure_tolerance =
-        1.0e-10 * std::max(1.0, expected_measure);
-    if (std::abs(inlet_measure - expected_measure) > measure_tolerance
-        || std::abs(outlet_measure - expected_measure) > measure_tolerance) {
-        if (state.rank == 0) {
-            log(LogLevel::Error,
-                "The parallel inlet/outlet functionals have the wrong measure.");
+    if (!state.boundary_data_ready) {
+        Array<int> clamped_marker(state.mesh->bdr_attributes.Max());
+        clamped_marker = 0;
+        if (dim == 3) {
+            clamped_marker[static_cast<int>(CartesianBoundary3D::bottom) - 1] = 1;
+            clamped_marker[static_cast<int>(CartesianBoundary3D::top) - 1] = 1;
         }
-        return false;
+        else {
+            clamped_marker[static_cast<int>(CartesianBoundary2D::bottom) - 1] = 1;
+            clamped_marker[static_cast<int>(CartesianBoundary2D::top) - 1] = 1;
+        }
+        state.displacement_fes->GetEssentialTrueDofs(
+            clamped_marker, state.displacement_essential_tdofs);
+
+        Array<int> inlet_marker(state.mesh->bdr_attributes.Max());
+        Array<int> outlet_marker(state.mesh->bdr_attributes.Max());
+        inlet_marker = 0;
+        outlet_marker = 0;
+        inlet_marker[inlet_boundary - 1] = 1;
+        outlet_marker[outlet_boundary - 1] = 1;
+        ConstantCoefficient one(1.0);
+        ParLinearForm inlet_form(state.scalar_fes.get());
+        inlet_form.AddBoundaryIntegrator(
+            new BoundaryLFIntegrator(one), inlet_marker);
+        inlet_form.Assemble();
+        inlet_form.ParallelAssemble(state.inlet_load);
+        ParLinearForm outlet_form(state.scalar_fes.get());
+        outlet_form.AddBoundaryIntegrator(
+            new BoundaryLFIntegrator(one), outlet_marker);
+        outlet_form.Assemble();
+        outlet_form.ParallelAssemble(state.outlet_functional);
+
+        state.system_inlet_load.SetSize(displacement_size + pressure_size);
+        state.system_inlet_load = 0.0;
+        state.system_inlet_load.SetVector(state.inlet_load, displacement_size);
+        state.system_outlet_functional.SetSize(displacement_size + pressure_size);
+        state.system_outlet_functional = 0.0;
+        state.system_outlet_functional.SetVector(
+            state.outlet_functional, displacement_size);
+
+        Vector ones(state.outlet_functional.Size());
+        ones = 1.0;
+        const double inlet_measure = global_dot(
+            state.comm, state.inlet_load, ones);
+        const double outlet_measure = global_dot(
+            state.comm, state.outlet_functional, ones);
+        const double expected_measure = dim == 3
+            ? settings.sy * settings.sz : settings.sy;
+        const double measure_tolerance =
+            1.0e-10 * std::max(1.0, expected_measure);
+        const bool boundary_measures_are_valid =
+            std::abs(inlet_measure - expected_measure) <= measure_tolerance
+            && std::abs(outlet_measure - expected_measure) <= measure_tolerance;
+        if (!all_succeeded(state.comm, boundary_measures_are_valid)) {
+            if (state.rank == 0) {
+                log(LogLevel::Error,
+                    "The parallel inlet/outlet functionals have the wrong measure.");
+            }
+            return false;
+        }
+        state.boundary_data_ready = true;
     }
 
     result.stateSize = state.M->Height();
@@ -786,10 +822,11 @@ bool App::Solver::solve(bool parallel)
         rank,
         parallel_state ? parallel_state->command_depth : 0,
         ParallelCommand::solve);
-    if (!parallel_state || !parallel_state->M) {
+    const bool solver_ready = parallel_state && mesh;
+    if (!all_succeeded(MPI_COMM_WORLD, solver_ready)) {
         if (rank == 0) {
             log(LogLevel::Error,
-                "Call assembleSolutionSpace(true) before the parallel solve.");
+                "Call setMesh(true) before the parallel solve.");
         }
         status.store(SolverStatus::Error);
         return false;
@@ -817,7 +854,7 @@ bool App::Solver::solve(bool parallel)
     };
 
     const int first_analysis = state.reference_ready ? 1 : 0;
-    bool designed_assembly_ready = true;
+    bool designed_assembly_ready = state.M && state.C && state.K;
     for (int analysis = first_analysis; analysis < 2; ++analysis) {
         const bool reference_analysis = analysis == 0;
         if (reference_analysis) {
@@ -878,6 +915,8 @@ bool App::Solver::solve(bool parallel)
             new HypreParMatrix(*state.Muu));
         initial_displacement->EliminateBC(
             state.displacement_essential_tdofs, Operator::DIAG_ONE);
+        std::unique_ptr<HypreParMatrix> initial_pressure(
+            new HypreParMatrix(*state.Mpp));
 
         Array<int> offsets(3);
         offsets[0] = 0;
@@ -886,10 +925,6 @@ bool App::Solver::solve(bool parallel)
         detail::LinearSolve solve_initial;
         detail::LinearSolve solve_effective;
 
-        std::unique_ptr<HypreBoomerAMG> initial_u_amg;
-        std::unique_ptr<HypreBoomerAMG> initial_p_amg;
-        std::unique_ptr<HypreBoomerAMG> effective_u_amg;
-        std::unique_ptr<HypreBoomerAMG> effective_p_amg;
         std::unique_ptr<BlockDiagonalPreconditioner> initial_preconditioner;
         std::unique_ptr<BlockDiagonalPreconditioner> effective_preconditioner;
         std::unique_ptr<FGMRESSolver> initial_fgmres;
@@ -904,7 +939,6 @@ bool App::Solver::solve(bool parallel)
                     direct->SetPrintLevel(0);
                     direct->SetMatrixSymType(MUMPSSolver::UNSYMMETRIC);
                     direct->SetReorderingStrategy(MUMPSSolver::PORD);
-                    direct->SetReorderingReuse(true);
                 }
             }
             auto factor_started_at = std::chrono::steady_clock::now();
@@ -935,27 +969,30 @@ bool App::Solver::solve(bool parallel)
             };
         }
         else {
-            initial_u_amg = std::make_unique<HypreBoomerAMG>(
+            state.initial_u_amg = std::make_unique<HypreBoomerAMG>(
                 *initial_displacement);
-            initial_u_amg->SetElasticityOptions(
+            state.initial_u_amg->SetElasticityOptions(
                 state.displacement_fes.get());
-            initial_p_amg = std::make_unique<HypreBoomerAMG>(*state.Mpp);
-            effective_u_amg = std::make_unique<HypreBoomerAMG>(
+            state.initial_p_amg = std::make_unique<HypreBoomerAMG>(
+                *initial_pressure);
+            state.effective_u_amg = std::make_unique<HypreBoomerAMG>(
                 *effective_displacement);
-            effective_u_amg->SetElasticityOptions(
+            state.effective_u_amg->SetElasticityOptions(
                 state.displacement_fes.get());
-            effective_p_amg = std::make_unique<HypreBoomerAMG>(
+            state.effective_p_amg = std::make_unique<HypreBoomerAMG>(
                 *effective_pressure);
             initial_preconditioner =
                 std::make_unique<BlockDiagonalPreconditioner>(offsets);
-            initial_preconditioner->SetDiagonalBlock(0, initial_u_amg.get());
-            initial_preconditioner->SetDiagonalBlock(1, initial_p_amg.get());
+            initial_preconditioner->SetDiagonalBlock(
+                0, state.initial_u_amg.get());
+            initial_preconditioner->SetDiagonalBlock(
+                1, state.initial_p_amg.get());
             effective_preconditioner =
                 std::make_unique<BlockDiagonalPreconditioner>(offsets);
             effective_preconditioner->SetDiagonalBlock(
-                0, effective_u_amg.get());
+                0, state.effective_u_amg.get());
             effective_preconditioner->SetDiagonalBlock(
-                1, effective_p_amg.get());
+                1, state.effective_p_amg.get());
 
             auto configure = [](FGMRESSolver& solver,
                                 const Operator& matrix,
@@ -999,7 +1036,7 @@ bool App::Solver::solve(bool parallel)
         const LogFunction rank_log = state.rank == 0
             ? log
             : LogFunction([](LogLevel, std::string) {});
-        if (!detail::runNewmark(
+        const bool transient_ready = detail::runNewmark(
                 settings,
                 *physics,
                 *state.M,
@@ -1025,12 +1062,21 @@ bool App::Solver::solve(bool parallel)
                 measured_outlet,
                 performance_data,
                 rank_log,
-                reference_analysis ? "empty-duct reference" : "designed duct")) {
+                reference_analysis ? "empty-duct reference" : "designed duct");
+        if (!all_succeeded(state.comm, transient_ready)) {
+            state.initial_u_amg.reset();
+            state.initial_p_amg.reset();
+            state.effective_u_amg.reset();
+            state.effective_p_amg.reset();
             return fail(SolverStatus::Diverged);
         }
         const double transient_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - transient_started_at).count();
         if (reference_analysis) {
+            state.initial_u_amg.reset();
+            state.initial_p_amg.reset();
+            state.effective_u_amg.reset();
+            state.effective_p_amg.reset();
             performance_data.referenceTransientSeconds = transient_seconds;
             state.reference_ready = true;
         }
@@ -1039,7 +1085,7 @@ bool App::Solver::solve(bool parallel)
             state.initial_matrix = std::move(M_system);
             state.effective_matrix = std::move(K_hat);
             state.initial_displacement = std::move(initial_displacement);
-            state.initial_pressure = std::make_unique<HypreParMatrix>(*state.Mpp);
+            state.initial_pressure = std::move(initial_pressure);
             state.effective_displacement = std::move(effective_displacement);
             state.effective_pressure = std::move(effective_pressure);
         }
@@ -1047,7 +1093,8 @@ bool App::Solver::solve(bool parallel)
 
     lset.design = designed_geometry;
     const auto fourier_started_at = std::chrono::steady_clock::now();
-    if (!postprocessFourierResponse()) {
+    const bool fourier_ready = postprocessFourierResponse();
+    if (!all_succeeded(state.comm, fourier_ready)) {
         return fail(SolverStatus::Error);
     }
     performance_data.fourierSeconds = std::chrono::duration<double>(
@@ -1089,7 +1136,8 @@ bool App::Solver::differentiateFrequencyResponses(
         rank,
         parallel_state ? parallel_state->command_depth : 0,
         ParallelCommand::differentiate);
-    if (!parallel_state) {
+    const bool adjoint_ready = static_cast<bool>(parallel_state);
+    if (!all_succeeded(MPI_COMM_WORLD, adjoint_ready)) {
         if (rank == 0) {
             log(LogLevel::Error,
                 "Run the parallel forward solver before its adjoint.");
@@ -1160,16 +1208,14 @@ bool App::Solver::differentiateFrequencyResponses(
     offsets[1] = state.displacement_fes->GetTrueVSize();
     offsets[2] = true_state_size;
 
-    std::unique_ptr<HypreBoomerAMG> initial_u_amg;
-    std::unique_ptr<HypreBoomerAMG> initial_p_amg;
-    std::unique_ptr<HypreBoomerAMG> effective_u_amg;
-    std::unique_ptr<HypreBoomerAMG> effective_p_amg;
     std::unique_ptr<BlockDiagonalPreconditioner> initial_preconditioner;
     std::unique_ptr<BlockDiagonalPreconditioner> effective_preconditioner;
     std::unique_ptr<FGMRESSolver> initial_fgmres;
     std::unique_ptr<FGMRESSolver> effective_fgmres;
     if (settings.linearSolveMethod == LinearSolveMethod::mumps) {
-        if (!state.initial_mumps || !state.effective_mumps) {
+        const bool factors_ready = state.initial_mumps
+            && state.effective_mumps;
+        if (!all_succeeded(state.comm, factors_ready)) {
             if (state.rank == 0) {
                 log(LogLevel::Error,
                     "The designed MUMPS factors are unavailable for the adjoint.");
@@ -1194,24 +1240,26 @@ bool App::Solver::differentiateFrequencyResponses(
         };
     }
     else {
-        initial_u_amg = std::make_unique<HypreBoomerAMG>(
-            *state.initial_displacement);
-        initial_u_amg->SetElasticityOptions(state.displacement_fes.get());
-        initial_p_amg = std::make_unique<HypreBoomerAMG>(
-            *state.initial_pressure);
-        effective_u_amg = std::make_unique<HypreBoomerAMG>(
-            *state.effective_displacement);
-        effective_u_amg->SetElasticityOptions(state.displacement_fes.get());
-        effective_p_amg = std::make_unique<HypreBoomerAMG>(
-            *state.effective_pressure);
+        const bool preconditioners_ready = state.initial_u_amg
+            && state.initial_p_amg && state.effective_u_amg
+            && state.effective_p_amg;
+        if (!all_succeeded(state.comm, preconditioners_ready)) {
+            if (state.rank == 0) {
+                log(LogLevel::Error,
+                    "The designed AMG preconditioners are unavailable for the adjoint.");
+            }
+            return false;
+        }
         initial_preconditioner =
             std::make_unique<BlockDiagonalPreconditioner>(offsets);
-        initial_preconditioner->SetDiagonalBlock(0, initial_u_amg.get());
-        initial_preconditioner->SetDiagonalBlock(1, initial_p_amg.get());
+        initial_preconditioner->SetDiagonalBlock(0, state.initial_u_amg.get());
+        initial_preconditioner->SetDiagonalBlock(1, state.initial_p_amg.get());
         effective_preconditioner =
             std::make_unique<BlockDiagonalPreconditioner>(offsets);
-        effective_preconditioner->SetDiagonalBlock(0, effective_u_amg.get());
-        effective_preconditioner->SetDiagonalBlock(1, effective_p_amg.get());
+        effective_preconditioner->SetDiagonalBlock(
+            0, state.effective_u_amg.get());
+        effective_preconditioner->SetDiagonalBlock(
+            1, state.effective_p_amg.get());
 
         auto configure = [](FGMRESSolver& solver,
                             const Operator& matrix,
@@ -1312,49 +1360,59 @@ bool App::Solver::differentiateFrequencyResponses(
     const int pressure_local_size = state.scalar_fes->GetVSize();
     const int local_state_size =
         displacement_local_size + pressure_local_size;
+    ParGridFunction displacement(state.displacement_fes.get());
+    ParGridFunction pressure(state.scalar_fes.get());
+    Vector displacement_true(displacement_true_size);
+    Vector pressure_true(pressure_true_size);
+    auto distribute_state = [&](const Vector& source,
+                                int blocks,
+                                Vector& distributed) {
+        if (source.Size() != blocks * true_state_size) {
+            return false;
+        }
+        distributed.SetSize(blocks * local_state_size);
+        for (int block = 0; block < blocks; ++block) {
+            for (int i = 0; i < displacement_true_size; ++i) {
+                displacement_true[i] = source[block * true_state_size + i];
+            }
+            for (int i = 0; i < pressure_true_size; ++i) {
+                pressure_true[i] = source[
+                    block * true_state_size + displacement_true_size + i];
+            }
+            displacement.Distribute(displacement_true);
+            pressure.Distribute(pressure_true);
+            distributed.SetVector(displacement, block * local_state_size);
+            distributed.SetVector(
+                pressure, block * local_state_size + displacement_local_size);
+        }
+        return true;
+    };
     auto distribute_history = [&](const std::vector<Vector>& source,
                                   int blocks,
                                   std::vector<Vector>& distributed) {
         distributed.resize(source.size());
-        ParGridFunction displacement(state.displacement_fes.get());
-        ParGridFunction pressure(state.scalar_fes.get());
-        Vector displacement_true(displacement_true_size);
-        Vector pressure_true(pressure_true_size);
         for (std::size_t n = 0; n < source.size(); ++n) {
-            if (source[n].Size() != blocks * true_state_size) {
+            if (!distribute_state(source[n], blocks, distributed[n])) {
                 return false;
-            }
-            distributed[n].SetSize(blocks * local_state_size);
-            for (int block = 0; block < blocks; ++block) {
-                for (int i = 0; i < displacement_true_size; ++i) {
-                    displacement_true[i] =
-                        source[n][block * true_state_size + i];
-                }
-                for (int i = 0; i < pressure_true_size; ++i) {
-                    pressure_true[i] = source[n][
-                        block * true_state_size
-                        + displacement_true_size + i];
-                }
-                displacement.Distribute(displacement_true);
-                pressure.Distribute(pressure_true);
-                distributed[n].SetVector(
-                    displacement, block * local_state_size);
-                distributed[n].SetVector(
-                    pressure,
-                    block * local_state_size + displacement_local_size);
             }
         }
         return true;
     };
+    auto distribute_history_in_place = [&](std::vector<Vector>& history) {
+        for (Vector& value : history) {
+            Vector distributed;
+            if (!distribute_state(value, 1, distributed)) {
+                return false;
+            }
+            value = std::move(distributed);
+        }
+        return true;
+    };
     std::vector<Vector> local_forward_history;
-    std::vector<Vector> local_pass_adjoint;
-    std::vector<Vector> local_stop_adjoint;
     const bool histories_ready = distribute_history(
             result.U, 3, local_forward_history)
-        && (!has_pass || distribute_history(
-            pass_adjoint_history, 1, local_pass_adjoint))
-        && (!has_stop || distribute_history(
-            stop_adjoint_history, 1, local_stop_adjoint));
+        && (!has_pass || distribute_history_in_place(pass_adjoint_history))
+        && (!has_stop || distribute_history_in_place(stop_adjoint_history));
     if (!all_succeeded(state.comm, histories_ready)) {
         if (state.rank == 0) {
             log(LogLevel::Error,
@@ -1362,22 +1420,13 @@ bool App::Solver::differentiateFrequencyResponses(
         }
         return false;
     }
-    auto distribute_state = [&](const Vector& source, Vector& distributed) {
-        std::vector<Vector> source_history{source};
-        std::vector<Vector> distributed_history;
-        if (!distribute_history(source_history, 1, distributed_history)) {
-            return false;
-        }
-        distributed = std::move(distributed_history[0]);
-        return true;
-    };
     Vector local_pass_initial;
     Vector local_stop_initial;
     const bool initial_states_ready =
         (!has_pass || distribute_state(
-            pass_initial_adjoint, local_pass_initial))
+            pass_initial_adjoint, 1, local_pass_initial))
         && (!has_stop || distribute_state(
-            stop_initial_adjoint, local_stop_initial));
+            stop_initial_adjoint, 1, local_stop_initial));
     if (!all_succeeded(state.comm, initial_states_ready)) {
         return false;
     }
@@ -1446,8 +1495,8 @@ bool App::Solver::differentiateFrequencyResponses(
             *state.phi,
             active_local,
             local_forward_history,
-            has_pass ? &local_pass_adjoint : nullptr,
-            has_stop ? &local_stop_adjoint : nullptr,
+            has_pass ? &pass_adjoint_history : nullptr,
+            has_stop ? &stop_adjoint_history : nullptr,
             has_pass ? &local_pass_initial : nullptr,
             has_stop ? &local_stop_initial : nullptr,
             displacement_local_size,

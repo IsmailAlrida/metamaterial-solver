@@ -113,6 +113,7 @@ inline bool differentiateCutElements(
     stop_physical_gradient = 0.0;
     cut_element_count = 0;
     differentiated_dof_count = 0;
+    bool normals_are_valid = true;
 
     std::vector<const mfem::real_t*> forward_data(forward_history.size());
     for (std::size_t state = 0; state < forward_history.size(); ++state) {
@@ -400,9 +401,12 @@ inline bool differentiateCutElements(
             stop_physical_gradient += thread_stop_gradient;
             cut_element_count += thread_cut_elements;
             differentiated_dof_count += thread_differentiated_dofs;
+            normals_are_valid = normals_are_valid
+                && Kup_integrator.GetDegenerateNormalCount() == 0
+                && Mpu_integrator.GetDegenerateNormalCount() == 0;
         }
     }
-    return true;
+    return normals_are_valid;
 }
 
 /** Apply the transpose node/cell maps and the adjoint finite-volume filter. */

@@ -137,12 +137,33 @@ test.bat all
 test.bat parallel-cpu debug
 ```
 
-The optimizer miniapp uses FGMRES by default and accepts `--mumps` for the
-direct-solver comparison:
+The optimizer miniapp uses FGMRES by default. `--paper` runs the paper's
+low-pass case, `--high-pass` runs its successful 1000--2500 Hz stop-band case,
+`--high-pass-20db` targets 20 dB attenuation from 60--1000 Hz, `--iterations`
+sets the iteration count, and `--mumps` selects the direct solver:
 
 ```bat
-mpiexec -n 2 build\parallel-cpu\paper_optimizer_miniapp.exe
-mpiexec -n 2 build\parallel-cpu\paper_optimizer_miniapp.exe --mumps
+mpiexec -n 2 build\parallel-cpu\paper_optimizer_miniapp.exe --paper
+mpiexec -n 2 build\parallel-cpu\paper_optimizer_miniapp.exe --high-pass
+mpiexec -n 2 build\parallel-cpu\paper_optimizer_miniapp.exe --high-pass-20db --iterations 50
+mpiexec -n 2 build\parallel-cpu\paper_optimizer_miniapp.exe --high-pass --mumps
+```
+
+Each run writes its JSON response and a ZIP containing that response plus the
+Python and MATLAB templates under `test-results/paper-optimizer/`.
+Load and cascade that measured complex response with
+`scripts/metamaterial_response.py` or `scripts/Metamaterial.m`.
+
+```python
+from scripts.metamaterial_response import Metamaterial
+material = Metamaterial.load("test-results/paper-optimizer/high-pass.json")
+output = material.apply(samples, sample_rate_hz)
+```
+
+```matlab
+addpath("scripts")
+material = Metamaterial("test-results/paper-optimizer/high-pass.json");
+output = material.apply(samples, sampleRateHz);
 ```
 
 ### Linux / WSL2

@@ -211,8 +211,8 @@ void Renderer::displayFrame(dispatcher_t& dispatcher)
 
     SimulationSettingsPanel(dispatcher);
     SimulationInfoPanel(dispatcher);
-    glvis->draw();
     OptimizerDesignPanel(dispatcher);
+    glvis->draw();
     LogPanel(dispatcher);
 
     ImGui::Render();
@@ -260,18 +260,19 @@ void Renderer::setupInitialDockLayout(ImGuiID dockspaceId,
     ImGuiID right = 0;
     ImGui::DockBuilderSplitNode(top, ImGuiDir_Right, 0.24f, &right, &top);
 
-    ImGuiID leftInfo = 0;
-    ImGui::DockBuilderSplitNode(left, ImGuiDir_Down, 0.34f, &leftInfo, &left);
-
-    ImGuiID lowerCenter = 0;
-    ImGui::DockBuilderSplitNode(top, ImGuiDir_Down, 0.38f, &lowerCenter, &top);
-
     ImGui::DockBuilderDockWindow("Simulation Settings", left);
-    ImGui::DockBuilderDockWindow("Simulation Information", leftInfo);
+    ImGui::DockBuilderDockWindow("Simulation Information", left);
     ImGui::DockBuilderDockWindow("Frequency Response", top);
-    ImGui::DockBuilderDockWindow("Visualization", lowerCenter);
+    ImGui::DockBuilderDockWindow("Visualization", top);
     ImGui::DockBuilderDockWindow("Objective Design", right);
     ImGui::DockBuilderDockWindow("Console", bottom);
+
+    if (ImGuiDockNode* node = ImGui::DockBuilderGetNode(left)) {
+        node->SelectedTabId = ImHashStr("Simulation Settings");
+    }
+    if (ImGuiDockNode* node = ImGui::DockBuilderGetNode(top)) {
+        node->SelectedTabId = ImHashStr("Frequency Response");
+    }
     ImGui::DockBuilderFinish(dockspaceId);
 }
 
