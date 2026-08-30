@@ -108,11 +108,8 @@ std::vector<std::complex<double>> response_derivative(
 int main(int argc, char** argv)
 {
     int provided = 0;
-    if (MPI_Init_thread(
-            &argc, &argv, MPI_THREAD_SERIALIZED, &provided) != MPI_SUCCESS) {
-        std::cerr << "Could not initialize MPI for the parallel Solver check.\n";
-        return 1;
-    }
+    mfem::Mpi::Init(argc, argv, MPI_THREAD_SERIALIZED, &provided);
+    mfem::Hypre::Init();
     int rank = 0;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
@@ -260,6 +257,5 @@ int main(int argc, char** argv)
 
     MPI_Bcast(&success, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Barrier(MPI_COMM_WORLD);
-    MPI_Finalize();
     return success ? 0 : 1;
 }

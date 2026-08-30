@@ -304,6 +304,7 @@ void Optimizer::run()
             throw OptimizationCancelled{};
         }
         if (!solver.setMesh(METAMATERIAL_USE_MPI != 0)
+            || !solver.assembleSolutionSpace(METAMATERIAL_USE_MPI != 0)
             || !solver.solve(METAMATERIAL_USE_MPI != 0)) {
             status.store(
                 solver.get_status() == SolverStatus::Diverged

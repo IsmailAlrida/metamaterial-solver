@@ -8,10 +8,8 @@
 
 int main(int argc, char** argv)
 {
-    if (MPI_Init(&argc, &argv) != MPI_SUCCESS) {
-        std::cerr << "Could not initialize MPI for the MUMPS smoke check.\n";
-        return 1;
-    }
+    mfem::Mpi::Init(argc, argv);
+    mfem::Hypre::Init();
 
     int rank = 0;
     int ranks = 1;
@@ -54,10 +52,9 @@ int main(int argc, char** argv)
         matrix->Mult(expected, right_hand_side);
         solution = 0.0;
 
-        mfem::MUMPSSolver solver(MPI_COMM_WORLD);
+        mfem::MUMPSSolver solver(matrix->GetComm());
         solver.SetPrintLevel(0);
         solver.SetMatrixSymType(mfem::MUMPSSolver::UNSYMMETRIC);
-        solver.SetReorderingStrategy(mfem::MUMPSSolver::PORD);
         solver.SetOperator(*matrix);
         solver.Mult(right_hand_side, solution);
 
@@ -98,6 +95,5 @@ int main(int argc, char** argv)
     int any_failed = 0;
     MPI_Allreduce(
         &failed, &any_failed, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-    MPI_Finalize();
     return any_failed;
 }

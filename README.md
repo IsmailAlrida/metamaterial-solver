@@ -58,8 +58,8 @@ CUDA development targets Linux and WSL2. Native Windows builds intentionally rem
 CUDA support is Linux-only for now. Native Windows builds intentionally reject
 CUDA backends instead of applying local patches to MFEM.
 
-`parallel-cpu` builds the MPI `ParMesh`/HYPRE path with OpenMP inside each rank.
-The runtime solver can use either iterative FGMRES or direct MUMPS.
+`parallel-cpu` builds the MPI `ParMesh`/HYPRE path. The runtime solver can use
+either iterative FGMRES or direct MUMPS; OpenMP is disabled inside each rank.
 
 ### Windows 11: CPU builds
 
@@ -168,7 +168,7 @@ output = material.apply(samples, sampleRateHz);
 
 ### Linux / WSL2
 
-Install the C++, Fortran, OpenGL, OpenMPI, BLAS/LAPACK, and ScaLAPACK
+Install the C++, Fortran, OpenGL, OpenMPI, and BLAS/LAPACK
 prerequisites. `setup.sh` is idempotent and currently targets Ubuntu/Debian:
 
 ```bash

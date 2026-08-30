@@ -543,6 +543,7 @@ int main(int argc, char** argv)
     bool paper_mode = false;
     bool high_pass = false;
     bool high_pass_20db = false;
+    bool desperado = false;
     bool use_mumps = false;
     int requested_iterations = 0;
     for (int argument = 1; argument < argc; ++argument) {
@@ -557,6 +558,10 @@ int main(int argc, char** argv)
         else if (option == "--high-pass-20db") {
             paper_mode = true;
             high_pass_20db = true;
+        }
+        else if (option == "--desperado") {
+            paper_mode = true;
+            desperado = true;
         }
         else if (option == "--mumps") {
             use_mumps = true;
@@ -576,7 +581,7 @@ int main(int argc, char** argv)
         else {
             std::cerr
                 << "Usage: paper_optimizer_miniapp "
-                   "[--paper|--high-pass|--high-pass-20db] "
+                   "[--paper|--high-pass|--high-pass-20db|--desperado] "
                    "[--iterations N] [--mumps]\n";
             return 1;
         }
@@ -589,14 +594,21 @@ int main(int argc, char** argv)
 #endif
 
     int provided = 0;
+#if METAMATERIAL_USE_MPI
+    mfem::Mpi::Init(argc, argv, MPI_THREAD_SERIALIZED, &provided);
+    mfem::Hypre::Init();
+#else
     if (MPI_Init_thread(&argc, &argv, MPI_THREAD_SERIALIZED, &provided)
             != MPI_SUCCESS) {
         std::cerr << "The miniapp could not initialize MPI.\n";
         return 1;
     }
+#endif
     if (provided < MPI_THREAD_SERIALIZED) {
         std::cerr << "The miniapp needs MPI_THREAD_SERIALIZED.\n";
+#if !METAMATERIAL_USE_MPI
         MPI_Finalize();
+#endif
         return 1;
     }
     int rank = 0;
@@ -613,7 +625,23 @@ int main(int argc, char** argv)
         solver_settings.linearSolveMethod = use_mumps
             ? App::LinearSolveMethod::mumps
             : App::LinearSolveMethod::fgmres;
-        if (high_pass_20db) {
+        if (desperado) {
+            auto& physics = std::get<App::VibroacousticSettings>(
+                solver_settings.physics);
+            physics.rho_s = 1340.0f;
+            physics.poisson_ratio = 0.36f;
+            physics.youngs_modulus = 2.5e9f;
+            solver_settings.nx = 150;
+            solver_settings.inletLength = 0.07;
+            solver_settings.designLength = 0.20;
+            solver_settings.outletLength = 0.07;
+            optimizer_settings.frequencyMin = 60.0f;
+            optimizer_settings.frequencyMax = 600.0f;
+            optimizer_settings.frequencyBands = {
+                {App::FrequencyBandType::stop, 60.0, 600.0, 1.0e-2}
+            };
+        }
+        else if (high_pass_20db) {
             solver_settings.duration = 0.05;
             optimizer_settings.frequencyMin = 60.0f;
             optimizer_settings.frequencyMax = 4000.0f;
@@ -734,7 +762,8 @@ int main(int argc, char** argv)
                 && final_worst < initial_worst;
 
             const std::string mode = std::string(
-                high_pass_20db ? "high-pass-20db"
+                desperado ? "desperado"
+                    : high_pass_20db ? "high-pass-20db"
                     : high_pass ? "high-pass"
                     : paper_mode ? "paper" : "quick")
                 + (use_mumps ? "-mumps" : "");
@@ -783,6 +812,8 @@ int main(int argc, char** argv)
         }
     }
 
+#if !METAMATERIAL_USE_MPI
     MPI_Finalize();
+#endif
     return exit_code;
 }

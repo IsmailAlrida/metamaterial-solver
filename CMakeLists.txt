@@ -137,25 +137,20 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(fftw)
 
-# 7. Fetch NLopt
-set(NLOPT_PYTHON OFF CACHE BOOL "" FORCE)
-set(NLOPT_OCTAVE OFF CACHE BOOL "" FORCE)
-set(NLOPT_MATLAB OFF CACHE BOOL "" FORCE)
-set(NLOPT_GUILE OFF CACHE BOOL "" FORCE)
-set(NLOPT_JAVA OFF CACHE BOOL "" FORCE)
-set(NLOPT_SWIG OFF CACHE BOOL "" FORCE)
-set(NLOPT_TESTS OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(
-  nlopt
-  GIT_REPOSITORY https://github.com/stevengj/nlopt.git
-  GIT_TAG        v2.11.0
-  SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/nlopt-src"
-  BINARY_DIR     "${CMAKE_BINARY_DIR}/deps/nlopt-build"
-)
-FetchContent_MakeAvailable(nlopt)
-
-# 8. Fetch ParOpt and its METIS dependency. ParOpt requires a system MPI SDK
-# and BLAS/LAPACK implementation; setup.bat installs MS-MPI and oneMKL.
+# 7. Fetch ParOpt and its METIS dependency. ParOpt requires a system MPI SDK
+# even when MFEM itself is serial; setup.bat installs MS-MPI and oneMKL.
+if(WIN32)
+  set(_msmpi_sdk "$ENV{SystemDrive}/Program Files (x86)/Microsoft SDKs/MPI")
+  if(NOT EXISTS "$ENV{MSMPI_INC}/mpi.h" AND
+     EXISTS "${_msmpi_sdk}/Include/mpi.h")
+    set(ENV{MSMPI_INC} "${_msmpi_sdk}/Include")
+  endif()
+  if(NOT EXISTS "$ENV{MSMPI_LIB64}/msmpi.lib" AND
+     EXISTS "${_msmpi_sdk}/Lib/x64/msmpi.lib")
+    set(ENV{MSMPI_LIB64} "${_msmpi_sdk}/Lib/x64")
+  endif()
+  unset(_msmpi_sdk)
+endif()
 if(WIN32 AND EXISTS "$ENV{ProgramFiles}/Microsoft MPI/Bin/mpiexec.exe")
   set(MPIEXEC_EXECUTABLE
       "$ENV{ProgramFiles}/Microsoft MPI/Bin/mpiexec.exe"
@@ -174,28 +169,8 @@ if(WIN32 AND EXISTS "$ENV{ProgramFiles}/Microsoft MPI/Bin/mpiexec.exe")
   unset(_msmpi_fortran_includes)
   unset(_msmpi_include)
 endif()
-if(MSVC AND METAMATERIAL_USE_MPI)
-  set(OpenMP_RUNTIME_MSVC llvm)
-  if(DEFINED OpenMP_CXX_FLAGS AND
-     NOT OpenMP_CXX_FLAGS MATCHES "openmp:llvm")
-    unset(OpenMP_C_FLAGS CACHE)
-    unset(OpenMP_CXX_FLAGS CACHE)
-    unset(OpenMP_C_SPEC_DATE CACHE)
-    unset(OpenMP_CXX_SPEC_DATE CACHE)
-  endif()
-endif()
 if(METAMATERIAL_USE_MPI)
   find_package(MPI REQUIRED COMPONENTS C CXX Fortran)
-  find_package(OpenMP REQUIRED COMPONENTS C CXX Fortran)
-
-  # FindOpenMP exposes ifx's driver option to every final linker. Keep it for
-  # Fortran links without passing -Qiopenmp to link.exe through C++ targets.
-  if(WIN32 AND TARGET OpenMP::OpenMP_Fortran)
-    set_property(TARGET OpenMP::OpenMP_Fortran PROPERTY
-      INTERFACE_LINK_OPTIONS
-      "$<$<LINK_LANGUAGE:Fortran>:SHELL:${OpenMP_Fortran_FLAGS}>"
-    )
-  endif()
 else()
   find_package(MPI REQUIRED COMPONENTS CXX)
 endif()
@@ -215,8 +190,12 @@ if(METAMATERIAL_USE_MPI)
   set(BUILD_COMPLEX OFF CACHE BOOL "" FORCE)
   set(BUILD_COMPLEX16 OFF CACHE BOOL "" FORCE)
   set(MUMPS_parallel ON CACHE BOOL "" FORCE)
-  set(MUMPS_openmp ON CACHE BOOL "" FORCE)
-  set(MUMPS_scalapack ON CACHE BOOL "" FORCE)
+  # Keep MUMPS on the same sequential oneMKL threading layer selected above.
+  # A separate build preset can opt into threaded MKL once that stack is proven.
+  set(MUMPS_openmp OFF CACHE BOOL "" FORCE)
+  # MUMPS 5.9 supports parallel solves without ScaLAPACK. Keeping it off
+  # avoids mixing oneMKL's Intel-MPI BLACS layer with the MS-MPI process.
+  set(MUMPS_scalapack OFF CACHE BOOL "" FORCE)
   set(MUMPS_scotch OFF CACHE BOOL "" FORCE)
   set(MUMPS_ptscotch OFF CACHE BOOL "" FORCE)
   set(MUMPS_metis OFF CACHE BOOL "" FORCE)
@@ -404,7 +383,7 @@ set(ALGOIM_DIR "${algoim_SOURCE_DIR}" CACHE PATH "" FORCE)
 
 if(METAMATERIAL_USE_MPI)
   set(HYPRE_ENABLE_MPI ON CACHE BOOL "" FORCE)
-  set(HYPRE_ENABLE_OPENMP ON CACHE BOOL "" FORCE)
+  set(HYPRE_ENABLE_OPENMP OFF CACHE BOOL "" FORCE)
   set(HYPRE_ENABLE_FORTRAN OFF CACHE BOOL "" FORCE)
   set(HYPRE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
   set(HYPRE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -442,6 +421,7 @@ set(MFEM_USE_MPI ${METAMATERIAL_USE_MPI} CACHE BOOL "" FORCE)
 set(MFEM_FETCH_TPLS OFF CACHE BOOL "" FORCE)
 set(MFEM_USE_METIS OFF CACHE BOOL "" FORCE)
 set(MFEM_USE_LAPACK OFF CACHE BOOL "" FORCE)
+set(MFEM_USE_EXCEPTIONS ON CACHE BOOL "" FORCE)
 set(MFEM_USE_MUMPS ${METAMATERIAL_USE_MPI} CACHE BOOL "" FORCE)
 set(MFEM_USE_ALGOIM ON CACHE BOOL "" FORCE)
 if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
@@ -449,11 +429,7 @@ if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
 else()
   set(MFEM_USE_CUDA OFF CACHE BOOL "" FORCE)
 endif()
-if(METAMATERIAL_MFEM_BACKEND MATCHES "parallel-cpu")
-  set(MFEM_USE_OPENMP ON CACHE BOOL "" FORCE)
-else()
-  set(MFEM_USE_OPENMP OFF CACHE BOOL "" FORCE)
-endif()
+set(MFEM_USE_OPENMP OFF CACHE BOOL "" FORCE)
 set(MFEM_ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(MFEM_ENABLE_MINIAPPS OFF CACHE BOOL "" FORCE)
 set(MFEM_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
@@ -615,7 +591,6 @@ target_link_libraries(metamaterial_app PRIVATE
     assimp
     Eigen3::Eigen
     fftw3
-    nlopt
     ParOpt::paropt
     mfem         # Enforces direct linkage to the compiled MFEM static library
     glvis
@@ -623,10 +598,6 @@ target_link_libraries(metamaterial_app PRIVATE
 
 if(TARGET SDL2::SDL2main)
   target_link_libraries(metamaterial_app PRIVATE SDL2::SDL2main)
-endif()
-
-if(METAMATERIAL_MFEM_BACKEND MATCHES "parallel-cpu")
-  target_link_libraries(metamaterial_app PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
 if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
@@ -715,10 +686,6 @@ if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
   target_link_libraries(paper_optimizer_miniapp PRIVATE
       CUDA::cudart CUDA::cublas CUDA::cusparse CUDA::cusolver)
 endif()
-if(METAMATERIAL_MFEM_BACKEND MATCHES "parallel-cpu")
-  target_link_libraries(paper_optimizer_miniapp PRIVATE OpenMP::OpenMP_CXX)
-endif()
-
 if(METAMATERIAL_USE_MPI)
   add_executable(mumps_smoke_check tests/mumps_smoke_check.cpp)
   target_link_libraries(mumps_smoke_check PRIVATE mfem)
@@ -728,8 +695,7 @@ if(METAMATERIAL_USE_MPI)
               ${MPIEXEC_PREFLAGS} $<TARGET_FILE:mumps_smoke_check>
               ${MPIEXEC_POSTFLAGS})
   set_tests_properties(mumps_2_ranks PROPERTIES
-      PROCESSORS 2
-      ENVIRONMENT "OMP_NUM_THREADS=2")
+      PROCESSORS 2)
 
   add_executable(parallel_solver_check
       tests/parallel_solver_check.cpp
@@ -743,7 +709,6 @@ if(METAMATERIAL_USE_MPI)
   target_link_libraries(parallel_solver_check PRIVATE
       fftw3
       mfem
-      OpenMP::OpenMP_CXX
   )
   target_compile_definitions(parallel_solver_check PRIVATE
       METAMATERIAL_USE_CUDA=0
@@ -756,7 +721,6 @@ if(METAMATERIAL_USE_MPI)
                 ${MPIEXEC_PREFLAGS} $<TARGET_FILE:parallel_solver_check>
                 ${MPIEXEC_POSTFLAGS})
     set_tests_properties(parallel_solver_${_ranks}_ranks PROPERTIES
-        PROCESSORS ${_ranks}
-        ENVIRONMENT "OMP_NUM_THREADS=2")
+        PROCESSORS ${_ranks})
   endforeach()
 endif()

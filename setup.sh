@@ -14,7 +14,6 @@ packages=(
     libopenmpi-dev
     libopenblas-dev
     liblapack-dev
-    libscalapack-openmpi-dev
     libgl1-mesa-dev
     libx11-dev
     libxext-dev

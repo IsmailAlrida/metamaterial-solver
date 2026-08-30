@@ -47,15 +47,23 @@
 int main(int argc, char** argv)
 {
     int provided_thread_level = 0;
+#if METAMATERIAL_USE_MPI
+    mfem::Mpi::Init(
+        argc, argv, MPI_THREAD_SERIALIZED, &provided_thread_level);
+    mfem::Hypre::Init();
+#else
     if (MPI_Init_thread(
             &argc, &argv, MPI_THREAD_SERIALIZED, &provided_thread_level)
             != MPI_SUCCESS) {
         std::cerr << "Could not initialize MPI for ParOpt.\n";
         return 1;
     }
+#endif
     if (provided_thread_level < MPI_THREAD_SERIALIZED) {
         std::cerr << "The MPI runtime does not support the optimizer worker thread.\n";
+#if !METAMATERIAL_USE_MPI
         MPI_Finalize();
+#endif
         return 1;
     }
     int rank = 0;
@@ -149,6 +157,8 @@ int main(int argc, char** argv)
                   << ": " << error.what() << '\n';
         exit_code = 1;
     }
+#if !METAMATERIAL_USE_MPI
     MPI_Finalize();
+#endif
     return exit_code;
 }

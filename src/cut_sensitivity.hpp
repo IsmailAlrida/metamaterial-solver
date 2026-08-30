@@ -139,9 +139,9 @@ inline bool differentiateCutElements(
         ? stop_initial_adjoint->HostRead() : nullptr;
     const mfem::real_t* phi_data = phi.HostRead();
 
-#ifdef _OPENMP
-#pragma omp parallel
-#endif
+    // ponytail: MFEM_THREAD_SAFE is off in the current dependency build, so
+    // shared finite-element spaces must remain serial here. Re-enable element
+    // parallelism only with thread-safe MFEM or per-thread FE spaces.
     {
         mfem::GridFunction thread_phi(&level_set_fes);
         thread_phi.UseDevice(false);
@@ -214,9 +214,6 @@ inline bool differentiateCutElements(
             }
         };
 
-#ifdef _OPENMP
-#pragma omp for schedule(dynamic)
-#endif
         for (int element = 0; element < mesh.GetNE(); ++element) {
             if (mesh.GetAttribute(element) != design_attribute) {
                 continue;
@@ -393,9 +390,6 @@ inline bool differentiateCutElements(
             }
         }
 
-#ifdef _OPENMP
-#pragma omp critical
-#endif
         {
             pass_physical_gradient += thread_pass_gradient;
             stop_physical_gradient += thread_stop_gradient;
@@ -426,6 +420,27 @@ inline bool reverseFilterGradients(
     SolverPerformance& performance,
     const LogFunction& log)
 {
+    const int design_size = design_to_cell.Width();
+    const int cell_count = design_to_cell.Height();
+    const bool dimensions_are_valid = design_size > 0 && cell_count > 0
+        && filter_matrix.Height() == cell_count
+        && filter_matrix.Width() == cell_count
+        && cell_to_level_set.Height() == design_size
+        && cell_to_level_set.Width() == cell_count
+        && cell_volumes.Size() == cell_count
+        && (!has_pass || pass_physical_gradient.Size() == design_size)
+        && (!has_stop || stop_physical_gradient.Size() == design_size);
+    bool active_indices_are_valid = true;
+    for (int i = 0; i < active_design_dofs.Size(); ++i) {
+        active_indices_are_valid &= active_design_dofs[i] >= 0
+            && active_design_dofs[i] < design_size;
+    }
+    if (!dimensions_are_valid || !active_indices_are_valid) {
+        log(LogLevel::Error,
+            "The adjoint filter received incompatible matrix or vector dimensions.");
+        return false;
+    }
+
 #if METAMATERIAL_USE_CUDA
     mfem::DSmoother preconditioner(filter_matrix);
 #else

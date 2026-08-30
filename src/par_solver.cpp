@@ -5,9 +5,12 @@
 #include <cmath>
 #include <complex>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <random>
+#include <sstream>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -53,6 +56,74 @@ enum class ParallelCommand : int {
     differentiate,
     shutdown
 };
+
+void write_mumps_diagnostic(int rank, const std::string& message) noexcept
+{
+    try {
+        const std::filesystem::path directory = "logs";
+        std::error_code error;
+        std::filesystem::create_directories(directory, error);
+        if (error) {
+            std::cerr << "Could not create the MUMPS log directory: "
+                      << error.message() << '\n';
+            return;
+        }
+
+        const std::filesystem::path path =
+            directory / ("mumps_rank_" + std::to_string(rank) + ".log");
+        std::ofstream output(path, std::ios::app);
+        if (!output) {
+            std::cerr << "Could not open " << path << " for MUMPS logging.\n";
+            return;
+        }
+
+        const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        output << "timestamp_ms=" << timestamp
+               << " rank=" << rank << ' ' << message << '\n';
+        output.flush();
+    }
+    catch (...) {
+        std::cerr << "Could not write the MUMPS diagnostic log.\n";
+    }
+}
+
+void factor_mumps(
+    MUMPSSolver& solver,
+    const HypreParMatrix& matrix,
+    int rank,
+    int ranks,
+    const std::string& name)
+{
+    std::ostringstream details;
+    details << "event=factor_begin matrix=" << name
+            << " ranks=" << ranks
+            << " global_rows=" << matrix.GetGlobalNumRows()
+            << " global_columns=" << matrix.GetGlobalNumCols()
+            << " local_rows=" << matrix.Height()
+            << " global_nnz=" << matrix.NNZ();
+    write_mumps_diagnostic(rank, details.str());
+
+    try {
+        solver.SetOperator(matrix);
+    }
+    catch (const std::exception& error) {
+        write_mumps_diagnostic(
+            rank,
+            "event=factor_error matrix=" + name
+                + " exception=" + error.what());
+        throw;
+    }
+    catch (...) {
+        write_mumps_diagnostic(
+            rank, "event=factor_error matrix=" + name
+                + " exception=unknown");
+        throw;
+    }
+
+    write_mumps_diagnostic(
+        rank, "event=factor_complete matrix=" + name);
+}
 
 void broadcast_command(
     MPI_Comm comm,
@@ -342,27 +413,43 @@ void App::Solver::parallelWorkerLoop()
             parallel_workers_shutdown = true;
             return;
         }
-        if (command == ParallelCommand::set_mesh) {
-            setMesh(true);
+        try {
+            if (command == ParallelCommand::set_mesh) {
+                setMesh(true);
+            }
+            else if (command == ParallelCommand::assemble) {
+                assembleSolutionSpace(true);
+            }
+            else if (command == ParallelCommand::solve) {
+                solve(true);
+            }
+            else if (command == ParallelCommand::differentiate) {
+                std::vector<std::complex<double>> pass;
+                std::vector<std::complex<double>> stop;
+                Vector pass_gradient;
+                Vector stop_gradient;
+                differentiateFrequencyResponses(
+                    pass, stop, pass_gradient, stop_gradient, true);
+            }
+            else {
+                std::cerr << "Unknown parallel solver command on MPI rank "
+                          << rank << ".\n";
+                return;
+            }
         }
-        else if (command == ParallelCommand::assemble) {
-            assembleSolutionSpace(true);
+        catch (const std::exception& error) {
+            write_mumps_diagnostic(
+                rank,
+                "event=worker_error command="
+                    + std::to_string(command_value)
+                    + " exception=" + error.what());
         }
-        else if (command == ParallelCommand::solve) {
-            solve(true);
-        }
-        else if (command == ParallelCommand::differentiate) {
-            std::vector<std::complex<double>> pass;
-            std::vector<std::complex<double>> stop;
-            Vector pass_gradient;
-            Vector stop_gradient;
-            differentiateFrequencyResponses(
-                pass, stop, pass_gradient, stop_gradient, true);
-        }
-        else {
-            std::cerr << "Unknown parallel solver command on MPI rank "
-                      << rank << ".\n";
-            return;
+        catch (...) {
+            write_mumps_diagnostic(
+                rank,
+                "event=worker_error command="
+                    + std::to_string(command_value)
+                    + " exception=unknown");
         }
     }
 #endif
@@ -467,6 +554,26 @@ bool App::Solver::assembleSolutionSpace(bool parallel)
     ++state.command_depth;
     DepthGuard depth_guard{state.command_depth};
     const auto started_at = std::chrono::steady_clock::now();
+
+    // A new assembly invalidates every state, adjoint, factorization, and
+    // preconditioner from the previous design.
+    result.U.clear();
+    result.residualNorms.clear();
+    pass_adjoint_history.clear();
+    stop_adjoint_history.clear();
+    outlet_pressure.clear();
+    state.initial_mumps.reset();
+    state.effective_mumps.reset();
+    state.initial_u_amg.reset();
+    state.initial_p_amg.reset();
+    state.effective_u_amg.reset();
+    state.effective_p_amg.reset();
+    state.initial_matrix.reset();
+    state.effective_matrix.reset();
+    state.initial_displacement.reset();
+    state.initial_pressure.reset();
+    state.effective_displacement.reset();
+    state.effective_pressure.reset();
 
     // Rank zero owns the replicated design and paper cell-centred filter.
     // The distributed ranks receive only the filtered level set and source.
@@ -870,6 +977,19 @@ bool App::Solver::solve(bool parallel)
     performance_data.mumpsSolveSeconds = 0.0;
     performance_data.maximumForwardResidual = 0.0;
 
+    bool designed_assembly_ready = state.M && state.C && state.K
+        && state.Muu && state.Cuu && state.Kuu
+        && state.Mpp && state.Cpp && state.Kpp && state.phi
+        && lset.design.Size() > 0;
+    if (!all_succeeded(state.comm, designed_assembly_ready)) {
+        if (state.rank == 0) {
+            log(LogLevel::Error,
+                "Call assembleSolutionSpace(true) before solve(true).");
+        }
+        status.store(SolverStatus::Error);
+        return false;
+    }
+
     const Vector designed_geometry(lset.design);
     auto fail = [this, &state, &designed_geometry](SolverStatus failure) {
         lset.design = designed_geometry;
@@ -879,7 +999,6 @@ bool App::Solver::solve(bool parallel)
     };
 
     const int first_analysis = state.reference_ready ? 1 : 0;
-    bool designed_assembly_ready = state.M && state.C && state.K;
     for (int analysis = first_analysis; analysis < 2; ++analysis) {
         const bool reference_analysis = analysis == 0;
         if (reference_analysis) {
@@ -961,18 +1080,29 @@ bool App::Solver::solve(bool parallel)
                 state.effective_mumps = std::make_unique<MUMPSSolver>(state.comm);
                 for (MUMPSSolver* direct : {
                          state.initial_mumps.get(), state.effective_mumps.get()}) {
-                    direct->SetPrintLevel(0);
+                    direct->SetPrintLevel(1);
                     direct->SetMatrixSymType(MUMPSSolver::UNSYMMETRIC);
-                    direct->SetReorderingStrategy(MUMPSSolver::PORD);
                 }
             }
             auto factor_started_at = std::chrono::steady_clock::now();
-            state.initial_mumps->SetOperator(*M_system);
+            const std::string analysis_name = reference_analysis
+                ? "reference" : "designed";
+            factor_mumps(
+                *state.initial_mumps,
+                *M_system,
+                state.rank,
+                state.ranks,
+                analysis_name + "_initial");
             performance_data.mumpsInitialFactorizationSeconds +=
                 std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - factor_started_at).count();
             factor_started_at = std::chrono::steady_clock::now();
-            state.effective_mumps->SetOperator(*K_hat);
+            factor_mumps(
+                *state.effective_mumps,
+                *K_hat,
+                state.rank,
+                state.ranks,
+                analysis_name + "_effective");
             performance_data.mumpsEffectiveFactorizationSeconds +=
                 std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - factor_started_at).count();
@@ -1088,6 +1218,15 @@ bool App::Solver::solve(bool parallel)
                 performance_data,
                 rank_log,
                 reference_analysis ? "empty-duct reference" : "designed duct");
+
+        // The wrappers borrow the AMG blocks. Destroy the wrappers before a
+        // reference solve releases those blocks.
+        solve_initial = {};
+        solve_effective = {};
+        initial_fgmres.reset();
+        effective_fgmres.reset();
+        initial_preconditioner.reset();
+        effective_preconditioner.reset();
         if (!all_succeeded(state.comm, transient_ready)) {
             state.initial_u_amg.reset();
             state.initial_p_amg.reset();

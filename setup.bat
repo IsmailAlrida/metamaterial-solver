@@ -126,21 +126,19 @@ exit /b 0
 
 :ensure_mkl
 if not exist "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\include\mkl.h" goto install_mkl
-if not exist "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\lib\mkl_scalapack_lp64.lib" goto install_mkl
-if not exist "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\lib\mkl_blacs_msmpi_lp64.lib" goto install_mkl
-if not exist "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\bin\mkl_scalapack_lp64.2.dll" goto install_mkl
-if not exist "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\bin\mkl_blacs_msmpi_lp64.2.dll" goto install_mkl
+if not exist "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\lib\mkl_core.lib" goto install_mkl
+if not exist "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\bin\mkl_sequential.3.dll" goto install_mkl
 goto mkl_available
 
 :install_mkl
 call :ensure_package Intel.oneMKL "Intel oneMKL"
 if errorlevel 1 exit /b 1
-if not exist "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\lib\mkl_scalapack_lp64.lib" goto incomplete_mkl
-if not exist "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\lib\mkl_blacs_msmpi_lp64.lib" goto incomplete_mkl
+if not exist "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\lib\mkl_core.lib" goto incomplete_mkl
+if not exist "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\bin\mkl_sequential.3.dll" goto incomplete_mkl
 exit /b 0
 
 :incomplete_mkl
-echo Intel oneMKL is installed without the ScaLAPACK/MS-MPI BLACS components.
+echo Intel oneMKL is installed without the required libraries or runtime.
 echo Repair the Intel oneMKL installation, then run setup.bat again.
 exit /b 1
 
@@ -196,10 +194,6 @@ call :check_file "%ProgramFiles(x86)%\Microsoft SDKs\MPI\Lib\x64\msmpi.lib" "Mic
 call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\include\mkl.h" "Intel oneMKL headers"
 call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\lib\mkl_core.lib" "Intel oneMKL libraries"
 call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\bin\mkl_sequential.3.dll" "Intel oneMKL runtime"
-call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\lib\mkl_scalapack_lp64.lib" "Intel oneMKL ScaLAPACK library"
-call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\lib\mkl_blacs_msmpi_lp64.lib" "Intel oneMKL MS-MPI BLACS library"
-call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\bin\mkl_scalapack_lp64.2.dll" "Intel oneMKL ScaLAPACK runtime"
-call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\bin\mkl_blacs_msmpi_lp64.2.dll" "Intel oneMKL MS-MPI BLACS runtime"
 call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\compiler\latest\bin\ifx.exe" "Intel Fortran Compiler"
 
 if not "!MISSING!"=="0" (

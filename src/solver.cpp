@@ -161,21 +161,21 @@ bool App::Solver::setMesh()
         return false;
     }
 
+    std::unique_ptr<Mesh> next_mesh;
+
     // TODO: Complete and validate the independent 3D optimization track.
     if (nz > 0) {
-        mesh = std::make_unique<Mesh>(Mesh::MakeCartesian3D(
+        next_mesh = std::make_unique<Mesh>(Mesh::MakeCartesian3D(
             nx, ny, nz, Element::HEXAHEDRON, sx, settings.sy, settings.sz));
     }
     else {
-        mesh = std::make_unique<Mesh>(Mesh::MakeCartesian2D(
+        next_mesh = std::make_unique<Mesh>(Mesh::MakeCartesian2D(
             nx, ny, Element::QUADRILATERAL, true, sx, settings.sy));
     }
 
+    // GridFunctions and finite-element spaces borrow their parents. Destroy
+    // every borrower before replacing the mesh they point into.
     lset.detach();
-    level_set_fes.reset();
-    scalar_fes.reset();
-    displacement_fes.reset();
-    fec.reset();
     M.reset();
     C.reset();
     K.reset();
@@ -196,6 +196,11 @@ bool App::Solver::setMesh()
     design_to_cell.reset();
     cell_to_level_set.reset();
     filter_matrix.reset();
+    level_set_fes.reset();
+    scalar_fes.reset();
+    displacement_fes.reset();
+    fec.reset();
+    mesh = std::move(next_mesh);
     inlet_load.SetSize(0);
     outlet_functional.SetSize(0);
     system_inlet_load.SetSize(0);
@@ -205,6 +210,11 @@ bool App::Solver::setMesh()
     displacement_essential_tdofs.SetSize(0);
     source_pressure.clear();
     source_pressure_derivative.clear();
+    outlet_pressure.clear();
+    result.U.clear();
+    result.residualNorms.clear();
+    pass_adjoint_history.clear();
+    stop_adjoint_history.clear();
     level_set_scale = 0.0;
     design_region_measure = 0.0;
     design_initialized = false;
@@ -339,10 +349,13 @@ bool App::Solver::prepareLevelSetAndSource()
                 ? design_incidence
                 : fixed_incidence;
             for (int i = 0; i < element_dofs.Size(); ++i) {
-                const int dof = element_dofs[i];
+                const int encoded_dof = element_dofs[i];
+                const int dof = encoded_dof >= 0
+                    ? encoded_dof : -1 - encoded_dof;
+                const real_t sign = encoded_dof >= 0 ? 1.0 : -1.0;
                 ++incidence[dof];
-                design_to_cell->Add(element, dof, shape[i]);
-                cell_to_level_set->Add(dof, element, 1.0);
+                design_to_cell->Add(element, dof, sign * shape[i]);
+                cell_to_level_set->Add(dof, element, sign);
             }
         }
         design_to_cell->Finalize();
@@ -394,6 +407,12 @@ bool App::Solver::prepareLevelSetAndSource()
         }
     }
 
+    if (lset.design.Size() != level_set_fes->GetTrueVSize()) {
+        log(LogLevel::Error,
+            "The level-set design does not match its finite-element space.");
+        return false;
+    }
+
     GridFunction unsmoothed_level_set(level_set_fes.get());
     unsmoothed_level_set.SetFromTrueDofs(lset.design);
     const auto smoothing_started_at = std::chrono::steady_clock::now();
@@ -432,6 +451,12 @@ bool App::Solver::prepareLevelSetAndSource()
 bool App::Solver::assembleSolutionSpace()
 {
     const auto assembly_started_at = std::chrono::steady_clock::now();
+    // A new assembly invalidates every state and adjoint from the old one.
+    result.U.clear();
+    result.residualNorms.clear();
+    pass_adjoint_history.clear();
+    stop_adjoint_history.clear();
+    outlet_pressure.clear();
     if (!prepareLevelSetAndSource()) {
         return false;
     }
@@ -744,6 +769,18 @@ bool App::Solver::solve()
         return false;
     }
 
+    bool designed_assembly_ready = M && C && K
+        && Muu_block && Cuu_block && Kuu_block
+        && Mpp_block && Cpp_block && Kpp_block;
+    if (!level_set_fes
+        || lset.design.Size() != level_set_fes->GetTrueVSize()
+        || !designed_assembly_ready) {
+        log(LogLevel::Error,
+            "Call assembleSolutionSpace() before solve().");
+        status.store(SolverStatus::Error);
+        return false;
+    }
+
     const Vector designed_geometry(lset.design);
     auto fail = [this, &designed_geometry](SolverStatus failure) {
         lset.design = designed_geometry;
@@ -753,9 +790,6 @@ bool App::Solver::solve()
     };
 
     const int first_analysis = reference_ready ? 1 : 0;
-    bool designed_assembly_ready = M && C && K
-        && Muu_block && Cuu_block && Kuu_block
-        && Mpp_block && Cpp_block && Kpp_block;
     for (int analysis = first_analysis; analysis < 2; ++analysis) {
         const bool reference_analysis = analysis == 0;
         if (reference_analysis) {
@@ -973,6 +1007,8 @@ bool App::Solver::smooth_level_set(
         || design_to_cell->Width() != level_set_size
         || cell_to_level_set->Height() != level_set_size
         || cell_to_level_set->Width() != cell_count
+        || level_set.Size() != level_set_fes->GetVSize()
+        || smoothed_level_set.Size() != level_set_fes->GetVSize()
         || element_centers.Height() != cell_count
         || element_centers.Width() != dim
         || cell_volumes.Size() != cell_count) {
@@ -1033,9 +1069,20 @@ bool App::Solver::smooth_level_set(
         }
         filter_matrix->Finalize();
     }
+    if (filter_matrix->Height() != cell_count
+        || filter_matrix->Width() != cell_count) {
+        log(LogLevel::Error,
+            "The level-set filter matrix does not match the mesh.");
+        return false;
+    }
 
     Vector mapped;
     level_set.GetTrueDofs(mapped);
+    if (mapped.Size() != design_to_cell->Width()) {
+        log(LogLevel::Error,
+            "The level-set smoother received an invalid design vector size.");
+        return false;
+    }
     mapped -= 0.5;
     mapped *= level_set_scale;
     Vector center_values(cell_count);
