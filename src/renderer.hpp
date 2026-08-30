@@ -60,7 +60,7 @@ namespace App {
             // Does the boring imgui window setup and flags and stuff, App class should call this
             void setup();
             void displayFrame(dispatcher_t& dispatcher);
-            void LogPanel();
+            void LogPanel(dispatcher_t& dispatcher);
             void log(LogLevel level, std::string msg);
 
             
@@ -95,12 +95,14 @@ namespace App {
             std::mutex logMutex;
             std::vector<LogEntry> logEntries;
             bool logScrollToBottom = false;
+            float clearButtonHover = 0.0f;
 
             void applyGlobalStyle(float scale);
             void loadFonts();
             void setupInitialDockLayout(ImGuiID dockspaceId,
                                         const ImGuiViewport& viewport);
             void updateObjectiveCurve();
+            void rebuildImplicitPassBands();
 
             //todo: maybe just pass refs to the class objects in each functions JUST to make the interface obvious.
             // Or be a devious dev and just do this in the implementation
@@ -152,7 +154,7 @@ namespace App {
                 Summary and guide of the current
                 physical simulation (math eqn, summary, etc..)
             */
-            void SimulationInfoPanel();
+            void SimulationInfoPanel(const dispatcher_t& dispatcher);
 
             /*
             OptimizerDesignPanel
@@ -162,10 +164,12 @@ namespace App {
                 A input field for the Y-range
                 A input field for No. of Samples/Points in the freq domain array; dictates the following
                 
-                A button to toggle between Bandgap and Freeform mode, with a hover tooltip explaining the difference
-                to a user who is assumed not to know what they mean, especially in ap context.
+                Current stop-band mode:
+                    - Only stop bands are exposed; every uncovered frequency is an implicit 0 dB passband
+                    - Stop bands are edited as start/end frequencies above one attenuation target
+                    - The invisible band row scrolls horizontally when it overflows
 
-                In Freeform mode:
+                TODO: Add Freeform mode later:
                 On the plot itself, since we already have a fixed number of points in the background, we
                 can draw them in the following way:
                     - Mouse pointer down and hold
@@ -173,16 +177,6 @@ namespace App {
                     - This lets us draw the filter response arbitrarily
                     - Also should have clamps to min/max attenuation; clamp to Y-range value
                     - Reset button
-                
-                In Bandgap mode
-                Or we can edit another way using the Bandgap struct:
-                    - We have a "div" under the plot show up
-                    - The div has an "+ Add Bandgap" button (use icon lib if possible)
-                    - Clicking add adds to a vector of bandgap smart pointers that each point to a unique bandgap object one such pointer
-                    - Spawns one UI element linked to it (bandgapGroup) 
-                    - Bandgap group has three input fields stacked vertically in a sandwich: Bandwidth (Hz), Center Frequencey (Hz), Attenuation (dB) which are all values of the bg struct
-                    - Inputting whatever moves the bandgap immediately
-                    - Bandgaps are iteratively applied over the base design function data points
             
                 Optional but real nice is Level Mode:
                 Similar to bandgap mode:
@@ -195,27 +189,10 @@ namespace App {
 
             */
             void OptimizerDesignPanel(const dispatcher_t& dispatcher);
-            void frequencyBandGroup(FrequencyBand* band);
-
-            /*
-            ActionPanel
-                This the stuff that starts/cancels/pauses/exports runs,
-                and this is where most state machine events will be dispatched from
-
-                While the other panels edit the run settings, the action panel will dictate
-                when thing.
-
-                Run/Pause/Cancel:
-                    - Run: Runs the solver <-> optimizer feedback loop until convergence/divergence/error. Switches from idle to solving to whatever to optimizing and so on and so forth.
-                    - Pause: Halts operation temproarily without freeing resources only after atomic next step is done (i.e, solver finishes its iteration then the halt signal is acked)
-                    - Cancel: Waits like pause, discards work/progress with no saving. Should give a popup warning.
-                
-                Export:
-                    - Run the exporter class to meshify the level set into a real mesh file viewable in 3D
-                    - Possibly dispatch any other scripts/algos we might bundle with this. IM feeling peckish for an HTML form with CDNs for three.js consuming a JSON of our data to make anice little html report.
-                
-            */
-            void ActionPanel(dispatcher_t& dispatcher);
+            bool frequencyBandGroup(FrequencyBand& band,
+                                    double lowerBound,
+                                    double upperBound,
+                                    bool locked);
             
     };
 

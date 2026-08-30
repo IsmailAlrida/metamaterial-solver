@@ -117,6 +117,12 @@ set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(ENABLE_OPENMP OFF CACHE BOOL "" FORCE)
 set(ENABLE_THREADS OFF CACHE BOOL "" FORCE)
 set(WITH_COMBINED_THREADS OFF CACHE BOOL "" FORCE)
+if(WIN32)
+  # The Windows CRT already supplies these functions. Prevent FFTW from
+  # finding oneAPI's Unix libm and exporting the nonexistent name m.lib.
+  set(LIBM_LIBRARY "" CACHE FILEPATH "Windows CRT supplies libm functions" FORCE)
+  unset(fftw3_LIB_DEPENDS CACHE)
+endif()
 FetchContent_Declare(
   fftw
   # The Git repository omits generated scalar codelets required by the
@@ -178,6 +184,15 @@ endif()
 if(METAMATERIAL_USE_MPI)
   find_package(MPI REQUIRED COMPONENTS C CXX Fortran)
   find_package(OpenMP REQUIRED COMPONENTS C CXX Fortran)
+
+  # FindOpenMP exposes ifx's driver option to every final linker. Keep it for
+  # Fortran links without passing -Qiopenmp to link.exe through C++ targets.
+  if(WIN32 AND TARGET OpenMP::OpenMP_Fortran)
+    set_property(TARGET OpenMP::OpenMP_Fortran PROPERTY
+      INTERFACE_LINK_OPTIONS
+      "$<$<LINK_LANGUAGE:Fortran>:SHELL:${OpenMP_Fortran_FLAGS}>"
+    )
+  endif()
 else()
   find_package(MPI REQUIRED COMPONENTS CXX)
 endif()
@@ -506,7 +521,9 @@ set(_glvis_compile_defs
   GLEW_STATIC
   $<$<PLATFORM_ID:Windows>:_USE_MATH_DEFINES>
 )
-set(_glvis_compile_opts)
+set(_glvis_compile_opts
+  $<$<CXX_COMPILER_ID:MSVC>:/Zc:preprocessor>
+)
 set(_glvis_include_dirs
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
   "${GLVIS_SOURCE_DIR}/lib"

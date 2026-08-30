@@ -91,6 +91,25 @@ inline std::filesystem::path fontPath()
         / "MaterialSymbolsRounded_28pt-Medium.ttf";
 }
 
+inline ImWchar firstCodepoint(const char* text)
+{
+    const auto* bytes = reinterpret_cast<const unsigned char*>(text);
+    if (bytes[0] < 0x80) {
+        return bytes[0];
+    }
+    if ((bytes[0] & 0xe0) == 0xc0) {
+        return static_cast<ImWchar>(
+            ((bytes[0] & 0x1f) << 6) | (bytes[1] & 0x3f));
+    }
+    if ((bytes[0] & 0xf0) == 0xe0) {
+        return static_cast<ImWchar>(
+            ((bytes[0] & 0x0f) << 12)
+            | ((bytes[1] & 0x3f) << 6)
+            | (bytes[2] & 0x3f));
+    }
+    return 0;
+}
+
 } // namespace Detail
 
 // Called once by Renderer::loadFonts(). UI code never needs to call this.
@@ -104,7 +123,9 @@ inline bool load(ImGuiIO& io, ImFont* targetFont, float pixelSize = 18.0f)
     ImFontConfig config;
     config.MergeMode = true;
     config.PixelSnapH = true;
+    config.GlyphOffset.y = 1.0f;
     config.GlyphMinAdvanceX = pixelSize;
+    config.GlyphMaxAdvanceX = pixelSize;
     config.DstFont = targetFont;
 
     return io.Fonts->AddFontFromFileTTF(
@@ -120,8 +141,36 @@ inline bool button(const char* id,
                    ImVec2 size = {})
 {
     ImGui::PushID(id);
-    const bool clicked = ImGui::Button(icon, size);
-    if (tooltip != nullptr && ImGui::IsItemHovered()) {
+    if (size.x <= 0.0f) {
+        size.x = ImGui::GetFrameHeight();
+    }
+    if (size.y <= 0.0f) {
+        size.y = ImGui::GetFrameHeight();
+    }
+
+    const bool clicked = ImGui::Button("##icon", size);
+    const ImVec2 minimum = ImGui::GetItemRectMin();
+    const ImVec2 maximum = ImGui::GetItemRectMax();
+    ImFontBaked* font = ImGui::GetFontBaked();
+    const ImFontGlyph* glyph = font->FindGlyphNoFallback(
+        Detail::firstCodepoint(icon));
+    if (glyph != nullptr) {
+        const ImVec2 origin(
+            minimum.x + (maximum.x - minimum.x - (glyph->X1 - glyph->X0)) * 0.5f
+                - glyph->X0,
+            minimum.y + (maximum.y - minimum.y - (glyph->Y1 - glyph->Y0)) * 0.5f
+                - glyph->Y0);
+        ImGui::GetWindowDrawList()->AddText(
+            ImGui::GetFont(),
+            ImGui::GetFontSize(),
+            origin,
+            ImGui::GetColorU32(ImGuiCol_Text),
+            icon);
+    }
+    if (tooltip != nullptr
+        && ImGui::IsItemHovered(
+            ImGuiHoveredFlags_ForTooltip
+            | ImGuiHoveredFlags_AllowWhenDisabled)) {
         ImGui::SetTooltip("%s", tooltip);
     }
     ImGui::PopID();

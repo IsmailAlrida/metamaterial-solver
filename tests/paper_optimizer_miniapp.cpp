@@ -3,7 +3,9 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cmath>
 #include <complex>
 #include <filesystem>
@@ -12,6 +14,7 @@
 #include <iostream>
 #include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -21,6 +24,13 @@
 #include "solver.hpp"
 
 namespace {
+
+volatile std::sig_atomic_t interrupt_requested = 0;
+
+void handle_interrupt(int)
+{
+    interrupt_requested = 1;
+}
 
 struct ObjectivePoint {
     int iteration;
@@ -181,6 +191,7 @@ void write_number(std::ostream& output, double value)
 bool write_report_data(
     const std::filesystem::path& path,
     const char* mode,
+    bool high_pass,
     bool gate_passed,
     const App::SolverSettings& solver_settings,
     const App::OptimizerSettings& optimizer_settings,
@@ -235,6 +246,14 @@ bool write_report_data(
         ? std::max(1, static_cast<int>(std::llround(
             solver_settings.duration / solver_settings.dt)))
         : 1;
+
+    const char* paper_case = high_pass
+        ? "High-pass filter, b = 1e-3, r1 = r2 = 7"
+        : "Low-pass filter, b = 1e-2";
+    const char* paper_figure = high_pass ? "11(a,d)" : "6(a,d)";
+    const int paper_page = high_pass ? 18 : 13;
+    const double paper_final_pass = high_pass ? 13.7815 : 5.06428;
+    const double paper_final_stop = high_pass ? 11.6695 : 4.99466;
 
     output << "{\n"
            << "  \"schema_version\": 5,\n"
@@ -343,9 +362,9 @@ bool write_report_data(
            << "    \"paper_runtime_note\": \"Not reported in the paper.\"\n"
            << "  },\n"
            << "  \"paper_reference\": {\n"
-           << "    \"case\": \"Low-pass filter, b = 1e-2\",\n"
-           << "    \"figure\": \"6(a,d)\",\n"
-           << "    \"page\": 13,\n"
+           << "    \"case\": " << std::quoted(paper_case) << ",\n"
+           << "    \"figure\": " << std::quoted(paper_figure) << ",\n"
+           << "    \"page\": " << paper_page << ",\n"
            << "    \"settings\": {\n"
            << "      \"nx\": 250,\n"
            << "      \"ny\": 50,\n"
@@ -354,8 +373,8 @@ bool write_report_data(
            << "      \"maximum_iterations\": 400\n"
            << "    },\n"
            << "    \"objectives\": {\n"
-           << "      \"final_pass\": 5.06428,\n"
-           << "      \"final_stop\": 4.99466\n"
+           << "      \"final_pass\": " << paper_final_pass << ",\n"
+           << "      \"final_stop\": " << paper_final_stop << "\n"
            << "    },\n"
            << "    \"optimizer_wall_seconds\": null\n"
            << "  },\n"
@@ -486,18 +505,23 @@ bool write_report_data(
 int main(int argc, char** argv)
 {
     bool paper_mode = false;
+    bool high_pass = false;
     bool use_mumps = false;
     for (int argument = 1; argument < argc; ++argument) {
         const std::string option = argv[argument];
         if (option == "--paper") {
             paper_mode = true;
         }
+        else if (option == "--high-pass") {
+            paper_mode = true;
+            high_pass = true;
+        }
         else if (option == "--mumps") {
             use_mumps = true;
         }
         else {
             std::cerr
-                << "Usage: paper_optimizer_miniapp [--paper] [--mumps]\n";
+                << "Usage: paper_optimizer_miniapp [--paper|--high-pass] [--mumps]\n";
             return 1;
         }
     }
@@ -521,6 +545,7 @@ int main(int argc, char** argv)
     }
     int rank = 0;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    std::signal(SIGINT, handle_interrupt);
 
     int exit_code = 0;
     {
@@ -532,6 +557,18 @@ int main(int argc, char** argv)
         solver_settings.linearSolveMethod = use_mumps
             ? App::LinearSolveMethod::mumps
             : App::LinearSolveMethod::fgmres;
+        if (high_pass) {
+            solver_settings.initialPatternX = 7;
+            solver_settings.initialPatternY = 7;
+            optimizer_settings.frequencyMin = 1000.0f;
+            optimizer_settings.frequencyMax = 4000.0f;
+            optimizer_settings.maxIterations = 400;
+            optimizer_settings.frequencyBands = {
+                {App::FrequencyBandType::stop, 1000.0,
+                    std::nextafter(2500.0, 0.0), 1.0e-3},
+                {App::FrequencyBandType::pass, 2500.0, 4000.0, 1.0}
+            };
+        }
         if (!paper_mode) {
             solver_settings.nx = 100;
             solver_settings.ny = 20;
@@ -589,7 +626,19 @@ int main(int argc, char** argv)
                 optimizer_settings, solver, geometry, result, log);
             optimizer = &optimizer_instance;
             started_at = std::chrono::steady_clock::now();
+            std::atomic<bool> optimizer_finished{false};
+            std::thread interrupt_watcher([&] {
+                while (!optimizer_finished.load(std::memory_order_relaxed)) {
+                    if (interrupt_requested != 0) {
+                        optimizer->request_cancel();
+                        return;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
+            });
             optimizer->run();
+            optimizer_finished.store(true, std::memory_order_relaxed);
+            interrupt_watcher.join();
 #if METAMATERIAL_USE_MPI
             solver.shutdownParallelWorkers();
 #endif
@@ -617,7 +666,7 @@ int main(int argc, char** argv)
                 && final_worst < initial_worst;
 
             const std::string mode = std::string(
-                paper_mode ? "paper" : "quick")
+                high_pass ? "high-pass" : (paper_mode ? "paper" : "quick"))
                 + (use_mumps ? "-mumps" : "");
             const std::filesystem::path output_path =
                 std::filesystem::path("test-results")
@@ -625,6 +674,7 @@ int main(int argc, char** argv)
             if (!write_report_data(
                     output_path,
                     mode.c_str(),
+                    high_pass,
                     gate_passed,
                     solver_settings,
                     optimizer_settings,
@@ -641,7 +691,12 @@ int main(int argc, char** argv)
                 std::cout << "Wrote " << std::filesystem::absolute(output_path)
                           << '\n';
             }
-            if (!gate_passed) {
+            if (interrupt_requested != 0
+                && optimizer->get_status() == App::OptimizerStatus::Cancelled) {
+                std::cerr << "Optimization interrupted after the latest completed design.\n";
+                exit_code = 130;
+            }
+            else if (!gate_passed) {
                 std::cerr << "The optimizer did not improve the app-like objective.\n";
                 exit_code = 1;
             }

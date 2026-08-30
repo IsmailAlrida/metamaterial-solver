@@ -660,11 +660,13 @@ bool App::Solver::assembleSolutionSpace(bool parallel)
     Cpp_form.Finalize();
     state.Cpp.reset(Cpp_form.ParallelAssemble());
 
-    std::unique_ptr<HypreParMatrix> Kup_transpose(Kup->Transpose());
-    std::unique_ptr<HypreParMatrix> coupling_residual(
-        Add(1.0, *Mpu, 1.0, *Kup_transpose));
-    if (coupling_residual->FNorm() > 1.0e-10 * std::max({
-            real_t{1.0}, Mpu->FNorm(), Kup_transpose->FNorm()})) {
+    std::unique_ptr<SparseMatrix> Kup_transpose(
+        Transpose(Kup_form.SpMat()));
+    std::unique_ptr<SparseMatrix> coupling_residual(
+        Add(1.0, Mpu_form.SpMat(), 1.0, *Kup_transpose));
+    if (coupling_residual->MaxNorm() > 1.0e-10 * std::max({
+            real_t{1.0}, Mpu_form.SpMat().MaxNorm(),
+            Kup_transpose->MaxNorm()})) {
         if (state.rank == 0) {
             log(LogLevel::Error,
                 "The parallel coupling matrices do not satisfy Mpu = -Kup^T.");
@@ -675,12 +677,16 @@ bool App::Solver::assembleSolutionSpace(bool parallel)
     state.M = block_matrix(state.Muu.get(), nullptr, Mpu.get(), state.Mpp.get());
     state.C = block_matrix(state.Cuu.get(), nullptr, nullptr, state.Cpp.get());
     state.K = block_matrix(state.Kuu.get(), Kup.get(), nullptr, state.Kpp.get());
-    if (!std::isfinite(state.M->FNorm())
-        || !std::isfinite(state.C->FNorm())
-        || !std::isfinite(state.K->FNorm())) {
+    if (Muu_form.SpMat().CheckFinite() != 0
+        || Kuu_form.SpMat().CheckFinite() != 0
+        || Mpp_form.SpMat().CheckFinite() != 0
+        || Kpp_form.SpMat().CheckFinite() != 0
+        || Kup_form.SpMat().CheckFinite() != 0
+        || Mpu_form.SpMat().CheckFinite() != 0
+        || Cpp_form.SpMat().CheckFinite() != 0) {
         if (state.rank == 0) {
             log(LogLevel::Error,
-                "The distributed matrices contain non-finite values.");
+                "The assembled finite element matrices contain non-finite values.");
         }
         return false;
     }

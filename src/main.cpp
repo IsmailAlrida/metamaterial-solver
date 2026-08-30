@@ -58,11 +58,17 @@ int main(int argc, char** argv)
         MPI_Finalize();
         return 1;
     }
+    int rank = 0;
+#if METAMATERIAL_USE_MPI
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+#endif
 
     int exit_code = 0;
     try {
         mfem::Device device(METAMATERIAL_USE_CUDA ? "cuda" : "cpu");
-        device.Print();
+        if (rank == 0) {
+            device.Print();
+        }
 
         // Construct the top-level data. Everyone below receives references to these.
         // TODO: Make App settings construct defaults
@@ -80,45 +86,67 @@ int main(int argc, char** argv)
         auto& geometry = *lset;
 
         // Keep the renderer alive longer than the objects that will publish to it.
-        auto renderer = std::make_unique<App::Renderer>(
-            appSettings,
-            solverResult,
-            geometry);
-        App::LogFunction log = [&renderer](App::LogLevel level, std::string message) {
-            renderer->log(level, std::move(message));
+        std::unique_ptr<App::Renderer> renderer;
+        App::LogFunction log = [&renderer, rank](
+            App::LogLevel level, std::string message) {
+            if (rank != 0) {
+                return;
+            }
+            if (renderer) {
+                renderer->log(level, std::move(message));
+            }
+            else {
+                std::cerr << message << '\n';
+            }
         };
 
+        // Every MPI process owns one local handle to the same collective solver.
         auto solver = std::make_unique<App::solver_t>(
             solverSettings,
             optimizerSettings,
             geometry,
             solverResult,
-            log);
-        // in opt, result is const, not edited.
-        auto optimizer = std::make_unique<App::optimizer_t>(
-            optimizerSettings,
-            *solver,
-            geometry,
-            solverResult,
-            log);
-        auto exporter = std::make_unique<App::exporter_t>(
-            exporterSettings,
-            geometry,
-            log);
-        auto dispatcher = std::make_unique<App::dispatcher_t>(
-            *optimizer,
-            *exporter,
-            log);
-        renderer->setup();
-        log(App::LogLevel::Message, "Renderer initialized");
+            log,
+            METAMATERIAL_USE_MPI != 0);
 
-        while (!renderer->shouldClose) {
-            dispatcher->dispatch();
-            renderer->displayFrame(*dispatcher);
+#if METAMATERIAL_USE_MPI
+        if (rank != 0) {
+            solver->parallelWorkerLoop();
+        }
+        else
+#endif
+        {
+            renderer = std::make_unique<App::Renderer>(
+                appSettings,
+                solverResult,
+                geometry);
+            // in opt, result is const, not edited.
+            auto optimizer = std::make_unique<App::optimizer_t>(
+                optimizerSettings,
+                *solver,
+                geometry,
+                solverResult,
+                log);
+            auto exporter = std::make_unique<App::exporter_t>(
+                exporterSettings,
+                geometry,
+                log);
+            auto dispatcher = std::make_unique<App::dispatcher_t>(
+                *optimizer,
+                *exporter,
+                log);
+            renderer->setup();
+            log(App::LogLevel::Message, "Renderer initialized");
+
+            while (!renderer->shouldClose) {
+                dispatcher->dispatch();
+                renderer->displayFrame(*dispatcher);
+            }
         }
 
     } catch (const std::exception& error) {
-        std::cerr << "Application startup failed: " << error.what() << '\n';
+        std::cerr << "Application startup failed on MPI rank " << rank
+                  << ": " << error.what() << '\n';
         exit_code = 1;
     }
     MPI_Finalize();
