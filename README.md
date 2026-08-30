@@ -141,5 +141,6 @@ For WSL2, install the Windows NVIDIA driver and follow NVIDIA's
 do not install a separate Linux display driver inside WSL.
 
 Windows build directories live under `build/<backend>`. Linux and WSL2 build
-directories live under `build/linux/<backend>`, with Linux dependency sources
-under `build/linux/deps/src`.
+directories live under `build/linux/<backend>`. Both platforms reuse dependency
+sources under `build/deps/src` and the GLVis checkout under `extern/glvis`;
+compiled objects remain platform-specific inside their respective build directories.

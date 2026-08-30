@@ -110,7 +110,7 @@
     const scientific = value => Number.isFinite(value) ? Number(value).toExponential(4) : 'n/a';
     const seconds = value => Number.isFinite(value) ? `${value.toFixed(2)} s` : 'n/a';
     const layout = title => ({
-      title: { text: title, font: { color: colors.paper, size: 16 } },
+      title: { text: title, font: { color: colors.paper, size: 16 }, pad: { b: 14 } },
       paper_bgcolor: colors.panel,
       plot_bgcolor: colors.panel,
       font: { color: colors.paper },
@@ -172,23 +172,26 @@
       const ys = [...new Set(points.map(point => point.y))].sort((a, b) => a - b);
       const values = new Map(points.map(point => [`${point.x}|${point.y}`, point]));
       const phi = ys.map(y => xs.map(x => values.get(`${x}|${y}`)?.phi ?? null));
-      const solid = ys.map(y => xs.map(x => values.get(`${x}|${y}`)?.solid ? 1 : 0));
-      const geometryLayout = layout('Implementation geometry — gray is solid');
+      const geometryLayout = layout('Implementation geometry — filled solid');
       geometryLayout.xaxis.title = 'x [m]';
       geometryLayout.yaxis.title = 'y [m]';
       geometryLayout.yaxis.scaleanchor = 'x';
-      geometryLayout.shapes = [
+      const ductLength = data.settings.inlet_length_m
+        + data.settings.design_length_m + data.settings.outlet_length_m;
+      geometryLayout.shapes = [{
+        type: 'rect', x0: 0, x1: ductLength, y0: 0, y1: data.settings.height_m,
+        fillcolor: '#ffffff', line: { width: 0 }, layer: 'below'
+      }, ...[
         data.settings.inlet_length_m,
         data.settings.inlet_length_m + data.settings.design_length_m
       ].map(x => ({ type: 'line', x0: x, x1: x, y0: 0, y1: data.settings.height_m,
-        line: { color: '#f7c66b', width: 1, dash: 'dot' } }));
-      Plotly.newPlot('geometry', [
-        { type: 'heatmap', x: xs, y: ys, z: solid, zmin: 0, zmax: 1,
-          colorscale: [[0, '#ffffff'], [1, '#595959']], showscale: false },
-        { type: 'contour', x: xs, y: ys, z: phi, autocontour: false,
-          contours: { start: 0, end: 0, size: 1, coloring: 'none' },
-          line: { color: '#05070a', width: 3 }, showscale: false, hoverinfo: 'skip' }
-      ], geometryLayout, config);
+        line: { color: '#f7c66b', width: 1, dash: 'dot' } }))];
+      Plotly.newPlot('geometry', [{
+        type: 'contour', x: xs, y: ys, z: phi,
+        contours: { type: 'constraint', operation: '<', value: 0 },
+        fillcolor: '#595959', line: { color: '#05070a', width: 3 },
+        showscale: false, hoverinfo: 'skip'
+      }], geometryLayout, config);
     }
 
     function renderResponse(data, analysis) {

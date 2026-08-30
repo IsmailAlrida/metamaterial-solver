@@ -61,8 +61,8 @@ fi
 
 build_dir="build/linux/$backend"
 [[ $build_type == Debug ]] && build_dir+="-debug"
-deps_source_dir="$PWD/build/linux/deps/src"
-glvis_source_dir="$deps_source_dir/glvis-src"
+deps_source_dir="$PWD/build/deps/src"
+glvis_source_dir="$PWD/extern/glvis"
 
 echo "Backend: $backend"
 echo "Build type: $build_type"
@@ -71,7 +71,7 @@ echo "Deps source dir: $deps_source_dir"
 echo "GLVis source dir: $glvis_source_dir"
 [[ -n $cuda_arch ]] && echo "CUDA architecture: $cuda_arch"
 
-mkdir -p "$deps_source_dir"
+mkdir -p "$deps_source_dir" "$PWD/extern"
 if [[ ! -d $glvis_source_dir/.git ]]; then
     echo "Fetching GLVis source into $glvis_source_dir..."
     git clone https://github.com/GLVis/glvis.git "$glvis_source_dir"
@@ -81,12 +81,15 @@ fi
 git -C "$glvis_source_dir" checkout --detach "$glvis_revision"
 
 glvis_patch="$PWD/patches/glvis-embedded-window.patch"
-if ! git -C "$glvis_source_dir" apply --reverse --check "$glvis_patch" >/dev/null 2>&1; then
-    git -C "$glvis_source_dir" apply --check "$glvis_patch" || {
+if ! git -C "$glvis_source_dir" apply --reverse --check \
+        --ignore-space-change --ignore-whitespace "$glvis_patch" >/dev/null 2>&1; then
+    git -C "$glvis_source_dir" apply --check \
+        --ignore-space-change --ignore-whitespace "$glvis_patch" || {
         echo "GLVis host-window patch does not apply to the downloaded revision." >&2
         exit 1
     }
-    git -C "$glvis_source_dir" apply "$glvis_patch"
+    git -C "$glvis_source_dir" apply \
+        --ignore-space-change --ignore-whitespace "$glvis_patch"
 fi
 
 cmake_args=(

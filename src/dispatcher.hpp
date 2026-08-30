@@ -41,15 +41,15 @@ class Dispatcher {
               transitions{
                   {{State::Idle, Event::Start},
                    {State::Working, [this]() {
-                       optimizer.run();
+                       this->optimizer.run();
                    }}},
                   {{State::Working, Event::Cancel},
                    {State::Working, [this]() {
-                       optimizer.request_cancel();
+                       this->optimizer.request_cancel();
                    }}},
                   {{State::Idle, Event::Export},
                    {State::Exporting, [this]() {
-                       if (!exporter.exportMesh()) {
+                       if (!this->exporter.exportMesh()) {
                            throw std::runtime_error("Mesh export failed.");
                        }
                    }}}
@@ -156,6 +156,21 @@ class Dispatcher {
         bool is_exportable() const
         {
             return optimizer.is_exportable();
+        }
+
+        double get_pass_objective() const
+        {
+            return optimizer.get_pass_objective();
+        }
+
+        double get_stop_objective() const
+        {
+            return optimizer.get_stop_objective();
+        }
+
+        double get_mma_bound() const
+        {
+            return optimizer.get_mma_bound();
         }
 
     private:

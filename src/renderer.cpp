@@ -355,8 +355,7 @@ void Renderer::SimulationSettingsPanel(const dispatcher_t& dispatcher)
 
     SolverSettings& solver = settings.solverSettings;
     OptimizerSettings& optimizer = settings.optSettings;
-    const bool locked = dispatcher.get_state() == dispatcher_t::State::Working
-        || dispatcher.get_state() == dispatcher_t::State::Exporting;
+    const bool locked = dispatcher.get_state() != dispatcher_t::State::Idle;
 
     if (locked) {
         ImGui::TextColored(
@@ -374,18 +373,19 @@ void Renderer::SimulationSettingsPanel(const dispatcher_t& dispatcher)
         ImGui::TextDisabled(is3D ? "3D hexahedral grid" : "nz = 0, 2D quadrilateral grid");
 
         ImGui::SeparatorText("Duct regions along x");
-        ImGui::SetNextItemWidth(110.0f);
-        ImGui::InputDouble("Inlet (m)", &solver.inletLength, 0.01, 0.1, "%.4f");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(110.0f);
-        ImGui::InputDouble("Design (m)", &solver.designLength, 0.01, 0.1, "%.4f");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(110.0f);
-        ImGui::InputDouble("Outlet (m)", &solver.outletLength, 0.01, 0.1, "%.4f");
-
-        solver.inletLength = std::max(solver.inletLength, 1.0e-6);
-        solver.designLength = std::max(solver.designLength, 1.0e-6);
-        solver.outletLength = std::max(solver.outletLength, 1.0e-6);
+        const double fixedRegionMinimum = 0.02;
+        const double fixedRegionMaximum = 0.30;
+        const double designRegionMinimum = 0.05;
+        const double designRegionMaximum = 1.00;
+        ImGui::SliderScalar("Inlet (m)", ImGuiDataType_Double,
+            &solver.inletLength, &fixedRegionMinimum,
+            &fixedRegionMaximum, "%.4f");
+        ImGui::SliderScalar("Design (m)", ImGuiDataType_Double,
+            &solver.designLength, &designRegionMinimum,
+            &designRegionMaximum, "%.4f");
+        ImGui::SliderScalar("Outlet (m)", ImGuiDataType_Double,
+            &solver.outletLength, &fixedRegionMinimum,
+            &fixedRegionMaximum, "%.4f");
 
         const double sx = solver.inletLength
             + solver.designLength
@@ -409,8 +409,10 @@ void Renderer::SimulationSettingsPanel(const dispatcher_t& dispatcher)
 
         }
 
-        ImGui::SetNextItemWidth(110.0f);
-        ImGui::InputDouble("sy (m)", &solver.sy, 0.01, 0.1, "%.4f");
+        const double heightMinimum = 0.02;
+        const double heightMaximum = 0.30;
+        ImGui::SliderScalar("sy (m)", ImGuiDataType_Double,
+            &solver.sy, &heightMinimum, &heightMaximum, "%.4f");
         if (is3D) {
             ImGui::SameLine();
             ImGui::SetNextItemWidth(110.0f);
@@ -418,7 +420,7 @@ void Renderer::SimulationSettingsPanel(const dispatcher_t& dispatcher)
         }
 
         solver.nx = std::max(solver.nx, 1);
-        solver.sy = std::max(solver.sy, 1.0e-6);
+        solver.sy = std::clamp(solver.sy, heightMinimum, heightMaximum);
         solver.sz = std::max(solver.sz, 1.0e-6);
 
         if (solver.isotropicGrid) {
@@ -471,19 +473,36 @@ void Renderer::SimulationSettingsPanel(const dispatcher_t& dispatcher)
     if (ImGui::CollapsingHeader("Fourier Transform & Solver Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::InputDouble("Duration (s)", &solver.duration, 0.001, 0.01, "%.5f");
         ImGui::InputDouble("Time step dt (s)", &solver.dt, 1.0e-6, 1.0e-5, "%.7f");
-        ImGui::InputInt("FFT samples", &solver.fftSamples, 128, 1024);
         ImGui::Checkbox("Hann window", &solver.useHannWindow);
         solver.duration = std::max(solver.duration, 1.0e-6);
         solver.dt = std::max(solver.dt, 1.0e-9);
-        solver.fftSamples = std::clamp(solver.fftSamples, 32, 65536);
-        ImGui::TextDisabled("Newmark beta: 0.25    gamma: 0.50");
+        ImGui::TextDisabled("Derived FFT samples: %d",
+            static_cast<int>(std::llround(solver.duration / solver.dt)));
+        ImGui::InputDouble("Newmark beta", &solver.newmarkBeta, 0.01, 0.1, "%.4f");
+        ImGui::InputDouble("Newmark gamma", &solver.newmarkGamma, 0.01, 0.1, "%.4f");
+        ImGui::InputDouble("Source amplitude (Pa)", &solver.sourceAmplitude, 0.1, 1.0, "%.3f");
+        ImGui::InputScalar("Source seed", ImGuiDataType_U32, &solver.sourceSeed);
     }
 
     if (ImGui::CollapsingHeader("Optimizer Settings")) {
         ImGui::InputFloat("Smoothing radius (m)", &optimizer.filterRadius, 0.0001f, 0.001f, "%.5f");
         ImGui::InputInt("Maximum iterations", &optimizer.maxIterations);
+        ImGui::InputDouble("Initial asymptote", &optimizer.mmaInitialAsymptote, 0.01, 0.1, "%.3f");
+        ImGui::InputDouble("Asymptote decrease", &optimizer.mmaDecreaseAsymptote, 0.01, 0.1, "%.3f");
+        ImGui::InputDouble("Asymptote increase", &optimizer.mmaIncreaseAsymptote, 0.01, 0.1, "%.3f");
+        ImGui::InputDouble("Constraint penalty", &optimizer.mmaConstraintPenalty, 10.0, 100.0, "%.1f");
+        ImGui::InputDouble("Cut derivative / h", &optimizer.cutDerivativeRelativeStep, 1.0e-5, 1.0e-4, "%.2e");
         optimizer.filterRadius = std::max(optimizer.filterRadius, 0.0f);
         optimizer.maxIterations = std::clamp(optimizer.maxIterations, 1, 10000);
+    }
+
+    if (ImGui::CollapsingHeader("Initial level-set design")) {
+        ImGui::InputInt("Cosine count x", &solver.initialPatternX);
+        ImGui::InputInt("Cosine count y", &solver.initialPatternY);
+        ImGui::InputDouble("Pattern length x (m)", &solver.initialPatternLx, 0.01, 0.1, "%.4f");
+        ImGui::InputDouble("Pattern length y (m)", &solver.initialPatternLy, 0.01, 0.1, "%.4f");
+        ImGui::InputDouble("Pattern bias", &solver.initialPatternBias, 0.01, 0.1, "%.4f");
+        ImGui::InputDouble("Pattern threshold", &solver.initialPatternThreshold, 0.001, 0.01, "%.4f");
     }
 
     ImGui::EndDisabled();
@@ -503,7 +522,7 @@ void Renderer::SimulationInfoPanel()
         * static_cast<long long>(solver.ny)
         * static_cast<long long>(is3D ? solver.nz : 1);
     const long long timeSteps = solver.dt > 0.0
-        ? static_cast<long long>(std::ceil(solver.duration / solver.dt))
+        ? std::llround(solver.duration / solver.dt)
         : 0;
     const double sx = solver.inletLength
         + solver.designLength
@@ -517,7 +536,7 @@ void Renderer::SimulationInfoPanel()
                 solver.designLength,
                 solver.outletLength);
     ImGui::Text("%lld time steps", timeSteps);
-    ImGui::Text("FFT: %d samples%s", solver.fftSamples, solver.useHannWindow ? " + Hann" : "");
+    ImGui::Text("FFT: %lld samples%s", timeSteps, solver.useHannWindow ? " + Hann" : "");
     ImGui::Separator();
     ImGui::TextWrapped(
         "A Newmark time-domain solve produces the impulse response. The selected window is then applied before the FFT constructs the frequency response.");
@@ -539,7 +558,6 @@ void Renderer::SimulationInfoPanel()
 void Renderer::updateObjectiveCurve()
 {
     OptimizerSettings& optimizer = settings.optSettings;
-    // TODO
     optimizer.frequencySamples = std::clamp(optimizer.frequencySamples, 32, 4096);
     optimizer.frequencyMax = std::max(optimizer.frequencyMax, optimizer.frequencyMin + 1.0f);
     optimizer.attenuationMaxDb = std::max(
@@ -547,35 +565,27 @@ void Renderer::updateObjectiveCurve()
 
     const int count = optimizer.frequencySamples;
     objectiveFrequency.resize(count);
-    objectiveTarget.assign(count, 0.0f);
-
-    if (optimizer.freeformTarget.size() != static_cast<std::size_t>(count)) {
-        optimizer.freeformTarget.resize(static_cast<std::size_t>(count), 0.0f);
-    }
+    objectiveTarget.assign(count, std::numeric_limits<float>::quiet_NaN());
 
     for (int i = 0; i < count; ++i) {
         const float t = static_cast<float>(i) / static_cast<float>(count - 1);
         objectiveFrequency[i] = optimizer.frequencyMin
             + t * (optimizer.frequencyMax - optimizer.frequencyMin);
 
-        if (optimizer.objectiveMode == ObjectiveMode::freeform) {
-            objectiveTarget[i] = std::clamp(
-                optimizer.freeformTarget[i],
-                optimizer.attenuationMinDb,
-                optimizer.attenuationMaxDb);
-            continue;
-        }
-
-        for (const Bandgap& bandgap : optimizer.bandgaps) {
-            const float halfWidth = std::max(bandgap.bandwidth, 0.0f) * 0.5f;
-            if (std::abs(objectiveFrequency[i] - bandgap.center) <= halfWidth) {
-                objectiveTarget[i] = std::min(
-                    objectiveTarget[i],
-                    std::clamp(
-                        bandgap.attenuationDb,
-                        optimizer.attenuationMinDb,
-                        optimizer.attenuationMaxDb));
+        const FrequencyBand* selected = nullptr;
+        for (const FrequencyBand& band : optimizer.frequencyBands) {
+            if (objectiveFrequency[i] >= band.startHz
+                && objectiveFrequency[i] <= band.endHz
+                && (selected == nullptr || band.endHz < selected->endHz)) {
+                selected = &band;
             }
+        }
+        if (selected) {
+            objectiveTarget[i] = static_cast<float>(std::clamp(
+                20.0 * std::log10(std::max(
+                    selected->targetTransmission, 1.0e-12)),
+                static_cast<double>(optimizer.attenuationMinDb),
+                static_cast<double>(optimizer.attenuationMaxDb)));
         }
     }
 }
@@ -583,8 +593,7 @@ void Renderer::updateObjectiveCurve()
 void Renderer::OptimizerDesignPanel(const dispatcher_t& dispatcher)
 {
     OptimizerSettings& optimizer = settings.optSettings;
-    const bool locked = dispatcher.get_state() == dispatcher_t::State::Working
-        || dispatcher.get_state() == dispatcher_t::State::Exporting;
+    const bool locked = dispatcher.get_state() != dispatcher_t::State::Idle;
     if (!locked) {
         updateObjectiveCurve();
     }
@@ -634,42 +643,7 @@ void Renderer::OptimizerDesignPanel(const dispatcher_t& dispatcher)
                     responseCount,
                     {ImPlotProp_LineColor, ImVec4(0.31f, 0.86f, 0.61f, 1.0f)});
             }
-
-            if (!locked
-                && optimizer.objectiveMode == ObjectiveMode::freeform
-                && ImPlot::IsPlotHovered()
-                && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-                const ImPlotPoint mouse = ImPlot::GetPlotMousePos();
-                const double normalized = (mouse.x - optimizer.frequencyMin)
-                    / (optimizer.frequencyMax - optimizer.frequencyMin);
-                const int index = std::clamp(
-                    static_cast<int>(std::lround(normalized * (optimizer.frequencySamples - 1))),
-                    0,
-                    optimizer.frequencySamples - 1);
-                const float value = std::clamp(
-                    static_cast<float>(mouse.y),
-                    optimizer.attenuationMinDb,
-                    optimizer.attenuationMaxDb);
-
-                if (lastFreeformIndex >= 0 && lastFreeformIndex != index) {
-                    const int first = std::min(lastFreeformIndex, index);
-                    const int last = std::max(lastFreeformIndex, index);
-                    const float firstValue = optimizer.freeformTarget[lastFreeformIndex];
-                    for (int i = first; i <= last; ++i) {
-                        const float t = static_cast<float>(i - lastFreeformIndex)
-                            / static_cast<float>(index - lastFreeformIndex);
-                        optimizer.freeformTarget[i] = firstValue + t * (value - firstValue);
-                    }
-                }
-                else {
-                    optimizer.freeformTarget[index] = value;
-                }
-                lastFreeformIndex = index;
-            }
             ImPlot::EndPlot();
-        }
-        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-            lastFreeformIndex = -1;
         }
     }
     ImGui::End();
@@ -680,33 +654,6 @@ void Renderer::OptimizerDesignPanel(const dispatcher_t& dispatcher)
     }
 
     ImGui::BeginDisabled(locked);
-    const bool bandgapMode = optimizer.objectiveMode == ObjectiveMode::bandgap;
-    if (bandgapMode) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.38f, 0.67f, 1.0f));
-    }
-    if (ImGui::Button("Bandgaps", ImVec2(110.0f, 0.0f))) {
-        optimizer.objectiveMode = ObjectiveMode::bandgap;
-    }
-    if (bandgapMode) {
-        ImGui::PopStyleColor();
-    }
-    ImGui::SameLine();
-    if (!bandgapMode) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.38f, 0.67f, 1.0f));
-    }
-    if (ImGui::Button("Freeform", ImVec2(110.0f, 0.0f))) {
-        if (optimizer.objectiveMode != ObjectiveMode::freeform) {
-            optimizer.freeformTarget = objectiveTarget;
-        }
-        optimizer.objectiveMode = ObjectiveMode::freeform;
-    }
-    if (!bandgapMode) {
-        ImGui::PopStyleColor();
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Draw the desired attenuation directly on the response plot.");
-    }
-
     ImGui::SeparatorText("Plot range");
     ImGui::InputFloat("Minimum frequency (Hz)", &optimizer.frequencyMin, 10.0f, 100.0f, "%.1f");
     ImGui::InputFloat("Maximum frequency (Hz)", &optimizer.frequencyMax, 10.0f, 100.0f, "%.1f");
@@ -714,80 +661,99 @@ void Renderer::OptimizerDesignPanel(const dispatcher_t& dispatcher)
     ImGui::InputFloat("Maximum attenuation (dB)", &optimizer.attenuationMaxDb, 1.0f, 5.0f, "%.1f");
     ImGui::InputInt("Frequency samples", &optimizer.frequencySamples, 16, 64);
 
-    if (optimizer.objectiveMode == ObjectiveMode::freeform) {
-        ImGui::SeparatorText("Freeform target");
-        ImGui::TextWrapped("Hold the left mouse button over the frequency plot and draw the target response.");
-        if (ImGui::Button("Reset target")) {
-            std::fill(
-                optimizer.freeformTarget.begin(),
-                optimizer.freeformTarget.end(),
-                0.0f);
+    ImGui::SeparatorText("Frequency bands");
+    if (ImGui::Button("+ Add band")) {
+        double start = optimizer.frequencyMin;
+        for (const FrequencyBand& band : optimizer.frequencyBands) {
+            start = std::max(start, band.endHz);
         }
-        ImGui::SameLine();
-        ImGui::BeginDisabled();
-        static bool levelMode = false;
-        ImGui::Checkbox("Snap to levels", &levelMode);
-        ImGui::EndDisabled();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-            ImGui::SetTooltip("Discrete level snapping is planned after the base freeform editor.");
+        const double width = std::max(
+            1.0, 0.1 * (optimizer.frequencyMax - optimizer.frequencyMin));
+        if (start < optimizer.frequencyMax) {
+            optimizer.frequencyBands.push_back({
+                FrequencyBandType::stop,
+                start,
+                std::min(
+                    start + width,
+                    static_cast<double>(optimizer.frequencyMax)),
+                1.0e-2
+            });
+        }
+        else {
+            log(LogLevel::Warning,
+                "Remove or shorten a frequency band before adding another.");
         }
     }
-    else {
-        ImGui::SeparatorText("Bandgaps");
-        if (ImGui::Button("+ Add bandgap")) {
-            const float center = 0.5f * (optimizer.frequencyMin + optimizer.frequencyMax);
-            optimizer.bandgaps.push_back({center, 400.0f, -30.0f});
-        }
 
-        int removeIndex = -1;
-        if (ImGui::BeginChild(
-                "##bandgap-strip",
-                ImVec2(0.0f, 175.0f),
-                ImGuiChildFlags_Borders,
-                ImGuiWindowFlags_HorizontalScrollbar)) {
-            for (std::size_t i = 0; i < optimizer.bandgaps.size(); ++i) {
-                ImGui::PushID(static_cast<int>(i));
-                if (ImGui::BeginChild(
-                        "##bandgap-card",
-                        ImVec2(215.0f, 145.0f),
-                        ImGuiChildFlags_Borders)) {
-                    ImGui::TextColored(
-                        ImVec4(0.35f, 0.69f, 1.0f, 1.0f),
-                        "BANDGAP %d",
-                        static_cast<int>(i + 1));
-                    bandgapGroup(&optimizer.bandgaps[i]);
-                    if (ImGui::SmallButton("Remove")) {
-                        removeIndex = static_cast<int>(i);
-                    }
-                }
-                ImGui::EndChild();
-                ImGui::PopID();
-                if (i + 1 < optimizer.bandgaps.size()) {
-                    ImGui::SameLine();
+    int removeIndex = -1;
+    if (ImGui::BeginChild(
+            "##frequency-band-strip",
+            ImVec2(0.0f, 185.0f),
+            ImGuiChildFlags_Borders,
+            ImGuiWindowFlags_HorizontalScrollbar)) {
+        for (std::size_t i = 0; i < optimizer.frequencyBands.size(); ++i) {
+            ImGui::PushID(static_cast<int>(i));
+            if (ImGui::BeginChild(
+                    "##frequency-band-card",
+                    ImVec2(235.0f, 155.0f),
+                    ImGuiChildFlags_Borders)) {
+                ImGui::TextColored(
+                    ImVec4(0.35f, 0.69f, 1.0f, 1.0f),
+                    "BAND %d",
+                    static_cast<int>(i + 1));
+                frequencyBandGroup(&optimizer.frequencyBands[i]);
+                if (ImGui::SmallButton("Remove")) {
+                    removeIndex = static_cast<int>(i);
                 }
             }
+            ImGui::EndChild();
+            ImGui::PopID();
+            if (i + 1 < optimizer.frequencyBands.size()) {
+                ImGui::SameLine();
+            }
         }
-        ImGui::EndChild();
+    }
+    ImGui::EndChild();
 
-        if (removeIndex >= 0) {
-            optimizer.bandgaps.erase(optimizer.bandgaps.begin() + removeIndex);
-        }
+    if (removeIndex >= 0) {
+        optimizer.frequencyBands.erase(
+            optimizer.frequencyBands.begin() + removeIndex);
     }
     ImGui::EndDisabled();
     ImGui::End();
 }
 
-void Renderer::bandgapGroup(Bandgap* bandgap)
+void Renderer::frequencyBandGroup(FrequencyBand* band)
 {
-    if (bandgap == nullptr) {
+    if (band == nullptr) {
         return;
     }
 
-    ImGui::InputFloat("Center (Hz)", &bandgap->center, 10.0f, 100.0f, "%.1f");
-    ImGui::SameLine();
-    ImGui::InputFloat("Bandwidth (Hz)", &bandgap->bandwidth, 10.0f, 100.0f, "%.1f");
-    ImGui::InputFloat("Attenuation (dB)", &bandgap->attenuationDb, 1.0f, 5.0f, "%.1f");
-    bandgap->bandwidth = std::max(bandgap->bandwidth, 0.0f);
+    int type = band->type == FrequencyBandType::pass ? 0 : 1;
+    const char* types[] = {"Pass", "Stop"};
+    if (ImGui::Combo("Type", &type, types, 2)) {
+        band->type = type == 0
+            ? FrequencyBandType::pass
+            : FrequencyBandType::stop;
+    }
+    ImGui::InputDouble("Start (Hz)", &band->startHz, 10.0, 100.0, "%.1f");
+    ImGui::InputDouble("End (Hz)", &band->endHz, 10.0, 100.0, "%.1f");
+    double target_db = 20.0 * std::log10(std::max(
+        band->targetTransmission, 1.0e-12));
+    ImGui::InputDouble("Target (dB)", &target_db, 1.0, 5.0, "%.1f");
+    band->startHz = std::clamp(
+        band->startHz,
+        static_cast<double>(settings.optSettings.frequencyMin),
+        static_cast<double>(settings.optSettings.frequencyMax) - 1.0);
+    band->endHz = std::clamp(
+        band->endHz,
+        band->startHz + 1.0,
+        static_cast<double>(settings.optSettings.frequencyMax));
+    target_db = std::clamp(
+        target_db,
+        static_cast<double>(settings.optSettings.attenuationMinDb),
+        static_cast<double>(settings.optSettings.attenuationMaxDb));
+    band->targetTransmission = std::pow(10.0, target_db / 20.0);
 }
 
 void Renderer::ActionPanel(dispatcher_t& dispatcher)
@@ -839,26 +805,22 @@ void Renderer::ActionPanel(dispatcher_t& dispatcher)
     const std::string progressLabel = std::to_string(completedIterations)
         + " / " + std::to_string(maximumIterations) + " iterations";
     ImGui::ProgressBar(progress, ImVec2(-1.0f, 2.0f), progressLabel.c_str());
+    ImGui::Text("Phi pass  %.6g", dispatcher.get_pass_objective());
+    ImGui::Text("Phi stop  %.6g", dispatcher.get_stop_objective());
+    ImGui::Text("MMA z     %.6g", dispatcher.get_mma_bound());
     ImGui::Spacing();
 
-#if METAMATERIAL_DEMO_MODE
-    const bool backendReady = true;
-#else
-    const bool backendReady = false;
-    ImGui::TextWrapped("The real solver path is still WIP. Demo mode is available for the complete UI shell.");
-    ImGui::Spacing();
-#endif
-
-    const bool canRun = backendReady
-        && dispatcher.get_state() == dispatcher_t::State::Idle;
+    const bool canRun = dispatcher.get_state() == dispatcher_t::State::Idle;
     ImGui::BeginDisabled(!canRun);
-    if (ImGui::Button("Run optimization", ImVec2(-1.0f, 38.0f))) {
+#if METAMATERIAL_DEMO_MODE
+    const char* runLabel = "Run demo optimization";
+#else
+    const char* runLabel = "Run optimization";
+#endif
+    if (ImGui::Button(runLabel, ImVec2(-1.0f, 38.0f))) {
         dispatcher.dispatch(dispatcher_t::Event::Start);
     }
     ImGui::EndDisabled();
-    if (!backendReady && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-        ImGui::SetTooltip("Configure with METAMATERIAL_DEMO_MODE=ON for the interactive demo.");
-    }
 
     ImGui::BeginDisabled();
     ImGui::Button("Pause", ImVec2(-1.0f, 0.0f));
@@ -867,8 +829,8 @@ void Renderer::ActionPanel(dispatcher_t& dispatcher)
         ImGui::SetTooltip("Pause is not implemented yet.");
     }
 
-    const bool canCancel = backendReady
-        && dispatcher.get_state() == dispatcher_t::State::Working;
+    const bool canCancel =
+        dispatcher.get_state() == dispatcher_t::State::Working;
     ImGui::BeginDisabled(!canCancel);
     if (ImGui::Button("Cancel run", ImVec2(-1.0f, 0.0f))) {
         ImGui::OpenPopup("Cancel optimization?");
@@ -878,7 +840,7 @@ void Renderer::ActionPanel(dispatcher_t& dispatcher)
     if (ImGui::BeginPopupModal("Cancel optimization?", nullptr,
                                ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::TextWrapped(
-            "Stop after the current complete iteration and keep its result?");
+            "Request cancellation after the current complete solve or iteration?");
         ImGui::Spacing();
         if (ImGui::Button("Cancel run", ImVec2(120.0f, 0.0f))) {
             dispatcher.dispatch(dispatcher_t::Event::Cancel);
@@ -891,8 +853,7 @@ void Renderer::ActionPanel(dispatcher_t& dispatcher)
         ImGui::EndPopup();
     }
 
-    const bool canExport = backendReady
-        && dispatcher.get_state() == dispatcher_t::State::Idle
+    const bool canExport = dispatcher.get_state() == dispatcher_t::State::Idle
         && dispatcher.is_exportable();
     ImGui::BeginDisabled(!canExport);
     if (ImGui::Button("Export mesh + manifest", ImVec2(-1.0f, 0.0f))) {
@@ -905,8 +866,8 @@ void Renderer::ActionPanel(dispatcher_t& dispatcher)
     ImGui::TextColored(ImVec4(0.35f, 0.69f, 1.0f, 1.0f), "DEMO SOURCE");
     ImGui::TextDisabled("Deterministic data / single background workflow");
 #else
-    ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.28f, 1.0f), "REAL SOURCE / WIP");
-    ImGui::TextDisabled("Serial MFEM backend");
+    ImGui::TextColored(ImVec4(0.31f, 0.86f, 0.61f, 1.0f), "REAL OPTIMIZER");
+    ImGui::TextDisabled("Serial MFEM / ParOpt MMA");
 #endif
     ImGui::End();
 }

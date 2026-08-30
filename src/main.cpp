@@ -1,8 +1,14 @@
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include <exception>
 #include <iostream>
 #include <memory>
 #include <string>
 #include <utility>
+
+#include "mpi.h"
 
 #include "exporter.hpp"
 #include "global_types.hpp"
@@ -13,9 +19,51 @@
 #include "dispatcher.hpp"
 
 // OK so what is left?
-int main(int, char**)
+/*
+    So the dispatcher is done, we have a nice asynchronous dispatcher.
+
+    We need to put the white noise and FFT calculator in the solver
+
+    Then we need to implement the MMA optimizer algorithm
+
+    Then an exporter algorihtm to make the mesh (marching cubes?)
+
+    then a publication path from the FFT of the solver and the renderer
+
+    THen polish the renderer
+
+    Then test
+
+    Then go to sleep
+
+    oh yeah periodic boundary conditions for unit cell design
+
+    also ensure we implement the boundary conditions of the paper for a prelim duct
+
+    ALso the FFT plot should be in dB in the y axis, so we can see the attenuation
+
+
+*/
+int main(int argc, char** argv)
 {
+    int provided_thread_level = 0;
+    if (MPI_Init_thread(
+            &argc, &argv, MPI_THREAD_SERIALIZED, &provided_thread_level)
+            != MPI_SUCCESS) {
+        std::cerr << "Could not initialize MPI for ParOpt.\n";
+        return 1;
+    }
+    if (provided_thread_level < MPI_THREAD_SERIALIZED) {
+        std::cerr << "The MPI runtime does not support the optimizer worker thread.\n";
+        MPI_Finalize();
+        return 1;
+    }
+
+    int exit_code = 0;
     try {
+        mfem::Device device(METAMATERIAL_USE_CUDA ? "cuda" : "cpu");
+        device.Print();
+
         // Construct the top-level data. Everyone below receives references to these.
         // TODO: Make App settings construct defaults
         auto settings = std::make_unique<App::AppSettings>();
@@ -27,11 +75,9 @@ int main(int, char**)
         auto result = std::make_unique<App::SolverResult>();
         auto& solverResult = *result;
 
-        // TODO: This needs an initial guess constructor to construct the first lset guess
-        // Probably an equally spaced square grid of cylinders/circles with some radius each; basically a sonic crystal whose shape we can weakly try to guess from the bandgap. Or just hardocde a single crystal structure. how about that?
+        // The solver attaches the FE space and initializes the paper's cosine design.
         auto lset = std::make_unique<App::LevelSet>();
         auto& geometry = *lset;
-        // TODO: Make the initial design guess the same shape as the paper has
 
         // Keep the renderer alive longer than the objects that will publish to it.
         auto renderer = std::make_unique<App::Renderer>(
@@ -71,9 +117,10 @@ int main(int, char**)
             renderer->displayFrame(*dispatcher);
         }
 
-        return 0;
     } catch (const std::exception& error) {
         std::cerr << "Application startup failed: " << error.what() << '\n';
-        return 1;
+        exit_code = 1;
     }
+    MPI_Finalize();
+    return exit_code;
 }

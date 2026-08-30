@@ -120,14 +120,14 @@ if not exist extern\glvis\.git (
 )
 
 set "GLVIS_PATCH=%~dp0patches\glvis-embedded-window.patch"
-git.exe -C extern\glvis apply --reverse --check "%GLVIS_PATCH%" >nul 2>nul
+git.exe -C extern\glvis apply --reverse --check --ignore-space-change --ignore-whitespace "%GLVIS_PATCH%" >nul 2>nul
 if not errorlevel 1 exit /b 0
 
-git.exe -C extern\glvis apply --check "%GLVIS_PATCH%"
+git.exe -C extern\glvis apply --check --ignore-space-change --ignore-whitespace "%GLVIS_PATCH%"
 if errorlevel 1 (
     echo GLVis host-window patch does not apply to the downloaded revision.
     exit /b 1
 )
 
-git.exe -C extern\glvis apply "%GLVIS_PATCH%"
+git.exe -C extern\glvis apply --ignore-space-change --ignore-whitespace "%GLVIS_PATCH%"
 exit /b %errorlevel%
