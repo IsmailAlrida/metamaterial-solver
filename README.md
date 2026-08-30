@@ -6,7 +6,7 @@ Thenn you also input your desired frequency response of the material
 
 which shows you the output signal as a plot
 
-And you can select whether to run in CUDA or not (checkbox is gated behind auto CUDA support check)
+CUDA acceleration is available in Linux builds. Windows builds use the CPU backends.
 
 And let's say you can also select the medium properties as well,
 
@@ -46,118 +46,100 @@ Constraints: Periodic unit cell, solid geometry must be continous starting from 
 
 ## Notes
 
-Main author has an RTX 5060 GPU and thought it's a shame not to use it. CUDA is certainly an option here so we make use of the hardware as much as possible
+CUDA development targets Linux and WSL2. Native Windows builds intentionally remain CPU-only.
 
 ## Building
 
-On a fresh Windows 11 machine, run the setup wrapper once from the repository
-root. It installs the Visual Studio C++ tools, Git, CMake, Ninja, the Microsoft
-MPI runtime and SDK, and Intel oneMKL through their normal Windows installers:
+| Platform | `serial` | `parallel-cpu` | `serial-cuda` | `parallel-cpu-cuda` |
+|---|---:|---:|---:|---:|
+| Windows 11 | Yes | Yes | No | No |
+| Linux / WSL2 | Yes | Yes | Yes | Yes |
+
+CUDA support is Linux-only for now. Native Windows builds intentionally reject
+CUDA backends instead of applying local patches to MFEM.
+
+`parallel-cpu` currently means MFEM/OpenMP inside one process. MPI is used by
+ParOpt with `MPI_COMM_SELF`; a distributed `ParMesh`/HYPRE solver is not yet
+implemented.
+
+### Windows 11: CPU builds
+
+From the repository root, install the native prerequisites and then open a new
+terminal:
 
 ```bat
 setup.bat
-```
-
-Open a new terminal afterward and verify the native prerequisites:
-
-```bat
 setup.bat check
 ```
 
-The setup script does not install CUDA because its version must match the GPU
-driver. CUDA builds require the [NVIDIA CUDA Toolkit](https://developer.nvidia.com/cuda-downloads)
-and `nvcc.exe` on `PATH`. The native packages come from the official
-[Microsoft MPI 10.1.3](https://www.microsoft.com/en-us/download/details.aspx?id=105289)
-and [Intel oneMKL](https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl-download.html)
-distributions.
+The setup wrapper installs or verifies Visual Studio C++ tools, Git, CMake,
+Ninja, [Microsoft MPI](https://www.microsoft.com/en-us/download/details.aspx?id=105289),
+and [Intel oneMKL](https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl-download.html).
 
-`build.bat` remains a thin wrapper around the Ninja CMake presets and activates
-the installed x64 Visual C++ environment when the current terminal has not:
-
-```bat
-build.bat
-```
-
-That defaults to the serial MFEM backend and writes build files to:
-
-```text
-build/serial
-```
-
-Select a different MFEM backend by passing one argument:
+Build an optimized Release configuration:
 
 ```bat
 build.bat serial
-build.bat serial-cuda
 build.bat parallel-cpu
-build.bat parallel-cpu-cuda
 ```
 
-CUDA presets target the GPU detected during configuration. Pass CMake's CUDA
-architecture as the optional second argument when targeting another GPU:
+Debug is opt-in and uses a separate build directory:
 
 ```bat
-build.bat serial-cuda 120
-build.bat deps parallel-cpu-cuda 120
+build.bat serial debug
+build.bat parallel-cpu debug
 ```
 
-For example: `86` targets Ampere, `89` targets Ada, and `120` targets Blackwell.
-
-Each backend gets its own build directory:
-
-```text
-build/serial
-build/serial-cuda
-build/parallel-cpu
-build/parallel-cpu-cuda
-```
-
-Dependency source checkouts are shared and hackable under:
-
-```text
-build/deps/src
-```
-
-Examples:
-
-```text
-build/deps/src/fftw3-src
-build/deps/src/mfem-src
-build/deps/src/imgui-src
-```
-
-Configure dependencies only:
+Configure dependencies and write `compile_commands.json` for the LSP without
+building the application:
 
 ```bat
 build.bat deps serial
-build.bat deps serial-cuda
 build.bat deps parallel-cpu
-build.bat deps parallel-cpu-cuda
 ```
 
-This configures the selected build and writes `compile_commands.json` for the
-LSP without building the application. CMake fetches and prepares NLopt,
-ParOpt, METIS, MFEM, and the remaining source dependencies under `build/deps`.
+### Linux / WSL2
 
-Valid `METAMATERIAL_MFEM_BACKEND` values are:
+Install the ordinary C++/OpenGL/MPI prerequisites. Package names below target
+Ubuntu:
 
-```text
-serial
-serial-cuda
-parallel-cpu
-parallel-cpu-cuda
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake ninja-build git curl pkg-config \
+  gfortran openmpi-bin libopenmpi-dev libopenblas-dev liblapack-dev \
+  libgl1-mesa-dev libx11-dev libxext-dev libxrandr-dev \
+  libxinerama-dev libxcursor-dev libxi-dev mesa-utils
+chmod +x build.sh
 ```
 
-Backend meaning:
+CPU builds:
 
-```text
-serial              CPU, one host thread
-serial-cuda         CPU host flow plus CUDA device backend
-parallel-cpu        OpenMP CPU backend
-parallel-cpu-cuda   OpenMP CPU backend plus CUDA device backend
+```bash
+./build.sh serial
+./build.sh parallel-cpu
+./build.sh serial debug
+./build.sh deps serial
 ```
 
-`parallel-cpu` currently means MFEM/OpenMP inside one process. MS-MPI is used by
-ParOpt (with `MPI_COMM_SELF`) and leaves the machine ready for a later true
-distributed MFEM `ParMesh`/HYPRE backend; the current solver does not pretend to
-be distributed merely because MPI is installed.
+CUDA builds additionally require a working Linux CUDA toolkit with `nvcc` on
+`PATH` and a compatible NVIDIA driver:
+
+```bash
+./build.sh serial-cuda
+./build.sh parallel-cpu-cuda
+```
+
+An optional CUDA architecture can be supplied after the backend; Blackwell is
+`120`:
+
+```bash
+./build.sh serial-cuda 120
+```
+
+For WSL2, install the Windows NVIDIA driver and follow NVIDIA's
+[CUDA on WSL guide](https://docs.nvidia.com/cuda/wsl-user-guide/index.html);
+do not install a separate Linux display driver inside WSL.
+
+Windows build directories live under `build/<backend>`. Linux and WSL2 build
+directories live under `build/linux/<backend>`, with Linux dependency sources
+under `build/linux/deps/src`.

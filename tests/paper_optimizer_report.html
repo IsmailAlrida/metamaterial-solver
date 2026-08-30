@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Paper Optimizer Report</title>
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <script>window.MathJax = { tex: { inlineMath: [['\\(', '\\)'], ['$', '$']] } };</script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
   <style>
     :root {
       color-scheme: dark;
@@ -34,6 +36,7 @@
     .paper-figure { width: 100%; min-height: 0; flex: 1; object-fit: contain; padding: 18px; background: #fff; margin-top: 12px; }
     a { color: #77b7ff; }
     .plot { width: 100%; height: 430px; }
+    .equation { min-height: 76px; padding: 0 18px 18px; overflow-x: auto; color: #dbe8ff; }
     .table-wrap { overflow-x: auto; border: 1px solid #243f61; border-radius: 12px; background: rgba(10, 24, 42, .92); }
     table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
     th, td { padding: 13px 16px; border-bottom: 1px solid #243f61; text-align: right; white-space: nowrap; }
@@ -73,6 +76,16 @@
     </section>
     <p class="panel-note">Reference: Dilgen &amp; Aage, <a href="../docs/golden-paper.pdf#page=13">Fig. 6(a,d), page 13</a>. The paper does not publish raw geometry/spectrum arrays or wall-clock runtime, so visual comparison and the reported final objective values are the honest available reference.</p>
 
+    <h2>Derived response analysis</h2>
+    <section class="grid">
+      <div class="panel"><div id="transmission-loss" class="plot"></div></div>
+      <div class="panel">
+        <div id="transfer-fit" class="plot"></div>
+        <div id="transfer-equation" class="equation">Transfer-function fit unavailable.</div>
+      </div>
+    </section>
+    <p class="panel-note">Transmission loss is \(TL(f)=-20\log_{10}|H(f)|\) dB. Broadband mean TL is the arithmetic mean across valid FFT bins from the first configured band edge to the last.</p>
+
     <h2>Numerical comparison</h2>
     <div class="table-wrap">
       <table>
@@ -107,6 +120,38 @@
       legend: { orientation: 'h', y: 1.12 }
     });
     const config = { responsive: true, displaylogo: false };
+    const mean = values => values.length
+      ? values.reduce((sum, value) => sum + value, 0) / values.length
+      : NaN;
+
+    function analyzeResponse(data) {
+      const bands = [...data.bands].sort((a, b) => a.end_hz - b.end_hz);
+      const frequencies = data.frequency_response.map(point => point.frequency_hz);
+      const minimum = bands.length ? Math.min(...bands.map(band => band.start_hz))
+        : frequencies.length ? Math.min(...frequencies) : 0;
+      const maximum = bands.length ? Math.max(...bands.map(band => band.end_hz))
+        : frequencies.length ? Math.max(...frequencies) : 1;
+      const valid = data.frequency_response
+        .filter(point => point.valid && point.transmission > 0
+          && point.frequency_hz >= minimum && point.frequency_hz <= maximum)
+        .map(point => ({
+          ...point,
+          transmissionDb: 20 * Math.log10(point.transmission),
+          transmissionLossDb: -20 * Math.log10(point.transmission),
+          band: bands.find(band => point.frequency_hz >= band.start_hz
+            && point.frequency_hz <= band.end_hz)
+        }));
+      const stop = valid.filter(point => point.band?.type === 'stop');
+      return {
+        bands,
+        valid,
+        stop,
+        minimum,
+        maximum,
+        broadbandMeanLossDb: mean(valid.map(point => point.transmissionLossDb)),
+        stopMeanLossDb: mean(stop.map(point => point.transmissionLossDb))
+      };
+    }
 
     function addCard(label, value, className = '') {
       const card = document.createElement('div');
@@ -146,7 +191,7 @@
       ], geometryLayout, config);
     }
 
-    function renderResponse(data) {
+    function renderResponse(data, analysis) {
       const valid = data.frequency_response.filter(point => point.valid && point.transmission > 0);
       const traces = [{
         x: valid.map(point => point.frequency_hz),
@@ -166,12 +211,10 @@
       }
       const responseLayout = layout('Implementation transmission');
       responseLayout.xaxis.title = 'Frequency [Hz]';
-      responseLayout.xaxis.range = [
-        Math.min(...data.bands.map(band => band.start_hz)),
-        Math.max(...data.bands.map(band => band.end_hz))
-      ];
+      responseLayout.xaxis.range = [analysis.minimum, analysis.maximum];
       responseLayout.yaxis = {
-        title: 'S(f)', type: 'log', range: [-5, 0.3], gridcolor: colors.grid
+        title: 'Transmission magnitude |H(f)| [dimensionless]',
+        type: 'log', range: [-5, 0.3], gridcolor: colors.grid
       };
       if (valid.length === 0) {
         responseLayout.annotations = [{
@@ -181,6 +224,104 @@
         }];
       }
       Plotly.newPlot('response', traces, responseLayout, config);
+    }
+
+    function renderTransmissionLoss(data, analysis) {
+      const traces = [{
+        x: analysis.valid.map(point => point.frequency_hz),
+        y: analysis.valid.map(point => point.transmissionLossDb),
+        name: 'Broadband transmission loss',
+        mode: 'lines',
+        line: { color: '#77b7ff', width: 2 }
+      }];
+      for (const band of analysis.bands.filter(band => band.type === 'stop')) {
+        const points = analysis.stop.filter(point => point.band === band);
+        traces.push({
+          x: points.map(point => point.frequency_hz),
+          y: points.map(point => point.transmissionLossDb),
+          name: `Stopband ${band.start_hz}-${band.end_hz} Hz`,
+          mode: 'lines',
+          line: { color: '#ff8b78', width: 3 }
+        });
+        const targetLoss = -20 * Math.log10(band.target_transmission);
+        traces.push({
+          x: [band.start_hz, band.end_hz],
+          y: [targetLoss, targetLoss],
+          name: `Stop target (${targetLoss.toFixed(1)} dB)`,
+          mode: 'lines',
+          line: { color: '#f7c66b', width: 3, dash: 'dash' }
+        });
+      }
+      const lossLayout = layout('Transmission loss and stopband attenuation');
+      lossLayout.xaxis.title = 'Frequency [Hz]';
+      lossLayout.xaxis.range = [analysis.minimum, analysis.maximum];
+      lossLayout.yaxis.title = 'Transmission loss TL(f) [dB]';
+      if (analysis.valid.length === 0) {
+        lossLayout.annotations = [{
+          text: 'No valid FFT bins are available.', x: 0.5, y: 0.5,
+          xref: 'paper', yref: 'paper', showarrow: false,
+          font: { color: '#ff748c', size: 15 }
+        }];
+      }
+      Plotly.newPlot('transmission-loss', traces, lossLayout, config);
+    }
+
+    function texNumber(value) {
+      const [mantissa, exponent] = Math.abs(value).toExponential(3).split('e');
+      return `${mantissa}\\times10^{${Number(exponent)}}`;
+    }
+
+    function texPolynomial(coefficients) {
+      const terms = [];
+      coefficients.forEach((value, power) => {
+        if (!Number.isFinite(value) || Math.abs(value) < 1e-14) return;
+        const sign = value < 0 ? '-' : terms.length ? '+' : '';
+        const variable = power === 0 ? '' : power === 1 ? 'q' : `q^{${power}}`;
+        terms.push(`${sign} ${texNumber(value)}${variable}`);
+      });
+      return terms.join(' ') || '0';
+    }
+
+    function renderTransferFit(data, analysis) {
+      const fit = data.transfer_function_fit;
+      const traces = [{
+        x: analysis.valid.map(point => point.frequency_hz),
+        y: analysis.valid.map(point => point.transmissionDb),
+        name: 'MFEM FFT response',
+        mode: 'lines',
+        line: { color: '#77b7ff', width: 2 }
+      }];
+      if (fit) {
+        traces.push({
+          x: fit.samples.map(point => point.frequency_hz),
+          y: fit.samples.map(point => point.transmission_db),
+          name: `Order-${fit.order} fitted H(s)`,
+          mode: 'lines',
+          line: { color: '#f7c66b', width: 3, dash: 'dash' }
+        });
+      }
+      const fitLayout = layout('Numerically fitted transfer function');
+      fitLayout.xaxis.title = 'Frequency [Hz]';
+      fitLayout.xaxis.range = [analysis.minimum, analysis.maximum];
+      fitLayout.yaxis.title = 'Transmission magnitude [dB re. empty duct]';
+      if (!fit) {
+        fitLayout.annotations = [{
+          text: 'Run the updated miniapp to generate transfer-function data.',
+          x: 0.5, y: 0.5, xref: 'paper', yref: 'paper', showarrow: false,
+          font: { color: '#ff748c', size: 14 }
+        }];
+      }
+      Plotly.newPlot('transfer-fit', traces, fitLayout, config);
+
+      const equation = document.getElementById('transfer-equation');
+      if (!fit) {
+        equation.textContent = 'Transfer-function fit unavailable.';
+        return;
+      }
+      equation.textContent = `\\[H(s)\\approx\\frac{${texPolynomial(fit.numerator)}}{${texPolynomial(fit.denominator)}},\\qquad q=\\frac{s}{2\\pi(${fit.frequency_scale_hz.toFixed(1)}\\,\\mathrm{Hz})}\\]`;
+      const typeset = () => window.MathJax?.typesetPromise?.([equation]);
+      if (document.readyState === 'complete') typeset();
+      else window.addEventListener('load', typeset, { once: true });
     }
 
     function appendCells(row, values) {
@@ -207,11 +348,12 @@
       document.getElementById('numerical-comparison').append(row);
     }
 
-    function renderNumericalComparison(data) {
+    function renderNumericalComparison(data, analysis) {
       const body = document.getElementById('numerical-comparison');
       body.replaceChildren();
       const reference = data.paper_reference;
       const integer = value => String(Math.round(value));
+      const fixed = value => value.toFixed(3);
       comparisonRow('Mesh elements nx', reference.settings.nx, data.settings.nx, integer);
       comparisonRow('Mesh elements ny', reference.settings.ny, data.settings.ny, integer);
       comparisonRow('Duration [s]', reference.settings.duration_s, data.settings.duration_s);
@@ -225,6 +367,12 @@
       comparisonRow('Final worst objective',
         Math.max(reference.objectives.final_pass, reference.objectives.final_stop),
         data.objectives.final_worst);
+      comparisonRow('Mean stopband transmission loss [dB]', NaN,
+        analysis.stopMeanLossDb, fixed);
+      comparisonRow('Mean broadband transmission loss [dB]', NaN,
+        analysis.broadbandMeanLossDb, fixed);
+      comparisonRow('Transfer-function fit RMSE [dB]', NaN,
+        data.transfer_function_fit?.rmse_db, fixed);
     }
 
     function renderExecutionTime(data) {
@@ -244,6 +392,7 @@
 
     function render(data) {
       document.getElementById('cards').replaceChildren();
+      const analysis = analyzeResponse(data);
       const paper = data.paper_reference.objectives;
       const improved = data.objectives.initial_worst / data.objectives.final_worst;
       const referenceSettings = data.paper_reference.settings;
@@ -264,9 +413,17 @@
       addCard('Improvement', Number.isFinite(improved) ? `${improved.toFixed(3)}×` : 'n/a');
       addCard('Objective distance', paperMode && Number.isFinite(relativeObjectiveDistance)
         ? `${relativeObjectiveDistance.toFixed(2)}%` : 'paper mode only');
+      addCard('Mean stopband TL', Number.isFinite(analysis.stopMeanLossDb)
+        ? `${analysis.stopMeanLossDb.toFixed(2)} dB` : 'n/a');
+      addCard('Broadband mean TL', Number.isFinite(analysis.broadbandMeanLossDb)
+        ? `${analysis.broadbandMeanLossDb.toFixed(2)} dB` : 'n/a');
+      addCard('Transfer fit RMSE', Number.isFinite(data.transfer_function_fit?.rmse_db)
+        ? `${data.transfer_function_fit.rmse_db.toFixed(2)} dB` : 'n/a');
       renderGeometry(data);
-      renderResponse(data);
-      renderNumericalComparison(data);
+      renderResponse(data, analysis);
+      renderTransmissionLoss(data, analysis);
+      renderTransferFit(data, analysis);
+      renderNumericalComparison(data, analysis);
       renderExecutionTime(data);
       status.textContent = data.failure_message
         ? `${data.optimizer_status}: ${data.failure_message}`

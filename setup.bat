@@ -153,13 +153,6 @@ call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\include\mkl.h" "In
 call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\lib\mkl_core.lib" "Intel oneMKL libraries"
 call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\bin\mkl_sequential.3.dll" "Intel oneMKL runtime"
 
-where nvcc.exe >nul 2>nul
-if errorlevel 1 (
-    echo [optional] CUDA Toolkit not found; CPU backends are ready.
-) else (
-    for /f "delims=" %%I in ('where nvcc.exe') do echo [ok] CUDA Toolkit: %%I
-)
-
 if not "!MISSING!"=="0" (
     echo.
     echo !MISSING! required prerequisite^(s^) missing. Run setup.bat to install them.

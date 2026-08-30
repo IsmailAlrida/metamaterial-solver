@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <complex>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -13,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include <Eigen/Dense>
 #include "mpi.h"
 
 #include "optimizer.hpp"
@@ -26,6 +28,131 @@ struct ObjectivePoint {
     double stop;
     double elapsedSeconds;
 };
+
+struct TransferFunctionFit {
+    int order = 0;
+    double frequencyScaleHz = 0.0;
+    double rmseDb = std::numeric_limits<double>::quiet_NaN();
+    std::vector<double> numerator;
+    std::vector<double> denominator;
+    std::vector<double> frequency;
+    std::vector<double> transmissionDb;
+};
+
+TransferFunctionFit fit_transfer_function(
+    const App::FrequencyResponse& response,
+    const std::vector<App::FrequencyBand>& bands)
+{
+    TransferFunctionFit fit;
+    if (bands.empty()) {
+        return fit;
+    }
+
+    double minimum_frequency = bands.front().startHz;
+    double maximum_frequency = bands.front().endHz;
+    for (const App::FrequencyBand& band : bands) {
+        minimum_frequency = std::min(minimum_frequency, band.startHz);
+        maximum_frequency = std::max(maximum_frequency, band.endHz);
+    }
+
+    std::vector<std::size_t> samples;
+    for (std::size_t bin = 0; bin < response.frequency.size(); ++bin) {
+        if (bin < response.valid.size()
+            && bin < response.outlet.size()
+            && bin < response.reference.size()
+            && response.valid[bin]
+            && response.frequency[bin] >= minimum_frequency
+            && response.frequency[bin] <= maximum_frequency
+            && std::abs(response.reference[bin]) > 0.0) {
+            samples.push_back(bin);
+        }
+    }
+    if (samples.size() < 3 || maximum_frequency <= 0.0) {
+        return fit;
+    }
+
+    fit.order = std::min(4, static_cast<int>((samples.size() - 1) / 2));
+    fit.frequencyScaleHz = maximum_frequency;
+    const int unknowns = 2 * fit.order + 1;
+    Eigen::MatrixXd matrix(2 * samples.size(), unknowns);
+    Eigen::VectorXd right_hand_side(2 * samples.size());
+
+    for (std::size_t sample = 0; sample < samples.size(); ++sample) {
+        const std::size_t bin = samples[sample];
+        const std::complex<double> transfer =
+            response.outlet[bin] / response.reference[bin];
+        const std::complex<double> q(
+            0.0, response.frequency[bin] / fit.frequencyScaleHz);
+        std::vector<std::complex<double>> powers(fit.order + 1, 1.0);
+        for (int power = 1; power <= fit.order; ++power) {
+            powers[power] = powers[power - 1] * q;
+        }
+
+        for (int power = 0; power <= fit.order; ++power) {
+            matrix(2 * sample, power) = powers[power].real();
+            matrix(2 * sample + 1, power) = powers[power].imag();
+        }
+        for (int power = 1; power <= fit.order; ++power) {
+            const std::complex<double> coefficient = -transfer * powers[power];
+            const int column = fit.order + power;
+            matrix(2 * sample, column) = coefficient.real();
+            matrix(2 * sample + 1, column) = coefficient.imag();
+        }
+        right_hand_side[2 * sample] = transfer.real();
+        right_hand_side[2 * sample + 1] = transfer.imag();
+    }
+
+    Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qr(matrix);
+    const Eigen::VectorXd coefficients = qr.solve(right_hand_side);
+    if (qr.rank() < unknowns || !coefficients.allFinite()) {
+        return {};
+    }
+
+    fit.numerator.resize(fit.order + 1);
+    fit.denominator.resize(fit.order + 1, 1.0);
+    for (int power = 0; power <= fit.order; ++power) {
+        fit.numerator[power] = coefficients[power];
+    }
+    for (int power = 1; power <= fit.order; ++power) {
+        fit.denominator[power] = coefficients[fit.order + power];
+    }
+
+    auto evaluate = [](const std::vector<double>& polynomial,
+                       std::complex<double> q) {
+        std::complex<double> value = 0.0;
+        for (auto coefficient = polynomial.rbegin();
+             coefficient != polynomial.rend(); ++coefficient) {
+            value = value * q + *coefficient;
+        }
+        return value;
+    };
+
+    double squared_error = 0.0;
+    for (std::size_t bin : samples) {
+        const std::complex<double> q(
+            0.0, response.frequency[bin] / fit.frequencyScaleHz);
+        const std::complex<double> denominator = evaluate(fit.denominator, q);
+        if (std::abs(denominator) < 1.0e-12) {
+            return {};
+        }
+        const std::complex<double> fitted = evaluate(fit.numerator, q) / denominator;
+        const double measured_db = 20.0 * std::log10(std::max(
+            std::abs(response.outlet[bin] / response.reference[bin]), 1.0e-12));
+        const double fitted_db =
+            20.0 * std::log10(std::max(std::abs(fitted), 1.0e-12));
+        if (!std::isfinite(measured_db) || !std::isfinite(fitted_db)) {
+            return {};
+        }
+        squared_error += (fitted_db - measured_db) * (fitted_db - measured_db);
+        fit.frequency.push_back(response.frequency[bin]);
+        fit.transmissionDb.push_back(fitted_db);
+    }
+    fit.rmseDb = std::sqrt(squared_error / samples.size());
+    if (!std::isfinite(fit.rmseDb)) {
+        return {};
+    }
+    return fit;
+}
 
 const char* status_name(App::OptimizerStatus status)
 {
@@ -81,6 +208,11 @@ bool write_report_data(
     output << std::setprecision(17);
 
     const App::FrequencyResponse& response = solver.frequencyResponse();
+    const TransferFunctionFit transfer_fit = fit_transfer_function(
+        response, optimizer_settings.frequencyBands);
+    const App::SolverPerformance& solver_performance = solver.performance();
+    const App::OptimizerPerformance& optimizer_performance =
+        optimizer.performance();
     const double initial_worst = history.empty()
         ? std::numeric_limits<double>::quiet_NaN()
         : std::max(history.front().pass, history.front().stop);
@@ -98,9 +230,14 @@ bool write_report_data(
         ? std::numeric_limits<double>::quiet_NaN()
         : (history.back().elapsedSeconds - history.front().elapsedSeconds)
             / std::max(1, history.back().iteration);
+    const int report_time_steps = solver_settings.duration > 0.0
+            && solver_settings.dt > 0.0
+        ? std::max(1, static_cast<int>(std::llround(
+            solver_settings.duration / solver_settings.dt)))
+        : 1;
 
     output << "{\n"
-           << "  \"schema_version\": 3,\n"
+           << "  \"schema_version\": 5,\n"
            << "  \"mode\": \"" << mode << "\",\n"
            << "  \"gate_passed\": " << (gate_passed ? "true" : "false") << ",\n"
            << "  \"optimizer_status\": \""
@@ -125,7 +262,71 @@ bool write_report_data(
     write_number(output, initial_forward_pair_seconds);
     output << ",\n    \"average_iteration_seconds\": ";
     write_number(output, average_iteration_seconds);
-    output << ",\n    \"paper_wall_seconds\": null,\n"
+    output << ",\n    \"solver_phases\": {\n"
+           << "      \"mesh_setup_seconds\": "
+           << solver_performance.meshSetupSeconds << ",\n"
+           << "      \"level_set_smoothing_seconds\": "
+           << solver_performance.levelSetSmoothingSeconds << ",\n"
+           << "      \"assembly_seconds\": "
+           << solver_performance.assemblySeconds << ",\n"
+           << "      \"reference_transient_seconds\": "
+           << solver_performance.referenceTransientSeconds << ",\n"
+           << "      \"designed_transient_seconds\": "
+           << solver_performance.designedTransientSeconds << ",\n"
+           << "      \"designed_time_step_seconds\": "
+           << solver_performance.designedTransientSeconds
+                / report_time_steps
+           << ",\n"
+           << "      \"fourier_seconds\": "
+           << solver_performance.fourierSeconds << ",\n"
+           << "      \"pass_adjoint_seconds\": "
+           << solver_performance.passAdjointSeconds << ",\n"
+           << "      \"stop_adjoint_seconds\": "
+           << solver_performance.stopAdjointSeconds << ",\n"
+           << "      \"cut_differentiation_seconds\": "
+           << solver_performance.cutDifferentiationSeconds << ",\n"
+           << "      \"filter_adjoint_seconds\": "
+           << solver_performance.filterAdjointSeconds << ",\n"
+           << "      \"forward_fgmres_solves\": "
+           << solver_performance.forwardFgmresSolves << ",\n"
+           << "      \"forward_fgmres_iterations\": "
+           << solver_performance.forwardFgmresIterations << ",\n"
+           << "      \"average_forward_fgmres_iterations\": "
+           << static_cast<double>(solver_performance.forwardFgmresIterations)
+                / std::max(1, solver_performance.forwardFgmresSolves)
+           << ",\n"
+           << "      \"maximum_forward_fgmres_iterations\": "
+           << solver_performance.maximumForwardFgmresIterations << ",\n"
+           << "      \"adjoint_fgmres_solves\": "
+           << solver_performance.adjointFgmresSolves << ",\n"
+           << "      \"adjoint_fgmres_iterations\": "
+           << solver_performance.adjointFgmresIterations << ",\n"
+           << "      \"average_adjoint_fgmres_iterations\": "
+           << static_cast<double>(solver_performance.adjointFgmresIterations)
+                / std::max(1, solver_performance.adjointFgmresSolves)
+           << ",\n"
+           << "      \"maximum_adjoint_fgmres_iterations\": "
+           << solver_performance.maximumAdjointFgmresIterations << ",\n"
+           << "      \"cut_elements\": "
+           << solver_performance.cutElements << ",\n"
+           << "      \"differentiated_local_dofs\": "
+           << solver_performance.differentiatedDofs << "\n"
+           << "    },\n"
+           << "    \"optimizer_phases\": {\n"
+           << "      \"paropt_seconds\": "
+           << optimizer_performance.paroptSeconds << ",\n"
+           << "      \"forward_callback_seconds\": "
+           << optimizer_performance.forwardCallbackSeconds << ",\n"
+           << "      \"gradient_callback_seconds\": "
+           << optimizer_performance.gradientCallbackSeconds << ",\n"
+           << "      \"paropt_bookkeeping_seconds\": "
+           << std::max(0.0,
+                optimizer_performance.paroptSeconds
+                    - optimizer_performance.forwardCallbackSeconds
+                    - optimizer_performance.gradientCallbackSeconds)
+           << "\n"
+           << "    },\n"
+           << "    \"paper_wall_seconds\": null,\n"
            << "    \"paper_runtime_note\": \"Not reported in the paper.\"\n"
            << "  },\n"
            << "  \"paper_reference\": {\n"
@@ -192,12 +393,49 @@ bool write_report_data(
         output << "    {\"frequency_hz\": " << response.frequency[bin]
                << ", \"valid\": " << (valid ? "true" : "false")
                << ", \"transmission\": ";
+        const std::complex<double> transfer = valid
+            ? response.outlet[bin] / response.reference[bin]
+            : std::complex<double>(
+                std::numeric_limits<double>::quiet_NaN(), 0.0);
+        write_number(output, std::abs(transfer));
+        output << ", \"phase_rad\": ";
         write_number(output, valid
-            ? std::abs(response.outlet[bin]) / std::abs(response.reference[bin])
+            ? std::arg(transfer)
             : std::numeric_limits<double>::quiet_NaN());
         output << "}" << (bin + 1 == response.frequency.size() ? "\n" : ",\n");
     }
     output << "  ],\n";
+
+    output << "  \"transfer_function_fit\": ";
+    if (transfer_fit.order == 0) {
+        output << "null,\n";
+    }
+    else {
+        output << "{\n"
+               << "    \"model\": \"continuous rational frequency-domain least squares\",\n"
+               << "    \"order\": " << transfer_fit.order << ",\n"
+               << "    \"frequency_scale_hz\": "
+               << transfer_fit.frequencyScaleHz << ",\n"
+               << "    \"rmse_db\": " << transfer_fit.rmseDb << ",\n"
+               << "    \"numerator\": [";
+        for (std::size_t i = 0; i < transfer_fit.numerator.size(); ++i) {
+            output << transfer_fit.numerator[i]
+                   << (i + 1 == transfer_fit.numerator.size() ? "" : ", ");
+        }
+        output << "],\n    \"denominator\": [";
+        for (std::size_t i = 0; i < transfer_fit.denominator.size(); ++i) {
+            output << transfer_fit.denominator[i]
+                   << (i + 1 == transfer_fit.denominator.size() ? "" : ", ");
+        }
+        output << "],\n    \"samples\": [\n";
+        for (std::size_t i = 0; i < transfer_fit.frequency.size(); ++i) {
+            output << "      {\"frequency_hz\": " << transfer_fit.frequency[i]
+                   << ", \"transmission_db\": "
+                   << transfer_fit.transmissionDb[i] << "}"
+                   << (i + 1 == transfer_fit.frequency.size() ? "\n" : ",\n");
+        }
+        output << "    ]\n  },\n";
+    }
 
     std::vector<unsigned char> active(fes.GetTrueVSize(), 0);
     for (int i = 0; i < geometry.activeDesignDofs.Size(); ++i) {
@@ -254,6 +492,9 @@ int main(int argc, char** argv)
 
     int exit_code = 0;
     {
+        mfem::Device device(METAMATERIAL_USE_CUDA ? "cuda" : "cpu");
+        device.Print();
+
         App::SolverSettings solver_settings;
         App::OptimizerSettings optimizer_settings;
         if (!paper_mode) {

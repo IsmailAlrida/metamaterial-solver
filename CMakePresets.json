@@ -6,7 +6,7 @@
       "hidden": true,
       "generator": "Ninja",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_EXPORT_COMPILE_COMMANDS": true,
         "CMAKE_POLICY_VERSION_MINIMUM": "3.5",
         "METAMATERIAL_DEMO_MODE": false
@@ -21,15 +21,6 @@
       }
     },
     {
-      "name": "serial-cuda",
-      "inherits": "base",
-      "binaryDir": "${sourceDir}/build/serial-cuda",
-      "cacheVariables": {
-        "CMAKE_CUDA_ARCHITECTURES": "native",
-        "METAMATERIAL_MFEM_BACKEND": "serial-cuda"
-      }
-    },
-    {
       "name": "parallel-cpu",
       "inherits": "base",
       "binaryDir": "${sourceDir}/build/parallel-cpu",
@@ -38,12 +29,19 @@
       }
     },
     {
-      "name": "parallel-cpu-cuda",
-      "inherits": "base",
-      "binaryDir": "${sourceDir}/build/parallel-cpu-cuda",
+      "name": "serial-debug",
+      "inherits": "serial",
+      "binaryDir": "${sourceDir}/build/serial-debug",
       "cacheVariables": {
-        "CMAKE_CUDA_ARCHITECTURES": "native",
-        "METAMATERIAL_MFEM_BACKEND": "parallel-cpu-cuda"
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "parallel-cpu-debug",
+      "inherits": "parallel-cpu",
+      "binaryDir": "${sourceDir}/build/parallel-cpu-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
       }
     },
     {
@@ -51,37 +49,37 @@
       "inherits": "serial"
     },
     {
-      "name": "deps-serial-cuda",
-      "inherits": "serial-cuda"
-    },
-    {
       "name": "deps-parallel-cpu",
       "inherits": "parallel-cpu"
     },
     {
-      "name": "deps-parallel-cpu-cuda",
-      "inherits": "parallel-cpu-cuda"
+      "name": "deps-serial-debug",
+      "inherits": "serial-debug"
+    },
+    {
+      "name": "deps-parallel-cpu-debug",
+      "inherits": "parallel-cpu-debug"
     }
   ],
   "buildPresets": [
     {
       "name": "serial",
       "configurePreset": "serial",
-      "configuration": "Debug"
-    },
-    {
-      "name": "serial-cuda",
-      "configurePreset": "serial-cuda",
-      "configuration": "Debug"
+      "configuration": "Release"
     },
     {
       "name": "parallel-cpu",
       "configurePreset": "parallel-cpu",
+      "configuration": "Release"
+    },
+    {
+      "name": "serial-debug",
+      "configurePreset": "serial-debug",
       "configuration": "Debug"
     },
     {
-      "name": "parallel-cpu-cuda",
-      "configurePreset": "parallel-cpu-cuda",
+      "name": "parallel-cpu-debug",
+      "configurePreset": "parallel-cpu-debug",
       "configuration": "Debug"
     }
   ]

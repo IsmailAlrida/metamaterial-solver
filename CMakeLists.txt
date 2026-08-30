@@ -13,12 +13,17 @@ endif()
 
 project(metamaterial_solver LANGUAGES C CXX)
 
+if(WIN32 AND METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
+  message(FATAL_ERROR
+      "CUDA backends are supported on Linux only. Use serial or parallel-cpu on Windows.")
+endif()
+
 if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
   enable_language(CUDA)
 endif()
 
 if(NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE Debug CACHE STRING "" FORCE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
 # Set standard for compiler components
@@ -312,7 +317,7 @@ if(METAMATERIAL_MFEM_BACKEND MATCHES "parallel-cpu")
 else()
   set(MFEM_USE_OPENMP OFF CACHE BOOL "" FORCE)
 endif()
-# TODO: Add MPI/HPC builds later with hypre/METIS. Keep normal local builds to serial/OpenMP/CUDA.
+# TODO: Add MPI/HPC builds later with hypre/METIS. Keep normal local builds to serial/OpenMP and Linux CUDA.
 set(MFEM_ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(MFEM_ENABLE_MINIAPPS OFF CACHE BOOL "" FORCE)
 set(MFEM_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
@@ -328,6 +333,9 @@ FetchContent_Declare(
 set(CMAKE_SKIP_INSTALL_RULES ON)
 FetchContent_MakeAvailable(mfem)
 set(CMAKE_SKIP_INSTALL_RULES OFF)
+if(METAMATERIAL_MFEM_BACKEND MATCHES "parallel-cpu")
+  find_package(OpenMP REQUIRED)
+endif()
 find_package(OpenGL REQUIRED)
 
 # GLVis is a library internally, but its standalone build expects system copies
@@ -369,9 +377,10 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(freetype)
 
-set(GLVIS_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/extern/glvis")
+set(GLVIS_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/extern/glvis"
+    CACHE PATH "GLVis source directory")
 if(NOT EXISTS "${GLVIS_SOURCE_DIR}/lib/window.cpp")
-  message(FATAL_ERROR "GLVis source is missing. Run build.bat deps ${METAMATERIAL_MFEM_BACKEND} first.")
+  message(FATAL_ERROR "GLVis source is missing. Run build.bat deps or ./build.sh deps for ${METAMATERIAL_MFEM_BACKEND} first.")
 endif()
 
 set(_glvis_compile_defs
@@ -432,6 +441,7 @@ add_executable(metamaterial_app
 
 target_compile_definitions(metamaterial_app PRIVATE
     METAMATERIAL_DEMO_MODE=$<BOOL:${METAMATERIAL_DEMO_MODE}>
+    METAMATERIAL_USE_CUDA=$<BOOL:${MFEM_USE_CUDA}>
 )
 message(STATUS "Interactive demo mode: ${METAMATERIAL_DEMO_MODE}")
 
@@ -463,7 +473,7 @@ if(TARGET SDL2::SDL2main)
 endif()
 
 if(METAMATERIAL_MFEM_BACKEND MATCHES "parallel-cpu" AND TARGET fftw3_omp)
-  target_link_libraries(metamaterial_app PRIVATE fftw3_omp)
+  target_link_libraries(metamaterial_app PRIVATE fftw3_omp OpenMP::OpenMP_CXX)
 endif()
 
 if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
@@ -497,6 +507,16 @@ target_include_directories(solver_adjoint_check PRIVATE
     "${fftw_SOURCE_DIR}/api"
 )
 target_link_libraries(solver_adjoint_check PRIVATE fftw3 mfem)
+target_compile_definitions(solver_adjoint_check PRIVATE
+    METAMATERIAL_USE_CUDA=$<BOOL:${MFEM_USE_CUDA}>
+)
+if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
+  target_link_libraries(solver_adjoint_check PRIVATE
+      CUDA::cudart CUDA::cublas CUDA::cusparse CUDA::cusolver)
+endif()
+if(METAMATERIAL_MFEM_BACKEND MATCHES "parallel-cpu")
+  target_link_libraries(solver_adjoint_check PRIVATE OpenMP::OpenMP_CXX)
+endif()
 
 add_executable(paper_optimizer_miniapp
     tests/paper_optimizer_miniapp.cpp
@@ -508,7 +528,18 @@ target_include_directories(paper_optimizer_miniapp PRIVATE
     "${fftw_SOURCE_DIR}/api"
 )
 target_link_libraries(paper_optimizer_miniapp PRIVATE
+    Eigen3::Eigen
     ParOpt::paropt
     fftw3
     mfem
 )
+target_compile_definitions(paper_optimizer_miniapp PRIVATE
+    METAMATERIAL_USE_CUDA=$<BOOL:${MFEM_USE_CUDA}>
+)
+if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
+  target_link_libraries(paper_optimizer_miniapp PRIVATE
+      CUDA::cudart CUDA::cublas CUDA::cusparse CUDA::cusolver)
+endif()
+if(METAMATERIAL_MFEM_BACKEND MATCHES "parallel-cpu")
+  target_link_libraries(paper_optimizer_miniapp PRIVATE OpenMP::OpenMP_CXX)
+endif()

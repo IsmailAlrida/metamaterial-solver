@@ -89,7 +89,11 @@ class FakeSolver {
                 systemSolution,
                 systemRightHandSide);
 
+#if METAMATERIAL_USE_CUDA
+            mfem::DSmoother smoother(static_cast<mfem::SparseMatrix&>(*system));
+#else
             mfem::GSSmoother smoother(static_cast<mfem::SparseMatrix&>(*system));
+#endif
             mfem::PCG(
                 *system,
                 smoother,
@@ -104,21 +108,23 @@ class FakeSolver {
                 rightHandSide,
                 solution);
 
-            char host[] = "127.0.0.1";
-            mfem::socketstream stream(host, GlvisAdapter::Port);
-            if (!stream.good()) {
-                log(LogLevel::Error, "MFEM Example 1 could not connect to the GLVis adapter.");
-                status.store(SolverStatus::Error);
-                return false;
+            if (glvisStream || bindToGlvis()) {
+                *glvisStream << "solution\n" << mesh << solution << std::flush;
+                if (!glvisStream->good()) {
+                    glvisStream.reset();
+                    ++glvisConnectionFailures;
+                    log(LogLevel::Warning,
+                        glvisConnectionFailures >= 3
+                            ? "MFEM Example 1 lost GLVis three times; disabling streaming."
+                            : "MFEM Example 1 lost GLVis; a later solve will reconnect.");
+                }
             }
-            stream.precision(8);
-            stream << "solution\n" << mesh << solution << std::flush;
 
             ++solveCount;
             populateResponse();
             result.success = 1;
             status.store(SolverStatus::Converged);
-            log(LogLevel::Message, "MFEM Example 1 solved and streamed its solution to GLVis.");
+            log(LogLevel::Message, "MFEM Example 1 solved and published its demo response.");
             return true;
         }
 
@@ -128,6 +134,32 @@ class FakeSolver {
         }
 
     private:
+        bool bindToGlvis()
+        {
+            if (glvisStream && glvisStream->good()) {
+                return true;
+            }
+            glvisStream.reset();
+            if (glvisConnectionFailures >= 3) {
+                return false;
+            }
+            char host[] = "127.0.0.1";
+            auto stream = std::make_unique<mfem::socketstream>(
+                host, GlvisAdapter::Port);
+            if (!stream->good()) {
+                ++glvisConnectionFailures;
+                log(LogLevel::Warning,
+                    glvisConnectionFailures == 3
+                        ? "MFEM Example 1 could not connect to GLVis three times; disabling streaming."
+                        : "MFEM Example 1 could not connect to GLVis; continuing headless.");
+                return false;
+            }
+            stream->precision(8);
+            glvisStream = std::move(stream);
+            glvisConnectionFailures = 0;
+            return true;
+        }
+
         void populateResponse()
         {
             constexpr int sampleCount = 256;
@@ -177,6 +209,8 @@ class FakeSolver {
         mfem::Mesh mesh;
         mfem::H1_FECollection fec;
         mfem::FiniteElementSpace fespace;
+        std::unique_ptr<mfem::socketstream> glvisStream;
+        int glvisConnectionFailures = 0;
         int solveCount = 0;
         std::atomic<SolverStatus> status{SolverStatus::Idle};
 };

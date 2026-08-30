@@ -3,46 +3,45 @@ setlocal EnableExtensions
 
 set "MODE=build"
 set "BACKEND=%~1"
-set "CUDA_ARCH=%~2"
+set "OPTION=%~2"
+set "BUILD_TYPE=Release"
 set "GLVIS_REVISION=1b9988ade7b78f125377a3be5c2b8514eafbcf0c"
 
 if /I "%BACKEND%"=="deps" (
     set "MODE=deps"
     set "BACKEND=%~2"
-    set "CUDA_ARCH=%~3"
+    set "OPTION=%~3"
 )
 
 if "%BACKEND%"=="" set "BACKEND=serial"
 
-if not "%BACKEND%"=="serial" if not "%BACKEND%"=="serial-cuda" if not "%BACKEND%"=="parallel-cpu" if not "%BACKEND%"=="parallel-cpu-cuda" (
-    echo Usage: build.bat [serial^|serial-cuda^|parallel-cpu^|parallel-cpu-cuda] [CUDA architecture]
-    echo        build.bat deps [serial^|serial-cuda^|parallel-cpu^|parallel-cpu-cuda] [CUDA architecture]
+call :parse_option "%OPTION%"
+if errorlevel 1 exit /b 1
+
+if not "%BACKEND%"=="serial" if not "%BACKEND%"=="parallel-cpu" (
+    echo Usage: build.bat [serial^|parallel-cpu] [debug]
+    echo        build.bat deps [serial^|parallel-cpu] [debug]
     exit /b 1
 )
 
 call :activate_msvc
 if errorlevel 1 exit /b 1
 
-if not "%BACKEND:cuda=%"=="%BACKEND%" (
-    call :check_cuda
-    if errorlevel 1 exit /b 1
-)
-
-if defined CUDA_ARCH if "%BACKEND:cuda=%"=="%BACKEND%" (
-    echo A CUDA architecture can only be supplied for a CUDA backend.
-    exit /b 1
-)
-
 set "BUILD_ROOT=build"
 set "BUILD_DIR=%BUILD_ROOT%\%BACKEND%"
 set "PRESET=%BACKEND%"
+if /I "%BUILD_TYPE%"=="Debug" (
+    set "BUILD_DIR=%BUILD_DIR%-debug"
+    set "PRESET=%PRESET%-debug"
+)
 if "%MODE%"=="deps" set "PRESET=deps-%BACKEND%"
+if "%MODE%"=="deps" if /I "%BUILD_TYPE%"=="Debug" set "PRESET=%PRESET%-debug"
 
 echo Backend: %BACKEND%
+echo Build type: %BUILD_TYPE%
 echo Build dir: %BUILD_DIR%
 echo Deps source dir: %BUILD_ROOT%\deps\src
 echo Preset: %PRESET%
-if defined CUDA_ARCH echo CUDA architecture: %CUDA_ARCH%
 
 if "%MODE%"=="deps" (
     call :fetch_glvis
@@ -52,11 +51,7 @@ if "%MODE%"=="deps" (
 call :patch_glvis
 if errorlevel 1 exit /b 1
 
-if defined CUDA_ARCH (
-    cmake --preset "%PRESET%" -DCMAKE_CUDA_ARCHITECTURES=%CUDA_ARCH%
-) else (
-    cmake --preset "%PRESET%"
-)
+cmake --preset "%PRESET%"
 if errorlevel 1 exit /b %errorlevel%
 copy /Y "%BUILD_DIR%\compile_commands.json" "%~dp0compile_commands.json" >nul
 if errorlevel 1 exit /b %errorlevel%
@@ -66,8 +61,22 @@ if "%MODE%"=="deps" (
     exit /b 0
 )
 
-cmake --build --preset "%BACKEND%"
+if /I "%BUILD_TYPE%"=="Debug" (
+    cmake --build --preset "%BACKEND%-debug"
+) else (
+    cmake --build --preset "%BACKEND%"
+)
 exit /b %errorlevel%
+
+:parse_option
+if "%~1"=="" exit /b 0
+if /I "%~1"=="debug" (
+    set "BUILD_TYPE=Debug"
+    exit /b 0
+)
+if /I "%~1"=="release" exit /b 0
+echo Unexpected build option: %~1
+exit /b 1
 
 :activate_msvc
 where cl.exe >nul 2>nul
@@ -88,20 +97,6 @@ exit /b 1
 :load_msvc
 call "%VS_INSTALL%\Common7\Tools\VsDevCmd.bat" -no_logo -arch=x64 -host_arch=x64
 exit /b %errorlevel%
-
-:check_cuda
-where nvcc >nul 2>nul
-if errorlevel 1 (
-    echo CUDA Toolkit not found: nvcc.exe is not on PATH.
-    echo Open a CUDA-enabled Developer Command Prompt or install the NVIDIA CUDA Toolkit.
-    exit /b 1
-)
-
-where nvidia-smi >nul 2>nul
-if errorlevel 1 (
-    echo Warning: nvidia-smi.exe is not on PATH. CUDA configure may still work, but driver/GPU detection is unavailable.
-)
-exit /b 0
 
 :fetch_glvis
 if not exist extern mkdir extern
