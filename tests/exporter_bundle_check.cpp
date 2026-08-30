@@ -70,6 +70,7 @@ int main()
         result.pressureOffset = 4;
         result.timeSteps = 1;
         result.dt = 0.001;
+        result.solidInfillFraction.store(0.375, std::memory_order_release);
         result.residualNorms.push_back({1.0e-12, 2.0e-12, 3.0e-12});
         result.U.emplace_back(8);
         result.U.back() = 123.0;
@@ -144,6 +145,8 @@ int main()
                 && json.find("\"attenuation_db\":-20") != std::string::npos
                 && json.find("\"reference_outlet\"") != std::string::npos
                 && json.find("\"equilibrium\":") != std::string::npos
+                && json.find("\"solid_infill_fraction\":0.375")
+                    != std::string::npos
                 && json.find("\"active_design_mask\"") != std::string::npos,
                 "response.json is missing required run data.");
         require(json.find("\"U\"") == std::string::npos,

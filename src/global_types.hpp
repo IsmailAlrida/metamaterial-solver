@@ -1,4 +1,6 @@
 #pragma once
+#include <atomic>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -74,6 +76,8 @@ struct SolverResult {
     int pressureOffset = 0;
     int timeSteps = 0;
     double dt = 0.0;
+    std::atomic<double> solidInfillFraction{
+        std::numeric_limits<double>::quiet_NaN()};
     std::shared_ptr<const SignalTD> inletPressure;
     std::shared_ptr<const SignalTD> outletPressure;
     std::shared_ptr<const SignalTD> referenceOutletPressure;

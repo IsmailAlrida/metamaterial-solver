@@ -27,14 +27,18 @@ bool check_cut_volume_integration()
     });
     phi.ProjectCoefficient(cut);
 
-    auto assemble = [&](bool positive) {
+    auto assemble = [&](bool positive, double* cut_measure = nullptr) {
         mfem::ConstantCoefficient one(1.0);
         mfem::BilinearForm form(&space);
-        form.AddDomainIntegrator(new App::ImplicitDomainIntegrator(
+        auto* integrator = new App::ImplicitDomainIntegrator(
             std::make_unique<mfem::MassIntegrator>(one),
-            phi, 4, 1, 0.0, positive));
+            phi, 4, 1, 0.0, positive);
+        form.AddDomainIntegrator(integrator);
         form.Assemble();
         form.Finalize();
+        if (cut_measure != nullptr) {
+            *cut_measure = integrator->GetCutMeasure();
+        }
         return std::unique_ptr<mfem::SparseMatrix>(form.LoseMat());
     };
     auto assemble_full = [&] {
@@ -47,22 +51,28 @@ bool check_cut_volume_integration()
     };
 
     const auto full = assemble_full();
-    auto positive = assemble(true);
-    auto negative = assemble(false);
+    double positive_measure = 0.0;
+    double negative_measure = 0.0;
+    auto positive = assemble(true, &positive_measure);
+    auto negative = assemble(false, &negative_measure);
     std::unique_ptr<mfem::SparseMatrix> complement(
         mfem::Add(1.0, *positive, 1.0, *negative));
     complement->Add(-1.0, *full);
     const double tolerance = 1.0e-10 * std::max(1.0, full->MaxNorm());
-    if (complement->MaxNorm() > tolerance) {
+    if (complement->MaxNorm() > tolerance
+        || std::abs(positive_measure - 0.5) > 1.0e-12
+        || std::abs(negative_measure - 0.5) > 1.0e-12) {
         return false;
     }
 
     phi = 1.0;
-    positive = assemble(true);
-    negative = assemble(false);
+    positive = assemble(true, &positive_measure);
+    negative = assemble(false, &negative_measure);
     positive->Add(-1.0, *full);
     return positive->MaxNorm() <= tolerance
-        && negative->MaxNorm() <= tolerance;
+        && negative->MaxNorm() <= tolerance
+        && std::abs(positive_measure - 1.0) <= 1.0e-12
+        && std::abs(negative_measure) <= 1.0e-12;
 }
 
 bool check_fft_convention()
@@ -138,6 +148,11 @@ int main()
     geometry.enforceDesignConstraints();
     if (!solver.assembleSolutionSpace() || !solver.solve()) {
         std::cerr << "The coarse empty-duct solve failed.\n";
+        return 1;
+    }
+    if (result.solidInfillFraction.load(std::memory_order_acquire)
+            > 1.0e-10) {
+        std::cerr << "The empty duct reports nonzero solid infill.\n";
         return 1;
     }
     int valid_empty_bins = 0;

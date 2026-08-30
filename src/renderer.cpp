@@ -656,6 +656,17 @@ void Renderer::SimulationInfoPanel(const dispatcher_t& dispatcher)
                 solver.inletLength,
                 solver.designLength,
                 solver.outletLength);
+    const double solidInfill = result.solidInfillFraction.load(
+        std::memory_order_acquire);
+    if (std::isfinite(solidInfill)) {
+        ImGui::Text("Solid %s infill: %.2f%%",
+                    is3D ? "volume" : "area",
+                    100.0 * solidInfill);
+    }
+    else {
+        ImGui::TextDisabled("Solid %s infill: N/A",
+                            is3D ? "volume" : "area");
+    }
     ImGui::Text("%lld time steps", timeSteps);
     ImGui::Text("FFT: %lld samples%s", timeSteps, solver.useHannWindow ? " + Hann" : "");
     ImGui::Separator();

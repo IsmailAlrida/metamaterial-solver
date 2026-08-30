@@ -206,12 +206,16 @@ bool App::Solver::setMesh()
     source_pressure.clear();
     source_pressure_derivative.clear();
     level_set_scale = 0.0;
+    design_region_measure = 0.0;
     design_initialized = false;
     reference_ready = false;
     reference_outlet_pressure.clear();
     fft_window.clear();
     frequency_response = {};
     result.success = 0;
+    result.solidInfillFraction.store(
+        std::numeric_limits<double>::quiet_NaN(),
+        std::memory_order_release);
     std::atomic_store(
         &result.inletPressure, std::shared_ptr<const SignalTD>{});
     std::atomic_store(
@@ -281,6 +285,7 @@ bool App::Solver::prepareLevelSetAndSource()
         int inlet_count = 0;
         int design_count = 0;
         int outlet_count = 0;
+        design_region_measure = 0.0;
         element_centers.SetSize(cell_count, dim);
         cell_volumes.SetSize(cell_count);
         Vector center(dim);
@@ -295,6 +300,7 @@ bool App::Solver::prepareLevelSetAndSource()
             else if (center[0] < design_end) {
                 mesh->SetAttribute(element, static_cast<int>(DomainAttribute::design));
                 ++design_count;
+                design_region_measure += cell_volumes[element];
             }
             else {
                 mesh->SetAttribute(element, static_cast<int>(DomainAttribute::outlet));
@@ -482,18 +488,33 @@ bool App::Solver::assembleSolutionSpace()
     // Algoim supplies the cut-volume rules while the ordinary MFEM
     // integrators and forms own the element loops and sparse assembly.
     BilinearForm Muu_form(displacement_fes.get());
-    Muu_form.AddDomainIntegrator(new ImplicitDomainIntegrator(
+    auto* solid_domain_integrator = new ImplicitDomainIntegrator(
         std::make_unique<VectorMassIntegrator>(solid_density),
         *lset.phi,
         cut_integration_order,
         level_set_order,
         physics->epsilon,
-        true), design_domain_marker);
+        true);
+    Muu_form.AddDomainIntegrator(
+        solid_domain_integrator, design_domain_marker);
     Muu_form.AddDomainIntegrator(
         new VectorMassIntegrator(fictitious_solid_density), fixed_air_marker);
     Muu_form.Assemble();
     Muu_form.Finalize();
     Muu_block.reset(Muu_form.LoseMat());
+
+    const double solid_measure = solid_domain_integrator->GetCutMeasure();
+    if (!std::isfinite(solid_measure)
+        || design_region_measure <= 0.0
+        || solid_measure < -1.0e-12
+        || solid_measure > design_region_measure * (1.0 + 1.0e-10)) {
+        log(LogLevel::Error,
+            "The solid infill measure is outside the design region.");
+        return false;
+    }
+    result.solidInfillFraction.store(
+        std::clamp(solid_measure / design_region_measure, 0.0, 1.0),
+        std::memory_order_release);
 
     BilinearForm Kuu_form(displacement_fes.get());
     Kuu_form.AddDomainIntegrator(new ImplicitDomainIntegrator(

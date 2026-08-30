@@ -150,6 +150,8 @@ std::string make_json(const AppSettings& settings,
     const auto outlet = std::atomic_load(&result.outletPressure);
     const auto reference = std::atomic_load(&result.referenceOutletPressure);
     const auto response = std::atomic_load(&result.materialImpulseResponse);
+    const double solid_infill_fraction = result.solidInfillFraction.load(
+        std::memory_order_acquire);
 
     std::ostringstream output;
     output << "{\n  \"schema_version\":1,\n"
@@ -305,7 +307,9 @@ std::string make_json(const AppSettings& settings,
             : std::numeric_limits<double>::quiet_NaN());
         output << '}';
     }
-    output << "],\n  \"geometry\":{\"dimension\":" << mesh.Dimension()
+    output << "],\n  \"geometry\":{\"solid_infill_fraction\":";
+    write_number(output, solid_infill_fraction);
+    output << ",\"dimension\":" << mesh.Dimension()
            << ",\"space_dimension\":" << mesh.SpaceDimension()
            << ",\"vertices\":[";
     for (int vertex = 0; vertex < mesh.GetNV(); ++vertex) {

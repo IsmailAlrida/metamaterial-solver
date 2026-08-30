@@ -570,18 +570,43 @@ bool App::Solver::assembleSolutionSpace(bool parallel)
     // ponytail: fixed-air terms reassemble to avoid retaining four extra
     // sparse matrices; cache them only if assembly time outweighs peak RAM.
     ParBilinearForm Muu_form(state.displacement_fes.get());
-    Muu_form.AddDomainIntegrator(new ImplicitDomainIntegrator(
+    auto* solid_domain_integrator = new ImplicitDomainIntegrator(
         std::make_unique<VectorMassIntegrator>(solid_density),
         *state.phi,
         cut_integration_order,
         level_set_order,
         physics->epsilon,
-        true), design_marker);
+        true);
+    Muu_form.AddDomainIntegrator(solid_domain_integrator, design_marker);
     Muu_form.AddDomainIntegrator(
         new VectorMassIntegrator(fictitious_solid_density), fixed_air_marker);
     Muu_form.Assemble();
     Muu_form.Finalize();
     state.Muu.reset(Muu_form.ParallelAssemble());
+
+    double solid_measure = solid_domain_integrator->GetCutMeasure();
+    MPI_Allreduce(MPI_IN_PLACE, &solid_measure, 1, MPI_DOUBLE, MPI_SUM,
+                  state.comm);
+    bool infill_valid = true;
+    if (state.rank == 0) {
+        infill_valid = std::isfinite(solid_measure)
+            && design_region_measure > 0.0
+            && solid_measure >= -1.0e-12
+            && solid_measure <= design_region_measure * (1.0 + 1.0e-10);
+        if (infill_valid) {
+            result.solidInfillFraction.store(
+                std::clamp(
+                    solid_measure / design_region_measure, 0.0, 1.0),
+                std::memory_order_release);
+        }
+        else {
+            log(LogLevel::Error,
+                "The parallel solid infill measure is outside the design region.");
+        }
+    }
+    if (!all_succeeded(state.comm, infill_valid)) {
+        return false;
+    }
 
     ParBilinearForm Kuu_form(state.displacement_fes.get());
     Kuu_form.AddDomainIntegrator(new ImplicitDomainIntegrator(

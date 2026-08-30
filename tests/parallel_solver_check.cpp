@@ -149,6 +149,8 @@ int main(int argc, char** argv)
             && solver.assembleSolutionSpace(true)
             && solver.solve(true);
         const auto fgmres_signal = result.outletPressure;
+        const double fgmres_infill = result.solidInfillFraction.load(
+            std::memory_order_acquire);
         const App::FrequencyResponse fgmres_response =
             solver.frequencyResponse();
         const auto derivative = response_derivative(fgmres_response);
@@ -191,6 +193,10 @@ int main(int argc, char** argv)
             && serial_solver.solve();
         const bool serial_match = fgmres_forward && serial_forward
             && serial_result.outletPressure
+            && std::isfinite(fgmres_infill)
+            && std::abs(fgmres_infill
+                - serial_result.solidInfillFraction.load(
+                    std::memory_order_acquire)) <= 1.0e-10
             && matching_signal(*fgmres_signal, *serial_result.outletPressure)
             && matching_response(
                 fgmres_response, serial_solver.frequencyResponse());
@@ -213,6 +219,8 @@ int main(int argc, char** argv)
             && solver.assembleSolutionSpace(true)
             && solver.solve(true);
         const auto mumps_signal = result.outletPressure;
+        const double mumps_infill = result.solidInfillFraction.load(
+            std::memory_order_acquire);
         const App::FrequencyResponse mumps_response =
             solver.frequencyResponse();
         mfem::Vector mumps_gradient;
@@ -231,6 +239,7 @@ int main(int argc, char** argv)
             && solver.performance().mumpsSolveSeconds > 0.0;
         const bool mumps_parity = fgmres_forward && fgmres_adjoint
             && mumps_forward && mumps_adjoint
+            && std::abs(fgmres_infill - mumps_infill) <= 1.0e-10
             && matching_signal(*fgmres_signal, *mumps_signal)
             && matching_response(fgmres_response, mumps_response)
             && matching_vector(fgmres_gradient, mumps_gradient);

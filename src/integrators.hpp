@@ -54,14 +54,21 @@ public:
 
         mfem::GridFunctionCoefficient phi_coefficient(&phi);
         NegatedCoefficient negative_phi(phi_coefficient);
+        // Algoim integrates where its coefficient is negative.
         mfem::Coefficient& cut_coefficient = positive
-            ? static_cast<mfem::Coefficient&>(phi_coefficient)
-            : static_cast<mfem::Coefficient&>(negative_phi);
+            ? static_cast<mfem::Coefficient&>(negative_phi)
+            : static_cast<mfem::Coefficient&>(phi_coefficient);
         mfem::AlgoimIntegrationRules integration_rules(
             integration_order, cut_coefficient, level_set_order);
         mfem::IntegrationRule cut_rule;
         integration_rules.GetVolumeIntegrationRule(
             transformation, cut_rule);
+
+        for (int point = 0; point < cut_rule.GetNPoints(); ++point) {
+            const mfem::IntegrationPoint& ip = cut_rule.IntPoint(point);
+            transformation.SetIntPoint(&ip);
+            cut_measure += ip.weight * transformation.Weight();
+        }
 
         mfem::DenseMatrix cut_matrix;
         integrator->SetIntegrationRule(cut_rule);
@@ -74,6 +81,9 @@ public:
         element_matrix.Add(1.0 - epsilon, cut_matrix);
     }
 
+    /** @brief Return the physical measure integrated on the selected side. */
+    mfem::real_t GetCutMeasure() const { return cut_measure; }
+
 private:
     std::unique_ptr<mfem::BilinearFormIntegrator> integrator;
     mfem::GridFunction& phi;
@@ -81,6 +91,7 @@ private:
     int level_set_order;
     mfem::real_t epsilon;
     bool positive;
+    mfem::real_t cut_measure = 0.0;
 };
 
 /** @brief Assemble a scalar-normal-vector product on an implicit surface.

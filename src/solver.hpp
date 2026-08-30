@@ -142,6 +142,7 @@ namespace App {
         SolverPerformance performance_data;
         std::unique_ptr<mfem::socketstream> glvis_stream;
         double level_set_scale = 0.0;
+        double design_region_measure = 0.0;
         int pressure_offset = 0;
         int glvis_connection_failures = 0;
         bool design_initialized = false;
