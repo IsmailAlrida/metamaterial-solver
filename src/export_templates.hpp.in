@@ -1,0 +1,10 @@
+#pragma once
+
+#include <string_view>
+
+namespace App::ExportTemplates {
+
+inline constexpr std::string_view Python = R"__PY__(@METAMATERIAL_PYTHON_TEMPLATE@)__PY__";
+inline constexpr std::string_view Matlab = R"__MATLAB__(@METAMATERIAL_MATLAB_TEMPLATE@)__MATLAB__";
+
+} // namespace App::ExportTemplates

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <filesystem>
+
 #include "global_types.hpp"
 #include "logging.hpp"
 
@@ -8,9 +10,17 @@ namespace App {
 class Exporter {
     
     public:
-        Exporter(const ExporterSettings& settings,
+        Exporter(const AppSettings& settings,
+                 const SolverResult& result,
                  const LevelSet& geometry,
                  const LogFunction& log);
+
+        bool exportRunData(const std::filesystem::path& directory,
+                           OptimizerStatus status,
+                           int iteration,
+                           double pass,
+                           double stop,
+                           double mmaBound);
 
         // This stays as the single public mesh-export action. The implementation
         // can choose the 2D, extruded-2D, or direct-3D path from the level-set
@@ -21,13 +31,10 @@ class Exporter {
         // The LevelSet remains the authoritative geometry. Any explicit vertices,
         // triangles, Assimp scenes, and manifest data should be temporary exporter
         // products rather than new app-wide state.
-        const ExporterSettings& settings;
+        const AppSettings& settings;
+        const SolverResult& result;
         const LevelSet& geometry;
         const LogFunction& log;
-
-        // TODO: Optionally add a separate saveRunData() action when the exact run
-        // data format is decided. It will need selected SolverResult/optimizer data;
-        // do not make the mesh-export path own or duplicate the simulation history.
 
 };
 

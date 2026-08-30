@@ -219,6 +219,47 @@ class FakeSolver {
                 response->phase[i] = 0.55f * std::sin(t * 13.0f + improvement * 0.1f);
             }
 
+            auto inlet = std::make_shared<SignalTD>();
+            auto outlet = std::make_shared<SignalTD>();
+            auto reference = std::make_shared<SignalTD>();
+            inlet->size = sampleCount;
+            outlet->size = sampleCount;
+            reference->size = sampleCount;
+            inlet->time.resize(sampleCount);
+            outlet->time.resize(sampleCount);
+            reference->time.resize(sampleCount);
+            inlet->amplitude.resize(sampleCount);
+            outlet->amplitude.resize(sampleCount);
+            reference->amplitude.resize(sampleCount);
+            for (int i = 0; i < sampleCount; ++i) {
+                const double time = i * settings.dt;
+                const double source = std::sin(2.0 * pi * 1000.0 * time);
+                inlet->time[i] = time;
+                outlet->time[i] = time;
+                reference->time[i] = time;
+                inlet->amplitude[i] = source;
+                reference->amplitude[i] = source;
+                outlet->amplitude[i] = source * (0.9 - 0.05 * improvement);
+            }
+
+            result.stateSize = fespace.GetTrueVSize();
+            result.displacementSize = 0;
+            result.pressureSize = result.stateSize;
+            result.pressureOffset = 0;
+            result.timeSteps = sampleCount - 1;
+            result.dt = settings.dt;
+            result.residualNorms.assign(
+                sampleCount, NewmarkResidualNorms{});
+            std::atomic_store(
+                &result.inletPressure,
+                std::shared_ptr<const SignalTD>(std::move(inlet)));
+            std::atomic_store(
+                &result.outletPressure,
+                std::shared_ptr<const SignalTD>(std::move(outlet)));
+            std::atomic_store(
+                &result.referenceOutletPressure,
+                std::shared_ptr<const SignalTD>(std::move(reference)));
+
             std::shared_ptr<const SignalFFT> publishedResponse = std::move(response);
             std::atomic_store(
                 &result.materialImpulseResponse,

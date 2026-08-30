@@ -170,6 +170,7 @@ const char* status_name(App::OptimizerStatus status)
     switch (status) {
     case App::OptimizerStatus::Idle: return "idle";
     case App::OptimizerStatus::Working: return "working";
+    case App::OptimizerStatus::Paused: return "paused";
     case App::OptimizerStatus::Converged: return "converged";
     case App::OptimizerStatus::MaximumIterations: return "maximum_iterations";
     case App::OptimizerStatus::Diverged: return "diverged";

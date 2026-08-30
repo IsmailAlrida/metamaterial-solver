@@ -1,5 +1,8 @@
 #pragma once
 
+#include <filesystem>
+
+#include "exporter.hpp"
 #include "global_types.hpp"
 #include "logging.hpp"
 
@@ -7,13 +10,24 @@ namespace App::Demo {
 
 class FakeExporter {
     public:
-        FakeExporter(const ExporterSettings& settings,
+        FakeExporter(const AppSettings& settings,
+                     const SolverResult& result,
                      const LevelSet& geometry,
                      const LogFunction& log)
-            : settings(settings),
-              geometry(geometry),
+            : exporter(settings, result, geometry, log),
               log(log)
         {
+        }
+
+        bool exportRunData(const std::filesystem::path& directory,
+                           OptimizerStatus status,
+                           int iteration,
+                           double pass,
+                           double stop,
+                           double mmaBound)
+        {
+            return exporter.exportRunData(
+                directory, status, iteration, pass, stop, mmaBound);
         }
 
         bool exportMesh()
@@ -24,8 +38,7 @@ class FakeExporter {
         }
 
     private:
-        const ExporterSettings& settings;
-        const LevelSet& geometry;
+        Exporter exporter;
         const LogFunction& log;
 };
 

@@ -25,6 +25,7 @@ enum class SolverStatus {
 enum class OptimizerStatus {
     Idle,
     Working,
+    Paused,
     Converged,
     MaximumIterations,
     Diverged,

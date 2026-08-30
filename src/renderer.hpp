@@ -86,6 +86,7 @@ namespace App {
             bool sdlBackendInitialized = false;
             bool openglBackendInitialized = false;
             std::unique_ptr<GlvisAdapter> glvis;
+            ImGui::FileBrowser exportDirectoryBrowser;
 
             struct LogEntry {
                 LogLevel level;

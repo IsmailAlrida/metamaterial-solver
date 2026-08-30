@@ -79,9 +79,13 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(SDL2)
 
 # 3. Fetch Assimp
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(ASSIMP_INSTALL OFF CACHE BOOL "" FORCE)
 set(ASSIMP_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
+# Assimp carries the ZIP implementation through its 3MF exporter sources.
+set(ASSIMP_NO_EXPORT OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_3MF_EXPORTER ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
   assimp
   GIT_REPOSITORY https://github.com/assimp/assimp.git
@@ -112,7 +116,6 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(implot)
 
 # 6. Fetch FFTW
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(ENABLE_OPENMP OFF CACHE BOOL "" FORCE)
 set(ENABLE_THREADS OFF CACHE BOOL "" FORCE)
@@ -552,6 +555,21 @@ if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
 endif()
 
 # Gather all user source files from your directory
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/scripts/metamaterial_response.py"
+  "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Metamaterial.m"
+)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/scripts/metamaterial_response.py"
+  METAMATERIAL_PYTHON_TEMPLATE)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Metamaterial.m"
+  METAMATERIAL_MATLAB_TEMPLATE)
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+configure_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/export_templates.hpp.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/generated/export_templates.hpp"
+  @ONLY
+)
+
 file(GLOB sources "src/*.cpp")
 if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
   file(GLOB cuda_sources "src/*.cu")
@@ -585,6 +603,8 @@ target_include_directories(metamaterial_app PRIVATE
     ${IMGUI_DIR}/backends
     ${implot_SOURCE_DIR}
     "${fftw_SOURCE_DIR}/api"
+    "${assimp_SOURCE_DIR}/contrib/zip/src"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated"
 )
 
 # Link all targets cleanly
@@ -628,6 +648,18 @@ target_include_directories(dispatcher_backend_check PRIVATE
 )
 target_link_libraries(dispatcher_backend_check PRIVATE mfem)
 add_test(NAME dispatcher_backend COMMAND dispatcher_backend_check)
+
+add_executable(exporter_bundle_check
+    tests/exporter_bundle_check.cpp
+    src/exporter.cpp
+)
+target_include_directories(exporter_bundle_check PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${assimp_SOURCE_DIR}/contrib/zip/src"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated"
+)
+target_link_libraries(exporter_bundle_check PRIVATE assimp mfem)
+add_test(NAME exporter_bundle COMMAND exporter_bundle_check)
 
 add_executable(paropt_smoke_check
     tests/paropt_smoke_check.cpp

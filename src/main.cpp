@@ -76,7 +76,6 @@ int main(int argc, char** argv)
         auto& appSettings = *settings;
         auto& solverSettings = appSettings.solverSettings;
         auto& optimizerSettings = appSettings.optSettings;
-        auto& exporterSettings = appSettings.exporterSettings;
 
         auto result = std::make_unique<App::SolverResult>();
         auto& solverResult = *result;
@@ -128,7 +127,8 @@ int main(int argc, char** argv)
                 solverResult,
                 log);
             auto exporter = std::make_unique<App::exporter_t>(
-                exporterSettings,
+                appSettings,
+                solverResult,
                 geometry,
                 log);
             auto dispatcher = std::make_unique<App::dispatcher_t>(

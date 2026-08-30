@@ -1,4 +1,4 @@
-"""Load a miniapp JSON result and apply its measured transfer response.
+"""Load an exported response.json and apply its measured transfer response.
 
 Requires NumPy and SciPy. Frequencies outside the measured range are left
 unchanged instead of inventing an extrapolated material response.

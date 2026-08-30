@@ -1,7 +1,7 @@
 classdef Metamaterial
-    % Load and apply the complex transfer response in a miniapp JSON result.
+    % Load and apply the complex transfer response in an exported response.json.
     %
-    %   material = Metamaterial("high-pass.json");
+    %   material = Metamaterial("response.json");
     %   filtered = material.apply(samples, sampleRateHz);
     %
     % Frequencies outside the measured range are left unchanged.

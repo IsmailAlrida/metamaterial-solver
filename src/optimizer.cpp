@@ -131,6 +131,7 @@ public:
             constraints[constraint++] =
                 bound - objective.stop / objective_scale;
         }
+        optimizer.pause_at_boundary();
         return 0;
     }
 
@@ -159,6 +160,7 @@ public:
             fillConstraintGradient(
                 stop_gradient, constraint_gradients[constraint++]);
         }
+        optimizer.pause_at_boundary();
         return 0;
     }
 
@@ -177,6 +179,7 @@ public:
 private:
     void evaluate(ParOptVec* variables)
     {
+        optimizer.pause_at_boundary();
         if (matches(variables)) {
             return;
         }
@@ -278,9 +281,18 @@ private:
     bool gradients_ready = false;
 };
 
+void Optimizer::prepare_run()
+{
+    clear_requests();
+    run_prepared.store(true);
+    status.store(OptimizerStatus::Working);
+}
+
 void Optimizer::run()
 {
-    cancel_requested.store(false);
+    if (!run_prepared.exchange(false)) {
+        clear_requests();
+    }
     iteration.store(0);
     pass_objective.store(0.0);
     stop_objective.store(0.0);
@@ -288,20 +300,24 @@ void Optimizer::run()
     status.store(OptimizerStatus::Working);
 
     try {
+        if (cancel_requested.load()) {
+            throw OptimizationCancelled{};
+        }
         if (!solver.setMesh(METAMATERIAL_USE_MPI != 0)
             || !solver.solve(METAMATERIAL_USE_MPI != 0)) {
             status.store(
                 solver.get_status() == SolverStatus::Diverged
                     ? OptimizerStatus::Diverged
                     : OptimizerStatus::Error);
-            return;
         }
-
-        if (cancel_requested.load()) {
-            status.store(OptimizerStatus::Cancelled);
-            return;
+        else {
+            optimize();
         }
-        optimize();
+    }
+    catch (const OptimizationCancelled&) {
+        status.store(OptimizerStatus::Cancelled);
+        log(LogLevel::Warning,
+            "Optimization cancelled after the latest completed design.");
     }
     catch (const std::exception& error) {
         status.store(OptimizerStatus::Error);
@@ -312,6 +328,7 @@ void Optimizer::run()
         status.store(OptimizerStatus::Error);
         log(LogLevel::Error, "Optimization failed with an unknown error.");
     }
+    clear_requests();
 }
 
 bool Optimizer::evaluateObjectives(ObjectiveEvaluation& objective) const
@@ -354,6 +371,8 @@ bool Optimizer::evaluateObjectives(ObjectiveEvaluation& objective) const
             }
             return first->startHz < second->startHz;
         });
+
+    // TODO: Perhaps allow overlapping bands to add when we add net square error for free form drawing of filters
     for (std::size_t band = 1; band < bands.size(); ++band) {
         if (bands[band]->startHz < bands[band - 1]->endHz) {
             log(LogLevel::Error, "Frequency bands cannot overlap.");
@@ -473,6 +492,7 @@ bool Optimizer::optimize()
             + std::to_string(objective.stop) + ".");
 
     try {
+        pause_at_boundary();
         auto release = [](auto* object) {
             if (object != nullptr) {
                 object->decref();
@@ -522,6 +542,7 @@ bool Optimizer::optimize()
         optimizer->optimize();
         performance_data.paroptSeconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - paropt_started_at).count();
+        pause_at_boundary();
 
         if (cancel_requested.load()) {
             status.store(OptimizerStatus::Cancelled);
@@ -570,7 +591,80 @@ bool Optimizer::optimize()
 
 void Optimizer::request_cancel()
 {
+    const OptimizerStatus current_status = status.load();
+    if (current_status != OptimizerStatus::Working
+        && current_status != OptimizerStatus::Paused) {
+        return;
+    }
     cancel_requested.store(true);
+    {
+        std::lock_guard<std::mutex> lock(pause_mutex);
+        pause_requested = false;
+    }
+    pause_condition.notify_all();
+}
+
+void Optimizer::request_pause()
+{
+    if (status.load() != OptimizerStatus::Working
+        || cancel_requested.load()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(pause_mutex);
+    pause_requested = true;
+}
+
+void Optimizer::resume()
+{
+    {
+        std::lock_guard<std::mutex> lock(pause_mutex);
+        pause_requested = false;
+    }
+    pause_condition.notify_all();
+}
+
+bool Optimizer::is_pause_requested() const
+{
+    std::lock_guard<std::mutex> lock(pause_mutex);
+    const OptimizerStatus current_status = status.load();
+    return pause_requested
+        && (current_status == OptimizerStatus::Working
+            || current_status == OptimizerStatus::Paused);
+}
+
+void Optimizer::pause_at_boundary()
+{
+    if (cancel_requested.load()) {
+        throw OptimizationCancelled{};
+    }
+
+    std::unique_lock<std::mutex> lock(pause_mutex);
+    if (!pause_requested) {
+        return;
+    }
+
+    status.store(OptimizerStatus::Paused);
+    log(LogLevel::Message,
+        "Optimization paused after the latest completed design.");
+    pause_condition.wait(lock, [this]() {
+        return !pause_requested || cancel_requested.load();
+    });
+
+    if (cancel_requested.load()) {
+        throw OptimizationCancelled{};
+    }
+    status.store(OptimizerStatus::Working);
+    log(LogLevel::Message, "Optimization resumed.");
+}
+
+void Optimizer::clear_requests()
+{
+    cancel_requested.store(false);
+    {
+        std::lock_guard<std::mutex> lock(pause_mutex);
+        pause_requested = false;
+    }
+    pause_condition.notify_all();
 }
 
 OptimizerStatus Optimizer::get_status() const
@@ -593,6 +687,8 @@ bool Optimizer::is_exportable() const
     const OptimizerStatus current_status = status.load();
     return current_status == OptimizerStatus::Converged
         || current_status == OptimizerStatus::MaximumIterations
+        || (current_status == OptimizerStatus::Paused
+            && solver.get_status() == SolverStatus::Converged)
         || (current_status == OptimizerStatus::Cancelled
             && solver.get_status() == SolverStatus::Converged);
 }
