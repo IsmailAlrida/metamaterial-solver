@@ -9,6 +9,12 @@
 
 namespace App {
 
+struct OptimizerPerformance {
+    double paroptSeconds = 0.0;
+    double forwardCallbackSeconds = 0.0;
+    double gradientCallbackSeconds = 0.0;
+};
+
 class Optimizer {
     public:
         Optimizer(const OptimizerSettings& settings,
@@ -27,6 +33,7 @@ class Optimizer {
         double get_pass_objective() const;
         double get_stop_objective() const;
         double get_mma_bound() const;
+        const OptimizerPerformance& performance() const;
 
     private:
         class Problem;
@@ -56,6 +63,7 @@ class Optimizer {
         std::atomic<double> pass_objective{0.0};
         std::atomic<double> stop_objective{0.0};
         std::atomic<double> mma_bound{0.0};
+        OptimizerPerformance performance_data;
 };
 
 } // namespace App

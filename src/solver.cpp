@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <complex>
 #include <iomanip>
@@ -75,9 +76,44 @@ const App::FrequencyResponse& App::Solver::frequencyResponse() const
     return frequency_response;
 }
 
+const App::SolverPerformance& App::Solver::performance() const
+{
+    return performance_data;
+}
+
+bool App::Solver::bindToGlvis()
+{
+    if (glvis_stream && glvis_stream->good()) {
+        return true;
+    }
+    glvis_stream.reset();
+    if (glvis_connection_failures >= 3) {
+        return false;
+    }
+
+    char host[] = "127.0.0.1";
+    auto stream = std::make_unique<socketstream>(host, GlvisAdapter::Port);
+    if (!stream->good()) {
+        ++glvis_connection_failures;
+        log(LogLevel::Warning,
+            glvis_connection_failures == 3
+                ? "Could not connect to the local GLVis panel three times; disabling streaming."
+                : "Could not connect to the local GLVis panel; continuing headless.");
+        return false;
+    }
+
+    stream->precision(8);
+    glvis_stream = std::move(stream);
+    glvis_connection_failures = 0;
+    log(LogLevel::Message, "Connected the solver to the local GLVis panel.");
+    return true;
+}
+
 // TODO: Do something about the mixed camelCase and snake_case. Choose one.
 bool App::Solver::setMesh()
 {
+    const auto started_at = std::chrono::steady_clock::now();
+    performance_data = {};
     const int nx = settings.nx;
     const int ny = settings.ny;
     const int nz = settings.nz;
@@ -110,13 +146,17 @@ bool App::Solver::setMesh()
     M.reset();
     C.reset();
     K.reset();
+    effective_matrix.reset();
     effective_matrix_transpose.reset();
+    initial_matrix.reset();
     initial_matrix_transpose.reset();
     design_to_cell.reset();
     cell_to_level_set.reset();
     filter_matrix.reset();
     inlet_load.SetSize(0);
     outlet_functional.SetSize(0);
+    system_inlet_load.SetSize(0);
+    system_outlet_functional.SetSize(0);
     element_centers.SetSize(0, 0);
     cell_volumes.SetSize(0);
     displacement_essential_tdofs.SetSize(0);
@@ -139,12 +179,15 @@ bool App::Solver::setMesh()
         &result.materialImpulseResponse, std::shared_ptr<const SignalFFT>{});
     log(LogLevel::Message,
         nz > 0 ? "Created 3D Cartesian mesh." : "Created 2D Cartesian mesh.");
+    performance_data.meshSetupSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started_at).count();
     return true;
 }
 
 // TODO: Make a bloch-floquet periodic boundary condition?
 bool App::Solver::assembleSolutionSpace()
 {
+    const auto assembly_started_at = std::chrono::steady_clock::now();
     if (!mesh || settings.duration <= 0.0 || settings.dt <= 0.0) {
         log(LogLevel::Error,
             "The duration and time step must be positive before assembly.");
@@ -185,7 +228,9 @@ bool App::Solver::assembleSolutionSpace()
     M.reset();
     C.reset();
     K.reset();
+    effective_matrix.reset();
     effective_matrix_transpose.reset();
+    initial_matrix.reset();
     initial_matrix_transpose.reset();
     if (!level_set_fes) {
         fec = std::make_unique<H1_FECollection>(fe_order, dim);
@@ -319,9 +364,12 @@ bool App::Solver::assembleSolutionSpace()
 
     GridFunction unsmoothed_level_set(level_set_fes.get());
     unsmoothed_level_set.SetFromTrueDofs(lset.design);
+    const auto smoothing_started_at = std::chrono::steady_clock::now();
     if (!smooth_level_set(unsmoothed_level_set, *lset.phi)) {
         return false;
     }
+    performance_data.levelSetSmoothingSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - smoothing_started_at).count();
 
 
     const int displacement_size = displacement_fes->GetVSize();
@@ -548,14 +596,24 @@ bool App::Solver::assembleSolutionSpace()
             / settings.dt;
     }
 
+    system_inlet_load.SetSize(M->Height());
+    system_inlet_load = 0.0;
+    system_inlet_load.SetVector(inlet_load, pressure_offset);
+    system_outlet_functional.SetSize(M->Height());
+    system_outlet_functional = 0.0;
+    system_outlet_functional.SetVector(outlet_functional, pressure_offset);
+
     result.stateSize = M->Height();
     result.displacementSize = displacement_size;
     result.pressureSize = pressure_size;
     result.pressureOffset = pressure_offset;
     result.timeSteps = time_steps;
     result.dt = settings.dt;
+    performance_data.assemblySeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - assembly_started_at).count();
     log(LogLevel::Message,
-        "Assembled fictitious-domain vibroacoustic M, C, and K matrices.");
+        "Assembled fictitious-domain vibroacoustic M, C, and K matrices in "
+            + std::to_string(performance_data.assemblySeconds) + " s.");
     return true;
 }
 
@@ -564,6 +622,14 @@ bool App::Solver::solve()
     status.store(SolverStatus::Working);
     result.success = 0;
     frequency_response = {};
+    if (!reference_ready) {
+        performance_data.referenceTransientSeconds = 0.0;
+    }
+    performance_data.designedTransientSeconds = 0.0;
+    performance_data.fourierSeconds = 0.0;
+    performance_data.forwardFgmresIterations = 0;
+    performance_data.forwardFgmresSolves = 0;
+    performance_data.maximumForwardFgmresIterations = 0;
 
     if (!mesh || !M || !C || !K) {
         log(LogLevel::Error,
@@ -598,18 +664,19 @@ bool App::Solver::solve()
         }
         designed_assembly_ready = !reference_analysis;
 
-        if (!reference_analysis) {
-            char host[] = "127.0.0.1";
-            socketstream stream(host, GlvisAdapter::Port);
-            if (stream.good()) {
-                stream.precision(8);
-                stream << "solution\n" << *mesh << *lset.phi << std::flush;
+        if (!reference_analysis && (glvis_stream || bindToGlvis())) {
+            *glvis_stream << "solution\n" << *mesh << *lset.phi << std::flush;
+            if (glvis_stream->good()) {
                 log(LogLevel::Message,
                     "Streamed the filtered paper initial geometry to GLVis.");
             }
             else {
+                glvis_stream.reset();
+                ++glvis_connection_failures;
                 log(LogLevel::Warning,
-                    "Could not connect to the local GLVis panel; continuing headless.");
+                    glvis_connection_failures >= 3
+                        ? "The GLVis connection failed three times; disabling streaming."
+                        : "The GLVis connection was lost; a later iteration will reconnect.");
             }
         }
 
@@ -639,9 +706,13 @@ bool App::Solver::solve()
         K_hat->EliminateBC(
             displacement_essential_tdofs, Operator::DIAG_ONE);
 
-        // ponytail: GSSmoother is the low-memory baseline; replace it with a
-        // block preconditioner only if the paper-default residual gate fails.
+        // ponytail: Jacobi keeps CUDA data on-device; use a physics block
+        // preconditioner only if its measured iteration count is excessive.
+#if METAMATERIAL_USE_CUDA
+        DSmoother K_hat_preconditioner(*K_hat);
+#else
         GSSmoother K_hat_preconditioner(*K_hat);
+#endif
         FGMRESSolver K_hat_solver;
         K_hat_solver.SetPreconditioner(K_hat_preconditioner);
         K_hat_solver.SetOperator(*K_hat);
@@ -653,7 +724,6 @@ bool App::Solver::solve()
         K_hat_solver.SetPrintLevel(-1);
 
         const int state_size = M->Height();
-        const int pressure_size = scalar_fes->GetVSize();
         const int time_steps = result.timeSteps;
         const double load_scale =
             2.0 / (physics->rho_a * physics->c_a);
@@ -662,6 +732,7 @@ bool App::Solver::solve()
                 + (reference_analysis ? "empty-duct reference" : "designed duct")
                 + " transient (" + std::to_string(state_size) + " unknowns, "
                 + std::to_string(time_steps) + " time steps).");
+        const auto transient_started_at = std::chrono::steady_clock::now();
 
         Vector v(state_size);
         Vector v_dot(state_size);
@@ -672,26 +743,34 @@ bool App::Solver::solve()
 
         Vector h(state_size);
         h = 0.0;
-        Vector pressure_h(h.GetData() + pressure_offset, pressure_size);
-        pressure_h.Add(
-            load_scale * source_pressure_derivative[0], inlet_load);
+        h.Add(load_scale * source_pressure_derivative[0], system_inlet_load);
         // The load is not zero: only the clamped displacement rows are.
         h.SetSubVector(displacement_essential_tdofs, 0.0);
 
         // Paper Eq. (21): M v_ddot^0 = h^0.
-        SparseMatrix M_system(*M);
-        M_system.EliminateBC(
+        auto M_system = std::make_unique<SparseMatrix>(*M);
+        M_system->EliminateBC(
             displacement_essential_tdofs, Operator::DIAG_ONE);
-        GSSmoother M_preconditioner(M_system);
+#if METAMATERIAL_USE_CUDA
+        DSmoother M_preconditioner(*M_system);
+#else
+        GSSmoother M_preconditioner(*M_system);
+#endif
         FGMRESSolver M_solver;
         M_solver.SetPreconditioner(M_preconditioner);
-        M_solver.SetOperator(M_system);
+        M_solver.SetOperator(*M_system);
         M_solver.SetKDim(50);
         M_solver.SetRelTol(1.0e-10);
         M_solver.SetAbsTol(1.0e-12);
         M_solver.SetMaxIter(1500);
         M_solver.SetPrintLevel(-1);
         M_solver.Mult(h, v_ddot);
+        performance_data.forwardFgmresIterations +=
+            M_solver.GetNumIterations();
+        ++performance_data.forwardFgmresSolves;
+        performance_data.maximumForwardFgmresIterations = std::max(
+            performance_data.maximumForwardFgmresIterations,
+            M_solver.GetNumIterations());
         if (!M_solver.GetConverged()) {
             std::ostringstream message;
             message << "The initial-acceleration solve did not converge: "
@@ -704,7 +783,7 @@ bool App::Solver::solve()
         v_ddot.SetSubVector(displacement_essential_tdofs, 0.0);
 
         Vector R_0(state_size);
-        M_system.Mult(v_ddot, R_0);
+        M_system->Mult(v_ddot, R_0);
         R_0 -= h;
         const double initial_residual = R_0.Norml2()
             / std::max(1.0, h.Norml2());
@@ -763,10 +842,8 @@ bool App::Solver::solve()
 
         for (int n = 1; n <= time_steps; ++n) {
             h = 0.0;
-            pressure_h.SetDataAndSize(
-                h.GetData() + pressure_offset, pressure_size);
-            pressure_h.Add(
-                load_scale * source_pressure_derivative[n], inlet_load);
+            h.Add(
+                load_scale * source_pressure_derivative[n], system_inlet_load);
 
             x_M = 0.0;
             x_M.Add(a_4, v_dot);
@@ -788,6 +865,12 @@ bool App::Solver::solve()
 
             v_n = v;
             K_hat_solver.Mult(h_hat, v_n);
+            performance_data.forwardFgmresIterations +=
+                K_hat_solver.GetNumIterations();
+            ++performance_data.forwardFgmresSolves;
+            performance_data.maximumForwardFgmresIterations = std::max(
+                performance_data.maximumForwardFgmresIterations,
+                K_hat_solver.GetNumIterations());
             if (!K_hat_solver.GetConverged()) {
                 std::ostringstream message;
                 message << "The Newmark linear solve failed at time step " << n
@@ -818,9 +901,7 @@ bool App::Solver::solve()
             v_dot_n.SetSubVector(displacement_essential_tdofs, 0.0);
             v_ddot_n.SetSubVector(displacement_essential_tdofs, 0.0);
 
-            Vector pressure(
-                v_n.GetData() + pressure_offset, pressure_size);
-            measured_outlet.push_back(outlet_functional * pressure);
+            measured_outlet.push_back(system_outlet_functional * v_n);
 
             M->Mult(v_ddot_n, y_M);
             C->Mult(v_dot_n, y_C);
@@ -926,6 +1007,17 @@ bool App::Solver::solve()
                 << maximum_fgmres_iterations << ".";
         log(LogLevel::Message, summary.str());
 
+        const double transient_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - transient_started_at).count();
+        if (reference_analysis) {
+            performance_data.referenceTransientSeconds = transient_seconds;
+        }
+        else {
+            performance_data.designedTransientSeconds = transient_seconds;
+            effective_matrix = std::move(K_hat);
+            initial_matrix = std::move(M_system);
+        }
+
         if (reference_analysis) {
             reference_ready = true;
             log(LogLevel::Message,
@@ -935,9 +1027,23 @@ bool App::Solver::solve()
 
     lset.design = designed_geometry;
     lset.enforceDesignConstraints();
+    const auto fourier_started_at = std::chrono::steady_clock::now();
     if (!postprocessFourierResponse()) {
         return fail(SolverStatus::Error);
     }
+    performance_data.fourierSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - fourier_started_at).count();
+    log(LogLevel::Message,
+        "Forward timings: reference/design/FFT = "
+            + std::to_string(performance_data.referenceTransientSeconds)
+            + " / "
+            + std::to_string(performance_data.designedTransientSeconds)
+            + " / " + std::to_string(performance_data.fourierSeconds)
+            + " s; "
+            + std::to_string(performance_data.forwardFgmresSolves)
+            + " FGMRES solves, "
+            + std::to_string(performance_data.forwardFgmresIterations)
+            + " total iterations.");
 
     result.success = 1;
     status.store(SolverStatus::Converged);
@@ -1033,7 +1139,11 @@ bool App::Solver::smooth_level_set(
         filter_rhs[cell] = cell_volumes[cell] * center_values[cell];
     }
 
+#if METAMATERIAL_USE_CUDA
+    DSmoother preconditioner(*filter_matrix);
+#else
     GSSmoother preconditioner(*filter_matrix);
+#endif
     CGSolver solver;
     solver.SetPreconditioner(preconditioner);
     solver.SetOperator(*filter_matrix);
@@ -1202,22 +1312,33 @@ bool App::Solver::postprocessFourierResponse()
     return true;
 }
 
-bool App::Solver::differentiateFrequencyResponse(
-    const std::vector<std::complex<double>>& spectrum_derivative,
-    Vector& design_gradient)
+bool App::Solver::differentiateFrequencyResponses(
+    const std::vector<std::complex<double>>& pass_spectrum_derivative,
+    const std::vector<std::complex<double>>& stop_spectrum_derivative,
+    Vector& pass_design_gradient,
+    Vector& stop_design_gradient)
 {
     const int time_steps = result.timeSteps;
     const int state_size = result.stateSize;
-    const int displacement_size = result.displacementSize;
-    const int pressure_size = result.pressureSize;
+    const std::size_t spectrum_size = frequency_response.outlet.size();
+    const bool has_pass = !pass_spectrum_derivative.empty();
+    const bool has_stop = !stop_spectrum_derivative.empty();
+    auto valid_derivative = [spectrum_size, time_steps](
+                                const std::vector<std::complex<double>>& value) {
+        return value.empty()
+            || (value.size() == spectrum_size
+                && value.size()
+                    == static_cast<std::size_t>(time_steps / 2 + 1));
+    };
     if (!mesh || mesh->Dimension() != 2 || !M || !C || !K
+        || !effective_matrix || !initial_matrix
         || !design_to_cell || !cell_to_level_set || !filter_matrix
         || time_steps <= 0 || state_size <= 0
+        || (!has_pass && !has_stop)
         || result.U.size() != static_cast<std::size_t>(time_steps + 1)
         || fft_window.size() != static_cast<std::size_t>(time_steps)
-        || spectrum_derivative.size() != frequency_response.outlet.size()
-        || spectrum_derivative.size()
-            != static_cast<std::size_t>(time_steps / 2 + 1)) {
+        || !valid_derivative(pass_spectrum_derivative)
+        || !valid_derivative(stop_spectrum_derivative)) {
         log(LogLevel::Error,
             "The forward history is incomplete for the discrete adjoint.");
         return false;
@@ -1233,41 +1354,54 @@ bool App::Solver::differentiateFrequencyResponse(
     // The complex input stores dPhi/dRe + i*dPhi/dIm. FFTW's unnormalized
     // C2R transform applies the transpose of the unnormalized forward R2C
     // transform after the interior bins are halved.
-    fftw_complex* fft_derivative = fftw_alloc_complex(
-        spectrum_derivative.size());
-    if (fft_derivative == nullptr) {
-        log(LogLevel::Error,
-            "FFTW could not allocate the adjoint frequency buffer.");
-        return false;
-    }
-    const bool has_nyquist_bin = time_steps % 2 == 0;
-    for (int bin = 0; bin < static_cast<int>(spectrum_derivative.size()); ++bin) {
-        const bool single_sided = bin == 0
-            || (has_nyquist_bin
-                && bin == static_cast<int>(spectrum_derivative.size()) - 1);
-        const double scale = single_sided ? 1.0 : 0.5;
-        fft_derivative[bin][0] = scale * spectrum_derivative[bin].real();
-        fft_derivative[bin][1] = single_sided
-            ? 0.0
-            : scale * spectrum_derivative[bin].imag();
-    }
-    std::vector<double> outlet_derivative(time_steps);
-    fftw_plan inverse_plan = fftw_plan_dft_c2r_1d(
-        time_steps,
-        fft_derivative,
-        outlet_derivative.data(),
-        FFTW_ESTIMATE);
-    if (inverse_plan == nullptr) {
+    auto inverse_transform = [this, time_steps](
+                                 const std::vector<std::complex<double>>& spectrum,
+                                 std::vector<double>& outlet_derivative) {
+        if (spectrum.empty()) {
+            outlet_derivative.clear();
+            return true;
+        }
+        fftw_complex* fft_derivative = fftw_alloc_complex(spectrum.size());
+        if (fft_derivative == nullptr) {
+            return false;
+        }
+        const bool has_nyquist_bin = time_steps % 2 == 0;
+        for (int bin = 0; bin < static_cast<int>(spectrum.size()); ++bin) {
+            const bool single_sided = bin == 0
+                || (has_nyquist_bin
+                    && bin == static_cast<int>(spectrum.size()) - 1);
+            const double scale = single_sided ? 1.0 : 0.5;
+            fft_derivative[bin][0] = scale * spectrum[bin].real();
+            fft_derivative[bin][1] = single_sided
+                ? 0.0
+                : scale * spectrum[bin].imag();
+        }
+        outlet_derivative.resize(time_steps);
+        fftw_plan inverse_plan = fftw_plan_dft_c2r_1d(
+            time_steps,
+            fft_derivative,
+            outlet_derivative.data(),
+            FFTW_ESTIMATE);
+        if (inverse_plan == nullptr) {
+            fftw_free(fft_derivative);
+            return false;
+        }
+        fftw_execute(inverse_plan);
+        fftw_destroy_plan(inverse_plan);
         fftw_free(fft_derivative);
-        log(LogLevel::Error,
-            "FFTW could not create the adjoint transform.");
+        for (int sample = 0; sample < time_steps; ++sample) {
+            outlet_derivative[sample] *= fft_window[sample];
+        }
+        return true;
+    };
+    std::vector<double> pass_outlet_derivative;
+    std::vector<double> stop_outlet_derivative;
+    if (!inverse_transform(
+            pass_spectrum_derivative, pass_outlet_derivative)
+        || !inverse_transform(
+            stop_spectrum_derivative, stop_outlet_derivative)) {
+        log(LogLevel::Error, "FFTW could not create the adjoint transform.");
         return false;
-    }
-    fftw_execute(inverse_plan);
-    fftw_destroy_plan(inverse_plan);
-    fftw_free(fft_derivative);
-    for (int sample = 0; sample < time_steps; ++sample) {
-        outlet_derivative[sample] *= fft_window[sample];
     }
 
     const double beta = settings.newmarkBeta;
@@ -1281,13 +1415,13 @@ bool App::Solver::differentiateFrequencyResponse(
     const double a_6 = 1.0 / (beta * settings.dt * settings.dt);
 
     if (!effective_matrix_transpose) {
-        std::unique_ptr<SparseMatrix> M_and_C(Add(a_6, *M, a_3, *C));
-        std::unique_ptr<SparseMatrix> K_hat(Add(1.0, *K, 1.0, *M_and_C));
-        K_hat->EliminateBC(
-            displacement_essential_tdofs, Operator::DIAG_ONE);
-        effective_matrix_transpose.reset(Transpose(*K_hat));
+        effective_matrix_transpose.reset(Transpose(*effective_matrix));
     }
+#if METAMATERIAL_USE_CUDA
+    DSmoother K_hat_preconditioner(*effective_matrix_transpose);
+#else
     GSSmoother K_hat_preconditioner(*effective_matrix_transpose);
+#endif
     FGMRESSolver K_hat_solver;
     K_hat_solver.SetPreconditioner(K_hat_preconditioner);
     K_hat_solver.SetOperator(*effective_matrix_transpose);
@@ -1298,92 +1432,14 @@ bool App::Solver::differentiateFrequencyResponse(
     K_hat_solver.SetMaxIter(1500);
     K_hat_solver.SetPrintLevel(-1);
 
-    adjoint_history.resize(time_steps + 1);
-    for (Vector& state : adjoint_history) {
-        state.SetSize(state_size);
-    }
-    auto& adjoint = adjoint_history;
-    Vector bar_v(state_size);
-    Vector bar_v_dot(state_size);
-    Vector bar_v_ddot(state_size);
-    bar_v = 0.0;
-    bar_v_dot = 0.0;
-    bar_v_ddot = 0.0;
-    Vector M_transpose_adjoint(state_size);
-    Vector C_transpose_adjoint(state_size);
-    Vector adjoint_residual(state_size);
-
-    for (int n = time_steps; n >= 1; --n) {
-        Vector pressure_bar(
-            bar_v.GetData() + pressure_offset, pressure_size);
-        pressure_bar.Add(outlet_derivative[n - 1], outlet_functional);
-
-        Vector previous_bar_v(state_size);
-        Vector previous_bar_v_dot(state_size);
-        Vector previous_bar_v_ddot(state_size);
-        previous_bar_v = 0.0;
-        previous_bar_v.Add(-a_3, bar_v_dot);
-        previous_bar_v.Add(-a_6, bar_v_ddot);
-        previous_bar_v_dot = 0.0;
-        previous_bar_v_dot.Add(a_1, bar_v_dot);
-        previous_bar_v_dot.Add(-a_4, bar_v_ddot);
-        previous_bar_v_ddot = 0.0;
-        previous_bar_v_ddot.Add(a_2, bar_v_dot);
-        previous_bar_v_ddot.Add(-a_5, bar_v_ddot);
-
-        bar_v.Add(a_3, bar_v_dot);
-        bar_v.Add(a_6, bar_v_ddot);
-        bar_v.SetSubVector(displacement_essential_tdofs, 0.0);
-
-        adjoint[n].SetSize(state_size);
-        if (n == time_steps) {
-            adjoint[n] = 0.0;
-        }
-        else {
-            adjoint[n] = adjoint[n + 1];
-        }
-        K_hat_solver.Mult(bar_v, adjoint[n]);
-        effective_matrix_transpose->Mult(adjoint[n], adjoint_residual);
-        adjoint_residual -= bar_v;
-        const double relative_adjoint_residual = adjoint_residual.Norml2()
-            / std::max(1.0, bar_v.Norml2());
-        if (!K_hat_solver.GetConverged()
-            || !std::isfinite(relative_adjoint_residual)
-            || relative_adjoint_residual > 1.0e-9) {
-            std::ostringstream message;
-            message << "The Newmark adjoint residual gate failed at time step "
-                    << n << ": physical=" << std::scientific
-                    << relative_adjoint_residual << ", FGMRES="
-                    << K_hat_solver.GetFinalRelNorm() << ", iterations="
-                    << K_hat_solver.GetNumIterations() << ", converged="
-                    << (K_hat_solver.GetConverged() ? "yes" : "no")
-                    << " (limit 1.000000e-09).";
-            log(LogLevel::Error, message.str());
-            return false;
-        }
-        adjoint[n].SetSubVector(displacement_essential_tdofs, 0.0);
-
-        M->MultTranspose(adjoint[n], M_transpose_adjoint);
-        C->MultTranspose(adjoint[n], C_transpose_adjoint);
-        previous_bar_v.Add(a_6, M_transpose_adjoint);
-        previous_bar_v.Add(a_3, C_transpose_adjoint);
-        previous_bar_v_dot.Add(a_4, M_transpose_adjoint);
-        previous_bar_v_dot.Add(-a_1, C_transpose_adjoint);
-        previous_bar_v_ddot.Add(a_5, M_transpose_adjoint);
-        previous_bar_v_ddot.Add(-a_2, C_transpose_adjoint);
-
-        bar_v = previous_bar_v;
-        bar_v_dot = previous_bar_v_dot;
-        bar_v_ddot = previous_bar_v_ddot;
-    }
-
     if (!initial_matrix_transpose) {
-        SparseMatrix initial_matrix(*M);
-        initial_matrix.EliminateBC(
-            displacement_essential_tdofs, Operator::DIAG_ONE);
-        initial_matrix_transpose.reset(Transpose(initial_matrix));
+        initial_matrix_transpose.reset(Transpose(*initial_matrix));
     }
+#if METAMATERIAL_USE_CUDA
+    DSmoother initial_preconditioner(*initial_matrix_transpose);
+#else
     GSSmoother initial_preconditioner(*initial_matrix_transpose);
+#endif
     FGMRESSolver initial_solver;
     initial_solver.SetPreconditioner(initial_preconditioner);
     initial_solver.SetOperator(*initial_matrix_transpose);
@@ -1392,29 +1448,150 @@ bool App::Solver::differentiateFrequencyResponse(
     initial_solver.SetAbsTol(1.0e-12);
     initial_solver.SetMaxIter(1500);
     initial_solver.SetPrintLevel(-1);
-    Vector initial_adjoint(state_size);
-    initial_adjoint = 0.0;
-    bar_v_ddot.SetSubVector(displacement_essential_tdofs, 0.0);
-    initial_solver.Mult(bar_v_ddot, initial_adjoint);
-    initial_matrix_transpose->Mult(initial_adjoint, adjoint_residual);
-    adjoint_residual -= bar_v_ddot;
-    const double initial_adjoint_residual = adjoint_residual.Norml2()
-        / std::max(1.0, bar_v_ddot.Norml2());
-    if (!initial_solver.GetConverged()
-        || !std::isfinite(initial_adjoint_residual)
-        || initial_adjoint_residual > 1.0e-9) {
-        std::ostringstream message;
-        message << "The initial-acceleration adjoint residual gate failed: "
-                << "physical=" << std::scientific << initial_adjoint_residual
-                << ", FGMRES=" << initial_solver.GetFinalRelNorm()
-                << ", iterations=" << initial_solver.GetNumIterations()
-                << ", converged="
-                << (initial_solver.GetConverged() ? "yes" : "no")
-                << " (limit 1.000000e-09).";
-        log(LogLevel::Error, message.str());
+
+    performance_data.passAdjointSeconds = 0.0;
+    performance_data.stopAdjointSeconds = 0.0;
+    performance_data.adjointFgmresIterations = 0;
+    performance_data.adjointFgmresSolves = 0;
+    performance_data.maximumAdjointFgmresIterations = 0;
+    auto solve_adjoint = [&](const char* objective_name,
+                             const std::vector<double>& outlet_derivative,
+                             std::vector<Vector>& adjoint,
+                             Vector& initial_adjoint,
+                             double& elapsed_seconds) {
+        const auto started_at = std::chrono::steady_clock::now();
+        adjoint.resize(time_steps + 1);
+        for (Vector& state : adjoint) {
+            state.SetSize(state_size);
+        }
+        adjoint[0] = 0.0;
+
+        Vector bar_v(state_size);
+        Vector bar_v_dot(state_size);
+        Vector bar_v_ddot(state_size);
+        Vector previous_bar_v(state_size);
+        Vector previous_bar_v_dot(state_size);
+        Vector previous_bar_v_ddot(state_size);
+        Vector M_transpose_adjoint(state_size);
+        Vector C_transpose_adjoint(state_size);
+        Vector adjoint_residual(state_size);
+        bar_v = 0.0;
+        bar_v_dot = 0.0;
+        bar_v_ddot = 0.0;
+
+        for (int n = time_steps; n >= 1; --n) {
+            bar_v.Add(
+                outlet_derivative[n - 1], system_outlet_functional);
+
+            previous_bar_v = 0.0;
+            previous_bar_v.Add(-a_3, bar_v_dot);
+            previous_bar_v.Add(-a_6, bar_v_ddot);
+            previous_bar_v_dot = 0.0;
+            previous_bar_v_dot.Add(a_1, bar_v_dot);
+            previous_bar_v_dot.Add(-a_4, bar_v_ddot);
+            previous_bar_v_ddot = 0.0;
+            previous_bar_v_ddot.Add(a_2, bar_v_dot);
+            previous_bar_v_ddot.Add(-a_5, bar_v_ddot);
+
+            bar_v.Add(a_3, bar_v_dot);
+            bar_v.Add(a_6, bar_v_ddot);
+            bar_v.SetSubVector(displacement_essential_tdofs, 0.0);
+
+            if (n == time_steps) {
+                adjoint[n] = 0.0;
+            }
+            else {
+                adjoint[n] = adjoint[n + 1];
+            }
+            K_hat_solver.Mult(bar_v, adjoint[n]);
+            performance_data.adjointFgmresIterations +=
+                K_hat_solver.GetNumIterations();
+            ++performance_data.adjointFgmresSolves;
+            performance_data.maximumAdjointFgmresIterations = std::max(
+                performance_data.maximumAdjointFgmresIterations,
+                K_hat_solver.GetNumIterations());
+            effective_matrix_transpose->Mult(adjoint[n], adjoint_residual);
+            adjoint_residual -= bar_v;
+            const double relative_adjoint_residual = adjoint_residual.Norml2()
+                / std::max(1.0, bar_v.Norml2());
+            if (!K_hat_solver.GetConverged()
+                || !std::isfinite(relative_adjoint_residual)
+                || relative_adjoint_residual > 1.0e-9) {
+                std::ostringstream message;
+                message << "The " << objective_name
+                        << " Newmark adjoint residual gate failed at time step "
+                        << n << ": physical=" << std::scientific
+                        << relative_adjoint_residual << ", FGMRES="
+                        << K_hat_solver.GetFinalRelNorm() << ", iterations="
+                        << K_hat_solver.GetNumIterations() << ", converged="
+                        << (K_hat_solver.GetConverged() ? "yes" : "no")
+                        << " (limit 1.000000e-09).";
+                log(LogLevel::Error, message.str());
+                return false;
+            }
+            adjoint[n].SetSubVector(displacement_essential_tdofs, 0.0);
+
+            M->MultTranspose(adjoint[n], M_transpose_adjoint);
+            C->MultTranspose(adjoint[n], C_transpose_adjoint);
+            previous_bar_v.Add(a_6, M_transpose_adjoint);
+            previous_bar_v.Add(a_3, C_transpose_adjoint);
+            previous_bar_v_dot.Add(a_4, M_transpose_adjoint);
+            previous_bar_v_dot.Add(-a_1, C_transpose_adjoint);
+            previous_bar_v_ddot.Add(a_5, M_transpose_adjoint);
+            previous_bar_v_ddot.Add(-a_2, C_transpose_adjoint);
+
+            bar_v = previous_bar_v;
+            bar_v_dot = previous_bar_v_dot;
+            bar_v_ddot = previous_bar_v_ddot;
+        }
+
+        initial_adjoint.SetSize(state_size);
+        initial_adjoint = 0.0;
+        bar_v_ddot.SetSubVector(displacement_essential_tdofs, 0.0);
+        initial_solver.Mult(bar_v_ddot, initial_adjoint);
+        performance_data.adjointFgmresIterations +=
+            initial_solver.GetNumIterations();
+        ++performance_data.adjointFgmresSolves;
+        performance_data.maximumAdjointFgmresIterations = std::max(
+            performance_data.maximumAdjointFgmresIterations,
+            initial_solver.GetNumIterations());
+        initial_matrix_transpose->Mult(initial_adjoint, adjoint_residual);
+        adjoint_residual -= bar_v_ddot;
+        const double initial_adjoint_residual = adjoint_residual.Norml2()
+            / std::max(1.0, bar_v_ddot.Norml2());
+        if (!initial_solver.GetConverged()
+            || !std::isfinite(initial_adjoint_residual)
+            || initial_adjoint_residual > 1.0e-9) {
+            std::ostringstream message;
+            message << "The " << objective_name
+                    << " initial-acceleration adjoint residual gate failed: "
+                    << "physical=" << std::scientific
+                    << initial_adjoint_residual << ", FGMRES="
+                    << initial_solver.GetFinalRelNorm() << ", iterations="
+                    << initial_solver.GetNumIterations() << ", converged="
+                    << (initial_solver.GetConverged() ? "yes" : "no")
+                    << " (limit 1.000000e-09).";
+            log(LogLevel::Error, message.str());
+            return false;
+        }
+        initial_adjoint.SetSubVector(displacement_essential_tdofs, 0.0);
+        elapsed_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started_at).count();
+        return true;
+    };
+
+    Vector pass_initial_adjoint;
+    Vector stop_initial_adjoint;
+    if (has_pass && !solve_adjoint(
+            "pass-band", pass_outlet_derivative, pass_adjoint_history,
+            pass_initial_adjoint, performance_data.passAdjointSeconds)) {
         return false;
     }
-    initial_adjoint.SetSubVector(displacement_essential_tdofs, 0.0);
+    if (has_stop && !solve_adjoint(
+            "stop-band", stop_outlet_derivative, stop_adjoint_history,
+            stop_initial_adjoint, performance_data.stopAdjointSeconds)) {
+        return false;
+    }
 
     const auto* physics =
         std::get_if<VibroacousticSettings>(&settings.physics);
@@ -1428,33 +1605,6 @@ bool App::Solver::differentiateFrequencyResponse(
         / (1.0 - physics->poisson_ratio * physics->poisson_ratio);
     const double mu = physics->youngs_modulus
         / (2.0 * (1.0 + physics->poisson_ratio));
-    ConstantCoefficient solid_density(physics->rho_s);
-    ConstantCoefficient solid_lambda(lambda);
-    ConstantCoefficient solid_mu(mu);
-    ConstantCoefficient acoustic_mass(
-        1.0 / (physics->rho_a * physics->c_a * physics->c_a));
-    ConstantCoefficient acoustic_stiffness(1.0 / physics->rho_a);
-    ImplicitDomainIntegrator Muu_integrator(
-        std::make_unique<VectorMassIntegrator>(solid_density),
-        *lset.phi, cut_integration_order, level_set_order,
-        physics->epsilon, true);
-    ImplicitDomainIntegrator Kuu_integrator(
-        std::make_unique<ElasticityIntegrator>(solid_lambda, solid_mu),
-        *lset.phi, cut_integration_order, level_set_order,
-        physics->epsilon, true);
-    ImplicitDomainIntegrator Mpp_integrator(
-        std::make_unique<MassIntegrator>(acoustic_mass),
-        *lset.phi, cut_integration_order, level_set_order,
-        physics->epsilon, false);
-    ImplicitDomainIntegrator Kpp_integrator(
-        std::make_unique<DiffusionIntegrator>(acoustic_stiffness),
-        *lset.phi, cut_integration_order, level_set_order,
-        physics->epsilon, false);
-    ImplicitSurfaceNormalIntegrator Kup_integrator(
-        *lset.phi, cut_integration_order, level_set_order, -1.0, false);
-    ImplicitSurfaceNormalIntegrator Mpu_integrator(
-        *lset.phi, cut_integration_order, level_set_order, 1.0, true);
-
     const double omega_1 = 2.0 * std::acos(-1.0) * physics->f1;
     const double omega_2 = 2.0 * std::acos(-1.0) * physics->f2;
     const double alpha_d = 2.0 * physics->zeta * omega_1 * omega_2
@@ -1469,28 +1619,122 @@ bool App::Solver::differentiateFrequencyResponse(
     for (int i = 0; i < lset.activeDesignDofs.Size(); ++i) {
         active[lset.activeDesignDofs[i]] = 1;
     }
-    Vector physical_gradient(level_set_fes->GetTrueVSize());
-    physical_gradient = 0.0;
-    Array<int> phi_dofs;
-    Array<int> displacement_dofs;
-    Array<int> pressure_dofs;
-    Vector matrix_product;
-    auto contract = [&matrix_product](
-                        const Vector& left,
-                        const DenseMatrix& matrix,
-                        const Vector& right) {
-        matrix_product.SetSize(matrix.Height());
-        matrix.Mult(right, matrix_product);
-        return left * matrix_product;
-    };
-    auto difference = [inverse_perturbation](
-                          DenseMatrix& plus,
-                          const DenseMatrix& minus) {
-        plus -= minus;
-        plus *= inverse_perturbation;
-    };
+    const int level_set_size = level_set_fes->GetTrueVSize();
+    Vector pass_physical_gradient(level_set_size);
+    Vector stop_physical_gradient(level_set_size);
+    pass_physical_gradient.UseDevice(false);
+    stop_physical_gradient.UseDevice(false);
+    pass_physical_gradient = 0.0;
+    stop_physical_gradient = 0.0;
 
-    for (int element = 0; element < mesh->GetNE(); ++element) {
+    std::vector<const real_t*> forward_state_data(result.U.size());
+    for (std::size_t state = 0; state < result.U.size(); ++state) {
+        forward_state_data[state] = result.U[state].HostRead();
+    }
+    std::vector<const real_t*> pass_adjoint_data;
+    std::vector<const real_t*> stop_adjoint_data;
+    if (has_pass) {
+        pass_adjoint_data.resize(pass_adjoint_history.size());
+        for (std::size_t state = 0; state < pass_adjoint_history.size(); ++state) {
+            pass_adjoint_data[state] = pass_adjoint_history[state].HostRead();
+        }
+    }
+    if (has_stop) {
+        stop_adjoint_data.resize(stop_adjoint_history.size());
+        for (std::size_t state = 0; state < stop_adjoint_history.size(); ++state) {
+            stop_adjoint_data[state] = stop_adjoint_history[state].HostRead();
+        }
+    }
+    const real_t* pass_initial_data = has_pass
+        ? pass_initial_adjoint.HostRead() : nullptr;
+    const real_t* stop_initial_data = has_stop
+        ? stop_initial_adjoint.HostRead() : nullptr;
+    const real_t* phi_data = lset.phi->HostRead();
+
+    int cut_element_count = 0;
+    int differentiated_dof_count = 0;
+    const auto differentiation_started_at = std::chrono::steady_clock::now();
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+    {
+        GridFunction thread_phi(level_set_fes.get());
+        thread_phi.UseDevice(false);
+        std::copy(
+            phi_data, phi_data + lset.phi->Size(), thread_phi.HostWrite());
+        ConstantCoefficient solid_density(physics->rho_s);
+        ConstantCoefficient solid_lambda(lambda);
+        ConstantCoefficient solid_mu(mu);
+        ConstantCoefficient acoustic_mass(
+            1.0 / (physics->rho_a * physics->c_a * physics->c_a));
+        ConstantCoefficient acoustic_stiffness(1.0 / physics->rho_a);
+        ImplicitDomainIntegrator Muu_integrator(
+            std::make_unique<VectorMassIntegrator>(solid_density),
+            thread_phi, cut_integration_order, level_set_order,
+            physics->epsilon, true);
+        ImplicitDomainIntegrator Kuu_integrator(
+            std::make_unique<ElasticityIntegrator>(solid_lambda, solid_mu),
+            thread_phi, cut_integration_order, level_set_order,
+            physics->epsilon, true);
+        ImplicitDomainIntegrator Mpp_integrator(
+            std::make_unique<MassIntegrator>(acoustic_mass),
+            thread_phi, cut_integration_order, level_set_order,
+            physics->epsilon, false);
+        ImplicitDomainIntegrator Kpp_integrator(
+            std::make_unique<DiffusionIntegrator>(acoustic_stiffness),
+            thread_phi, cut_integration_order, level_set_order,
+            physics->epsilon, false);
+        ImplicitSurfaceNormalIntegrator Kup_integrator(
+            thread_phi, cut_integration_order, level_set_order, -1.0, false);
+        ImplicitSurfaceNormalIntegrator Mpu_integrator(
+            thread_phi, cut_integration_order, level_set_order, 1.0, true);
+
+        Vector thread_pass_gradient(level_set_size);
+        Vector thread_stop_gradient(level_set_size);
+        thread_pass_gradient.UseDevice(false);
+        thread_stop_gradient.UseDevice(false);
+        thread_pass_gradient = 0.0;
+        thread_stop_gradient = 0.0;
+        int thread_cut_elements = 0;
+        int thread_differentiated_dofs = 0;
+        Array<int> phi_dofs;
+        Array<int> displacement_dofs;
+        Array<int> pressure_dofs;
+        Vector matrix_product;
+        matrix_product.UseDevice(false);
+        IsoparametricTransformation transformation;
+        auto contract = [&matrix_product](
+                            const Vector& left,
+                            const DenseMatrix& matrix,
+                            const Vector& right) {
+            matrix_product.SetSize(matrix.Height());
+            matrix.Mult(right, matrix_product);
+            return left * matrix_product;
+        };
+        auto difference = [inverse_perturbation](
+                              DenseMatrix& plus,
+                              const DenseMatrix& minus) {
+            plus -= minus;
+            plus *= inverse_perturbation;
+        };
+        auto gather = [](const real_t* source,
+                         const Array<int>& dofs,
+                         Vector& values,
+                         int offset = 0) {
+            values.SetSize(dofs.Size());
+            for (int i = 0; i < dofs.Size(); ++i) {
+                const int encoded = dofs[i];
+                const int dof = encoded >= 0 ? encoded : -1 - encoded;
+                values[i] = encoded >= 0
+                    ? source[offset + dof]
+                    : -source[offset + dof];
+            }
+        };
+
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic)
+#endif
+        for (int element = 0; element < mesh->GetNE(); ++element) {
         if (mesh->GetAttribute(element)
             != static_cast<int>(DomainAttribute::design)) {
             continue;
@@ -1499,16 +1743,16 @@ bool App::Solver::differentiateFrequencyResponse(
         double minimum_phi = std::numeric_limits<double>::max();
         double maximum_phi = std::numeric_limits<double>::lowest();
         for (int dof = 0; dof < phi_dofs.Size(); ++dof) {
-            minimum_phi = std::min(minimum_phi, (*lset.phi)[phi_dofs[dof]]);
-            maximum_phi = std::max(maximum_phi, (*lset.phi)[phi_dofs[dof]]);
+            minimum_phi = std::min(minimum_phi, thread_phi[phi_dofs[dof]]);
+            maximum_phi = std::max(maximum_phi, thread_phi[phi_dofs[dof]]);
         }
         if (minimum_phi > perturbation || maximum_phi < -perturbation) {
             continue;
         }
+        ++thread_cut_elements;
         displacement_fes->GetElementVDofs(element, displacement_dofs);
         scalar_fes->GetElementDofs(element, pressure_dofs);
-        ElementTransformation* transformation =
-            mesh->GetElementTransformation(element);
+        mesh->GetElementTransformation(element, &transformation);
         const FiniteElement& scalar_element = *scalar_fes->GetFE(element);
         const FiniteElement& displacement_element =
             *displacement_fes->GetFE(element);
@@ -1523,44 +1767,45 @@ bool App::Solver::differentiateFrequencyResponse(
             if (active[phi_dof] == 0) {
                 continue;
             }
-            const double original_phi = (*lset.phi)[phi_dof];
+            ++thread_differentiated_dofs;
+            const double original_phi = thread_phi[phi_dof];
 
             DenseMatrix Muu_plus, Kuu_plus, Mpp_plus, Kpp_plus;
             DenseMatrix Kup_plus, Mpu_plus;
-            (*lset.phi)[phi_dof] = original_phi + perturbation;
+            thread_phi[phi_dof] = original_phi + perturbation;
             Muu_integrator.AssembleElementMatrix(
-                displacement_element, *transformation, Muu_plus);
+                displacement_element, transformation, Muu_plus);
             Kuu_integrator.AssembleElementMatrix(
-                displacement_element, *transformation, Kuu_plus);
+                displacement_element, transformation, Kuu_plus);
             Mpp_integrator.AssembleElementMatrix(
-                scalar_element, *transformation, Mpp_plus);
+                scalar_element, transformation, Mpp_plus);
             Kpp_integrator.AssembleElementMatrix(
-                scalar_element, *transformation, Kpp_plus);
+                scalar_element, transformation, Kpp_plus);
             Kup_integrator.AssembleElementMatrix2(
                 scalar_element, displacement_element,
-                *transformation, Kup_plus);
+                transformation, Kup_plus);
             Mpu_integrator.AssembleElementMatrix2(
                 displacement_element, scalar_element,
-                *transformation, Mpu_plus);
+                transformation, Mpu_plus);
 
             DenseMatrix Muu_minus, Kuu_minus, Mpp_minus, Kpp_minus;
             DenseMatrix Kup_minus, Mpu_minus;
-            (*lset.phi)[phi_dof] = original_phi - perturbation;
+            thread_phi[phi_dof] = original_phi - perturbation;
             Muu_integrator.AssembleElementMatrix(
-                displacement_element, *transformation, Muu_minus);
+                displacement_element, transformation, Muu_minus);
             Kuu_integrator.AssembleElementMatrix(
-                displacement_element, *transformation, Kuu_minus);
+                displacement_element, transformation, Kuu_minus);
             Mpp_integrator.AssembleElementMatrix(
-                scalar_element, *transformation, Mpp_minus);
+                scalar_element, transformation, Mpp_minus);
             Kpp_integrator.AssembleElementMatrix(
-                scalar_element, *transformation, Kpp_minus);
+                scalar_element, transformation, Kpp_minus);
             Kup_integrator.AssembleElementMatrix2(
                 scalar_element, displacement_element,
-                *transformation, Kup_minus);
+                transformation, Kup_minus);
             Mpu_integrator.AssembleElementMatrix2(
                 displacement_element, scalar_element,
-                *transformation, Mpu_minus);
-            (*lset.phi)[phi_dof] = original_phi;
+                transformation, Mpu_minus);
+            thread_phi[phi_dof] = original_phi;
 
             difference(Muu_plus, Muu_minus);
             difference(Kuu_plus, Kuu_minus);
@@ -1570,44 +1815,61 @@ bool App::Solver::differentiateFrequencyResponse(
             difference(Mpu_plus, Mpu_minus);
 
             Vector initial_u, initial_p, acceleration_u, acceleration_p;
-            initial_adjoint.GetSubVector(displacement_dofs, initial_u);
-            initial_adjoint.GetSubVector(pressure_state_dofs, initial_p);
-            Vector initial_state(
-                result.U[0].GetData() + 2 * state_size, state_size);
-            initial_state.GetSubVector(displacement_dofs, acceleration_u);
-            initial_state.GetSubVector(pressure_state_dofs, acceleration_p);
-            double sensitivity = -contract(
-                initial_u, Muu_plus, acceleration_u);
-            sensitivity -= contract(initial_p, Mpu_plus, acceleration_u);
-            sensitivity -= contract(initial_p, Mpp_plus, acceleration_p);
+            initial_u.UseDevice(false);
+            initial_p.UseDevice(false);
+            acceleration_u.UseDevice(false);
+            acceleration_p.UseDevice(false);
+            gather(forward_state_data[0], displacement_dofs,
+                acceleration_u, 2 * state_size);
+            gather(forward_state_data[0], pressure_state_dofs,
+                acceleration_p, 2 * state_size);
+            auto initial_sensitivity = [&](const real_t* initial_data) {
+                gather(initial_data, displacement_dofs, initial_u);
+                gather(initial_data, pressure_state_dofs, initial_p);
+                double sensitivity = -contract(
+                    initial_u, Muu_plus, acceleration_u);
+                sensitivity -= contract(initial_p, Mpu_plus, acceleration_u);
+                sensitivity -= contract(initial_p, Mpp_plus, acceleration_p);
+                return sensitivity;
+            };
+            double pass_sensitivity = has_pass
+                ? initial_sensitivity(pass_initial_data) : 0.0;
+            double stop_sensitivity = has_stop
+                ? initial_sensitivity(stop_initial_data) : 0.0;
 
             Vector lambda_u, lambda_p;
             Vector v_u, v_p, previous_v_u, previous_v_p;
             Vector previous_dot_u, previous_dot_p;
             Vector previous_ddot_u, previous_ddot_p;
             Vector mass_u, mass_p, damping_u;
+            lambda_u.UseDevice(false);
+            lambda_p.UseDevice(false);
+            v_u.UseDevice(false);
+            v_p.UseDevice(false);
+            previous_v_u.UseDevice(false);
+            previous_v_p.UseDevice(false);
+            previous_dot_u.UseDevice(false);
+            previous_dot_p.UseDevice(false);
+            previous_ddot_u.UseDevice(false);
+            previous_ddot_p.UseDevice(false);
+            mass_u.UseDevice(false);
+            mass_p.UseDevice(false);
+            damping_u.UseDevice(false);
             for (int n = 1; n <= time_steps; ++n) {
-                adjoint[n].GetSubVector(displacement_dofs, lambda_u);
-                adjoint[n].GetSubVector(pressure_state_dofs, lambda_p);
-
-                Vector state(
-                    result.U[n].GetData(), state_size);
-                Vector previous_state(
-                    result.U[n - 1].GetData(), state_size);
-                Vector previous_dot(
-                    result.U[n - 1].GetData() + state_size, state_size);
-                Vector previous_ddot(
-                    result.U[n - 1].GetData() + 2 * state_size, state_size);
-                state.GetSubVector(displacement_dofs, v_u);
-                state.GetSubVector(pressure_state_dofs, v_p);
-                previous_state.GetSubVector(displacement_dofs, previous_v_u);
-                previous_state.GetSubVector(pressure_state_dofs, previous_v_p);
-                previous_dot.GetSubVector(displacement_dofs, previous_dot_u);
-                previous_dot.GetSubVector(pressure_state_dofs, previous_dot_p);
-                previous_ddot.GetSubVector(
-                    displacement_dofs, previous_ddot_u);
-                previous_ddot.GetSubVector(
-                    pressure_state_dofs, previous_ddot_p);
+                gather(forward_state_data[n], displacement_dofs, v_u);
+                gather(forward_state_data[n], pressure_state_dofs, v_p);
+                gather(forward_state_data[n - 1], displacement_dofs,
+                    previous_v_u);
+                gather(forward_state_data[n - 1], pressure_state_dofs,
+                    previous_v_p);
+                gather(forward_state_data[n - 1], displacement_dofs,
+                    previous_dot_u, state_size);
+                gather(forward_state_data[n - 1], pressure_state_dofs,
+                    previous_dot_p, state_size);
+                gather(forward_state_data[n - 1], displacement_dofs,
+                    previous_ddot_u, 2 * state_size);
+                gather(forward_state_data[n - 1], pressure_state_dofs,
+                    previous_ddot_p, 2 * state_size);
 
                 mass_u.SetSize(previous_v_u.Size());
                 mass_u = 0.0;
@@ -1628,26 +1890,56 @@ bool App::Solver::differentiateFrequencyResponse(
                 damping_u.Add(a_3, previous_v_u);
                 damping_u.Add(-a_3, v_u);
 
-                sensitivity += contract(lambda_u, Muu_plus, mass_u);
-                sensitivity += contract(lambda_p, Mpu_plus, mass_u);
-                sensitivity += contract(lambda_p, Mpp_plus, mass_p);
-                sensitivity += alpha_d
-                    * contract(lambda_u, Muu_plus, damping_u);
-                sensitivity += beta_d
-                    * contract(lambda_u, Kuu_plus, damping_u);
-                sensitivity -= contract(lambda_u, Kuu_plus, v_u);
-                sensitivity -= contract(lambda_u, Kup_plus, v_p);
-                sensitivity -= contract(lambda_p, Kpp_plus, v_p);
+                auto accumulate_sensitivity = [&](const real_t* adjoint_data,
+                                                   double& sensitivity) {
+                    gather(adjoint_data, displacement_dofs, lambda_u);
+                    gather(adjoint_data, pressure_state_dofs, lambda_p);
+                    sensitivity += contract(lambda_u, Muu_plus, mass_u);
+                    sensitivity += contract(lambda_p, Mpu_plus, mass_u);
+                    sensitivity += contract(lambda_p, Mpp_plus, mass_p);
+                    sensitivity += alpha_d
+                        * contract(lambda_u, Muu_plus, damping_u);
+                    sensitivity += beta_d
+                        * contract(lambda_u, Kuu_plus, damping_u);
+                    sensitivity -= contract(lambda_u, Kuu_plus, v_u);
+                    sensitivity -= contract(lambda_u, Kup_plus, v_p);
+                    sensitivity -= contract(lambda_p, Kpp_plus, v_p);
+                };
+                if (has_pass) {
+                    accumulate_sensitivity(
+                        pass_adjoint_data[n], pass_sensitivity);
+                }
+                if (has_stop) {
+                    accumulate_sensitivity(
+                        stop_adjoint_data[n], stop_sensitivity);
+                }
             }
-            physical_gradient[phi_dof] += sensitivity;
+            thread_pass_gradient[phi_dof] += pass_sensitivity;
+            thread_stop_gradient[phi_dof] += stop_sensitivity;
         }
     }
 
+#ifdef _OPENMP
+#pragma omp critical
+#endif
+        {
+            pass_physical_gradient += thread_pass_gradient;
+            stop_physical_gradient += thread_stop_gradient;
+            cut_element_count += thread_cut_elements;
+            differentiated_dof_count += thread_differentiated_dofs;
+        }
+    }
+    performance_data.cutElements = cut_element_count;
+    performance_data.differentiatedDofs = differentiated_dof_count;
+    performance_data.cutDifferentiationSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - differentiation_started_at).count();
+
     // Reverse the paper's node -> cell -> finite-volume filter -> node map.
-    Vector filtered_gradient(cell_to_level_set->Width());
-    cell_to_level_set->MultTranspose(
-        physical_gradient, filtered_gradient);
+#if METAMATERIAL_USE_CUDA
+    DSmoother filter_preconditioner(*filter_matrix);
+#else
     GSSmoother filter_preconditioner(*filter_matrix);
+#endif
     CGSolver filter_solver;
     filter_solver.SetPreconditioner(filter_preconditioner);
     filter_solver.SetOperator(*filter_matrix);
@@ -1655,30 +1947,67 @@ bool App::Solver::differentiateFrequencyResponse(
     filter_solver.SetAbsTol(1.0e-12);
     filter_solver.SetMaxIter(1500);
     filter_solver.SetPrintLevel(-1);
-    Vector filter_adjoint(filtered_gradient.Size());
-    filter_adjoint = 0.0;
-    filter_solver.Mult(filtered_gradient, filter_adjoint);
-    if (!filter_solver.GetConverged()) {
-        std::ostringstream message;
-        message << "The adjoint PDE filter solve did not converge: "
-                << filter_solver.GetNumIterations()
-                << " CG iterations, relative residual " << std::scientific
-                << filter_solver.GetFinalRelNorm() << ".";
-        log(LogLevel::Error, message.str());
+    const auto filter_started_at = std::chrono::steady_clock::now();
+    auto reverse_filter = [&](const char* objective_name,
+                              bool active_objective,
+                              const Vector& physical_gradient,
+                              Vector& design_gradient) {
+        design_gradient.SetSize(design_to_cell->Width());
+        design_gradient = 0.0;
+        if (!active_objective) {
+            return true;
+        }
+        Vector filtered_gradient(cell_to_level_set->Width());
+        cell_to_level_set->MultTranspose(
+            physical_gradient, filtered_gradient);
+        Vector filter_adjoint(filtered_gradient.Size());
+        filter_adjoint = 0.0;
+        filter_solver.Mult(filtered_gradient, filter_adjoint);
+        if (!filter_solver.GetConverged()) {
+            std::ostringstream message;
+            message << "The " << objective_name
+                    << " adjoint PDE filter solve did not converge: "
+                    << filter_solver.GetNumIterations()
+                    << " CG iterations, relative residual " << std::scientific
+                    << filter_solver.GetFinalRelNorm() << ".";
+            log(LogLevel::Error, message.str());
+            return false;
+        }
+        Vector center_gradient(filter_adjoint.Size());
+        for (int cell = 0; cell < center_gradient.Size(); ++cell) {
+            center_gradient[cell] = cell_volumes[cell] * filter_adjoint[cell];
+        }
+        design_to_cell->MultTranspose(center_gradient, design_gradient);
+        design_gradient *= level_set_scale;
+        design_gradient.SetSubVectorComplement(lset.activeDesignDofs, 0.0);
+        if (design_gradient.CheckFinite() != 0) {
+            log(LogLevel::Error,
+                std::string("The ") + objective_name
+                    + " discrete-adjoint design gradient is non-finite.");
+            return false;
+        }
+        return true;
+    };
+    if (!reverse_filter(
+            "pass-band", has_pass, pass_physical_gradient,
+            pass_design_gradient)
+        || !reverse_filter(
+            "stop-band", has_stop, stop_physical_gradient,
+            stop_design_gradient)) {
         return false;
     }
-    Vector center_gradient(filter_adjoint.Size());
-    for (int cell = 0; cell < center_gradient.Size(); ++cell) {
-        center_gradient[cell] = cell_volumes[cell] * filter_adjoint[cell];
-    }
-    design_gradient.SetSize(design_to_cell->Width());
-    design_to_cell->MultTranspose(center_gradient, design_gradient);
-    design_gradient *= level_set_scale;
-    design_gradient.SetSubVectorComplement(lset.activeDesignDofs, 0.0);
-    if (design_gradient.CheckFinite() != 0) {
-        log(LogLevel::Error,
-            "The discrete-adjoint design gradient is non-finite.");
-        return false;
-    }
+    performance_data.filterAdjointSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - filter_started_at).count();
+    log(LogLevel::Message,
+        "Completed pass/stop adjoints in "
+            + std::to_string(performance_data.passAdjointSeconds) + " / "
+            + std::to_string(performance_data.stopAdjointSeconds)
+            + " s; differentiated "
+            + std::to_string(performance_data.differentiatedDofs)
+            + " local level-set DOFs across "
+            + std::to_string(performance_data.cutElements)
+            + " cut elements in "
+            + std::to_string(performance_data.cutDifferentiationSeconds)
+            + " s.");
     return true;
 }

@@ -18,6 +18,27 @@ namespace App {
         std::vector<unsigned char> valid;
     };
 
+    struct SolverPerformance {
+        double meshSetupSeconds = 0.0;
+        double levelSetSmoothingSeconds = 0.0;
+        double assemblySeconds = 0.0;
+        double referenceTransientSeconds = 0.0;
+        double designedTransientSeconds = 0.0;
+        double fourierSeconds = 0.0;
+        double passAdjointSeconds = 0.0;
+        double stopAdjointSeconds = 0.0;
+        double cutDifferentiationSeconds = 0.0;
+        double filterAdjointSeconds = 0.0;
+        long long forwardFgmresIterations = 0;
+        int forwardFgmresSolves = 0;
+        int maximumForwardFgmresIterations = 0;
+        long long adjointFgmresIterations = 0;
+        int adjointFgmresSolves = 0;
+        int maximumAdjointFgmresIterations = 0;
+        int cutElements = 0;
+        int differentiatedDofs = 0;
+    };
+
     class Solver {
 
     public:
@@ -35,9 +56,12 @@ namespace App {
         bool solve();
         SolverStatus get_status() const;
         const FrequencyResponse& frequencyResponse() const;
-        bool differentiateFrequencyResponse(
-            const std::vector<std::complex<double>>& spectrum_derivative,
-            mfem::Vector& design_gradient);
+        const SolverPerformance& performance() const;
+        bool differentiateFrequencyResponses(
+            const std::vector<std::complex<double>>& pass_spectrum_derivative,
+            const std::vector<std::complex<double>>& stop_spectrum_derivative,
+            mfem::Vector& pass_design_gradient,
+            mfem::Vector& stop_design_gradient);
 
 
 
@@ -66,13 +90,17 @@ namespace App {
         std::unique_ptr<mfem::SparseMatrix> M;
         std::unique_ptr<mfem::SparseMatrix> C;
         std::unique_ptr<mfem::SparseMatrix> K;
+        std::unique_ptr<mfem::SparseMatrix> effective_matrix;
         std::unique_ptr<mfem::SparseMatrix> effective_matrix_transpose;
+        std::unique_ptr<mfem::SparseMatrix> initial_matrix;
         std::unique_ptr<mfem::SparseMatrix> initial_matrix_transpose;
         std::unique_ptr<mfem::SparseMatrix> design_to_cell;
         std::unique_ptr<mfem::SparseMatrix> cell_to_level_set;
         std::unique_ptr<mfem::SparseMatrix> filter_matrix;
         mfem::Vector inlet_load;
         mfem::Vector outlet_functional;
+        mfem::Vector system_inlet_load;
+        mfem::Vector system_outlet_functional;
         mfem::DenseMatrix element_centers;
         mfem::Vector cell_volumes;
         mfem::Array<int> displacement_essential_tdofs;
@@ -81,10 +109,14 @@ namespace App {
         std::vector<double> outlet_pressure;
         std::vector<double> reference_outlet_pressure;
         std::vector<double> fft_window;
-        std::vector<mfem::Vector> adjoint_history;
+        std::vector<mfem::Vector> pass_adjoint_history;
+        std::vector<mfem::Vector> stop_adjoint_history;
         FrequencyResponse frequency_response;
+        SolverPerformance performance_data;
+        std::unique_ptr<mfem::socketstream> glvis_stream;
         double level_set_scale = 0.0;
         int pressure_offset = 0;
+        int glvis_connection_failures = 0;
         bool design_initialized = false;
         bool reference_ready = false;
         std::atomic<SolverStatus> status{SolverStatus::Idle};
@@ -92,6 +124,7 @@ namespace App {
         bool smooth_level_set(
             const mfem::GridFunction& level_set,
             mfem::GridFunction& smoothed_level_set);
+        bool bindToGlvis();
         bool postprocessFourierResponse();
 
 

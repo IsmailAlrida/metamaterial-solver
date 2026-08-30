@@ -5,6 +5,7 @@
 #include "optimizer.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <memory>
@@ -180,6 +181,7 @@ private:
         if (optimizer.cancel_requested.load()) {
             throw OptimizationCancelled{};
         }
+        const auto started_at = std::chrono::steady_clock::now();
 
         ParOptScalar* x;
         variables->getArray(&x);
@@ -218,6 +220,9 @@ private:
         gradients_ready = false;
         optimizer.pass_objective.store(objective.pass);
         optimizer.stop_objective.store(objective.stop);
+        optimizer.performance_data.forwardCallbackSeconds +=
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - started_at).count();
     }
 
     void differentiate()
@@ -225,18 +230,21 @@ private:
         if (gradients_ready) {
             return;
         }
-        if (objective.has_pass
-            && !optimizer.solver.differentiateFrequencyResponse(
-                objective.pass_spectrum_derivative, pass_gradient)) {
+        const auto started_at = std::chrono::steady_clock::now();
+        static const std::vector<std::complex<double>> no_derivative;
+        if (!optimizer.solver.differentiateFrequencyResponses(
+                objective.has_pass
+                    ? objective.pass_spectrum_derivative : no_derivative,
+                objective.has_stop
+                    ? objective.stop_spectrum_derivative : no_derivative,
+                pass_gradient,
+                stop_gradient)) {
             throw std::runtime_error(
-                "The pass-band discrete adjoint failed.");
+                "The pass/stop discrete adjoint failed.");
         }
-        if (objective.has_stop
-            && !optimizer.solver.differentiateFrequencyResponse(
-                objective.stop_spectrum_derivative, stop_gradient)) {
-            throw std::runtime_error(
-                "The stop-band discrete adjoint failed.");
-        }
+        optimizer.performance_data.gradientCallbackSeconds +=
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - started_at).count();
         gradients_ready = true;
     }
 
@@ -416,6 +424,7 @@ bool Optimizer::evaluateObjectives(ObjectiveEvaluation& objective) const
 
 bool Optimizer::optimize()
 {
+    performance_data = {};
     if (settings.maxIterations <= 0
         || settings.mmaInitialAsymptote < 0.0
         || settings.mmaInitialAsymptote > 1.0
@@ -498,7 +507,10 @@ bool Optimizer::optimize()
                 + " active design variables and "
                 + std::to_string(settings.maxIterations)
                 + " requested iterations.");
+        const auto paropt_started_at = std::chrono::steady_clock::now();
         optimizer->optimize();
+        performance_data.paroptSeconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - paropt_started_at).count();
 
         if (cancel_requested.load()) {
             status.store(OptimizerStatus::Cancelled);
@@ -587,6 +599,11 @@ double Optimizer::get_stop_objective() const
 double Optimizer::get_mma_bound() const
 {
     return mma_bound.load();
+}
+
+const OptimizerPerformance& Optimizer::performance() const
+{
+    return performance_data;
 }
 
 } // namespace App
