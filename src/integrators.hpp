@@ -54,10 +54,10 @@ public:
 
         mfem::GridFunctionCoefficient phi_coefficient(&phi);
         NegatedCoefficient negative_phi(phi_coefficient);
-        // Algoim integrates where its coefficient is negative.
+        // Algoim integrates where its coefficient is positive.
         mfem::Coefficient& cut_coefficient = positive
-            ? static_cast<mfem::Coefficient&>(negative_phi)
-            : static_cast<mfem::Coefficient&>(phi_coefficient);
+            ? static_cast<mfem::Coefficient&>(phi_coefficient)
+            : static_cast<mfem::Coefficient&>(negative_phi);
         mfem::AlgoimIntegrationRules integration_rules(
             integration_order, cut_coefficient, level_set_order);
         mfem::IntegrationRule cut_rule;

@@ -215,7 +215,7 @@ symmetric.
 
 The repository pins MFEM 4.9 and already enables Algoim in
 [`CMakeLists.txt`](../CMakeLists.txt). Start with the serial classes because
-the current `parallel-cpu` option enables OpenMP, not MPI:
+they expose the same finite-element concepts with less MPI bookkeeping:
 
 ```cpp
 mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(
