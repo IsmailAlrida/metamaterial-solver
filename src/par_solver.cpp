@@ -331,6 +331,7 @@ struct App::Solver::ParallelState {
     std::unique_ptr<HypreParMatrix> reference_M;
     std::unique_ptr<HypreParMatrix> reference_C;
     std::unique_ptr<HypreParMatrix> reference_K;
+    std::unique_ptr<HypreParMatrix> reference_effective_matrix;
     std::unique_ptr<HypreParMatrix> Muu;
     std::unique_ptr<HypreParMatrix> Cuu;
     std::unique_ptr<HypreParMatrix> Kuu;
@@ -348,6 +349,8 @@ struct App::Solver::ParallelState {
     std::unique_ptr<HypreParMatrix> initial_pressure;
     std::unique_ptr<HypreParMatrix> effective_displacement;
     std::unique_ptr<HypreParMatrix> effective_pressure;
+    std::unique_ptr<HypreParMatrix> reference_effective_displacement;
+    std::unique_ptr<HypreParMatrix> reference_effective_pressure;
     std::unique_ptr<MUMPSSolver> initial_mumps;
     std::unique_ptr<MUMPSSolver> effective_mumps;
     std::unique_ptr<HypreBoomerAMG> initial_u_amg;
@@ -361,6 +364,7 @@ struct App::Solver::ParallelState {
     Vector system_outlet_functional;
     Array<int> displacement_essential_tdofs;
     Array<int> active_design_dofs;
+    Array<int> true_to_serial_design_dofs;
     bool boundary_data_ready = false;
     bool reference_ready = false;
 };
@@ -549,6 +553,52 @@ bool App::Solver::setMeshParallelLocal()
                 parallel_state->mesh.get(),
                 parallel_state->collection.get(),
                 dim, Ordering::byVDIM);
+
+        parallel_state->true_to_serial_design_dofs.SetSize(
+            parallel_state->scalar_fes->GetTrueVSize());
+        parallel_state->true_to_serial_design_dofs = -1;
+        Array<int> local_dofs;
+        Array<int> serial_dofs;
+        int local_element = 0;
+        bool design_dof_map_ready = true;
+        for (int element = 0; element < mesh->GetNE(); ++element) {
+            if (parallel_state->partition[element] != rank) {
+                continue;
+            }
+            parallel_state->scalar_fes->GetElementDofs(
+                local_element++, local_dofs);
+            level_set_fes->GetElementDofs(element, serial_dofs);
+            if (local_dofs.Size() != serial_dofs.Size()) {
+                design_dof_map_ready = false;
+                break;
+            }
+            for (int i = 0; i < local_dofs.Size(); ++i) {
+                const int local_dof = local_dofs[i] >= 0
+                    ? local_dofs[i] : -1 - local_dofs[i];
+                const int serial_dof = serial_dofs[i] >= 0
+                    ? serial_dofs[i] : -1 - serial_dofs[i];
+                const int true_dof = parallel_state->scalar_fes
+                    ->GetLocalTDofNumber(local_dof);
+                if (true_dof >= 0) {
+                    int& mapped =
+                        parallel_state->true_to_serial_design_dofs[true_dof];
+                    design_dof_map_ready = design_dof_map_ready
+                        && (mapped < 0 || mapped == serial_dof);
+                    mapped = serial_dof;
+                }
+            }
+        }
+        design_dof_map_ready = design_dof_map_ready
+            && local_element == parallel_state->mesh->GetNE();
+        for (int i = 0;
+             i < parallel_state->true_to_serial_design_dofs.Size(); ++i) {
+            design_dof_map_ready = design_dof_map_ready
+                && parallel_state->true_to_serial_design_dofs[i] >= 0;
+        }
+        if (!all_succeeded(
+                parallel_state->comm, design_dof_map_ready)) {
+            all_ready = 0;
+        }
 
         Vector active_true_dofs(level_set_fes->GetTrueVSize());
         active_true_dofs = 0.0;
@@ -842,7 +892,49 @@ bool App::Solver::assembleSolutionSpaceParallelLocal()
     const real_t alpha_d = 2.0 * physics->zeta * omega_1 * omega_2
         / (omega_1 + omega_2);
     const real_t beta_d = 2.0 * physics->zeta / (omega_1 + omega_2);
-    state.Cuu.reset(Add(alpha_d, *state.Muu, beta_d, *state.Kuu));
+    const real_t beta = settings.newmarkBeta;
+    const real_t gamma = settings.newmarkGamma;
+    if (beta <= 0.0 || gamma < 0.5
+        || beta < 0.25 * std::pow(gamma + 0.5, 2.0)) {
+        if (state.rank == 0) {
+            log(LogLevel::Error,
+                "The Newmark parameters do not satisfy the stability bound.");
+        }
+        return false;
+    }
+    const real_t a_3 = gamma / (beta * settings.dt);
+    const real_t a_6 = 1.0 / (beta * settings.dt * settings.dt);
+
+    // Separately assembled Hypre matrices can have different off-process
+    // column maps. Assemble linear combinations as forms so this works for N ranks.
+    ConstantCoefficient damped_solid_density(alpha_d * physics->rho_s);
+    ConstantCoefficient damped_solid_lambda(beta_d * lambda);
+    ConstantCoefficient damped_solid_mu(beta_d * mu);
+    ConstantCoefficient damped_fictitious_solid_density(
+        physics->epsilon * alpha_d * physics->rho_s);
+    ConstantCoefficient damped_fictitious_solid_lambda(
+        physics->epsilon * beta_d * lambda);
+    ConstantCoefficient damped_fictitious_solid_mu(
+        physics->epsilon * beta_d * mu);
+    ParBilinearForm Cuu_form(state.displacement_fes.get());
+    Cuu_form.AddDomainIntegrator(new ImplicitDomainIntegrator(
+        std::make_unique<VectorMassIntegrator>(damped_solid_density),
+        *state.phi, cut_integration_order, level_set_order,
+        physics->epsilon, true), design_marker);
+    Cuu_form.AddDomainIntegrator(new ImplicitDomainIntegrator(
+        std::make_unique<ElasticityIntegrator>(
+            damped_solid_lambda, damped_solid_mu),
+        *state.phi, cut_integration_order, level_set_order,
+        physics->epsilon, true), design_marker);
+    Cuu_form.AddDomainIntegrator(new VectorMassIntegrator(
+        damped_fictitious_solid_density), fixed_air_marker);
+    Cuu_form.AddDomainIntegrator(new ElasticityIntegrator(
+        damped_fictitious_solid_lambda,
+        damped_fictitious_solid_mu), fixed_air_marker);
+    Cuu_form.Assemble();
+    Cuu_form.Finalize();
+    state.Cuu.reset(Cuu_form.ParallelAssemble());
+    write_mumps_diagnostic(state.rank, "event=matrix_complete matrix=Cuu");
 
     const int inlet_boundary = dim == 3
         ? static_cast<int>(CartesianBoundary3D::left)
@@ -850,14 +942,14 @@ bool App::Solver::assembleSolutionSpaceParallelLocal()
     const int outlet_boundary = dim == 3
         ? static_cast<int>(CartesianBoundary3D::right)
         : static_cast<int>(CartesianBoundary2D::right);
+    Array<int> absorbing_marker(state.mesh->bdr_attributes.Max());
+    absorbing_marker = 0;
+    absorbing_marker[inlet_boundary - 1] = 1;
+    absorbing_marker[outlet_boundary - 1] = 1;
+    ConstantCoefficient inverse_impedance(
+        1.0 / (physics->rho_a * physics->c_a));
     bool cpp_is_finite = true;
     if (!state.Cpp) {
-        Array<int> absorbing_marker(state.mesh->bdr_attributes.Max());
-        absorbing_marker = 0;
-        absorbing_marker[inlet_boundary - 1] = 1;
-        absorbing_marker[outlet_boundary - 1] = 1;
-        ConstantCoefficient inverse_impedance(
-            1.0 / (physics->rho_a * physics->c_a));
         ParBilinearForm Cpp_form(state.scalar_fes.get());
         Cpp_form.AddBoundaryIntegrator(
             new BoundaryMassIntegrator(inverse_impedance), absorbing_marker);
@@ -885,9 +977,89 @@ bool App::Solver::assembleSolutionSpaceParallelLocal()
     }
 
     state.M = block_matrix(state.Muu.get(), nullptr, Mpu.get(), state.Mpp.get());
+    write_mumps_diagnostic(state.rank, "event=matrix_complete matrix=M");
     state.C = block_matrix(state.Cuu.get(), nullptr, nullptr, state.Cpp.get());
+    write_mumps_diagnostic(state.rank, "event=matrix_complete matrix=C");
     state.K = block_matrix(state.Kuu.get(), Kup.get(), nullptr, state.Kpp.get());
+    write_mumps_diagnostic(state.rank, "event=matrix_complete matrix=K");
 
+    const real_t effective_mass_scale = a_6 + a_3 * alpha_d;
+    const real_t effective_stiffness_scale = 1.0 + a_3 * beta_d;
+    ConstantCoefficient effective_solid_density(
+        effective_mass_scale * physics->rho_s);
+    ConstantCoefficient effective_solid_lambda(
+        effective_stiffness_scale * lambda);
+    ConstantCoefficient effective_solid_mu(
+        effective_stiffness_scale * mu);
+    ConstantCoefficient effective_fictitious_solid_density(
+        physics->epsilon * effective_mass_scale * physics->rho_s);
+    ConstantCoefficient effective_fictitious_solid_lambda(
+        physics->epsilon * effective_stiffness_scale * lambda);
+    ConstantCoefficient effective_fictitious_solid_mu(
+        physics->epsilon * effective_stiffness_scale * mu);
+    ParBilinearForm effective_displacement_form(
+        state.displacement_fes.get());
+    effective_displacement_form.AddDomainIntegrator(
+        new ImplicitDomainIntegrator(
+            std::make_unique<VectorMassIntegrator>(effective_solid_density),
+            *state.phi, cut_integration_order, level_set_order,
+            physics->epsilon, true), design_marker);
+    effective_displacement_form.AddDomainIntegrator(
+        new ImplicitDomainIntegrator(
+            std::make_unique<ElasticityIntegrator>(
+                effective_solid_lambda, effective_solid_mu),
+            *state.phi, cut_integration_order, level_set_order,
+            physics->epsilon, true), design_marker);
+    effective_displacement_form.AddDomainIntegrator(
+        new VectorMassIntegrator(effective_fictitious_solid_density),
+        fixed_air_marker);
+    effective_displacement_form.AddDomainIntegrator(new ElasticityIntegrator(
+        effective_fictitious_solid_lambda,
+        effective_fictitious_solid_mu), fixed_air_marker);
+    effective_displacement_form.Assemble();
+    effective_displacement_form.Finalize();
+    state.effective_displacement.reset(
+        effective_displacement_form.ParallelAssemble());
+
+    ConstantCoefficient effective_acoustic_mass(
+        a_6 / (physics->rho_a * physics->c_a * physics->c_a));
+    ConstantCoefficient effective_inverse_impedance(
+        a_3 / (physics->rho_a * physics->c_a));
+    ParBilinearForm effective_pressure_form(state.scalar_fes.get());
+    effective_pressure_form.AddDomainIntegrator(new ImplicitDomainIntegrator(
+        std::make_unique<MassIntegrator>(effective_acoustic_mass),
+        *state.phi, cut_integration_order, level_set_order,
+        physics->epsilon, false), design_marker);
+    effective_pressure_form.AddDomainIntegrator(new ImplicitDomainIntegrator(
+        std::make_unique<DiffusionIntegrator>(acoustic_stiffness),
+        *state.phi, cut_integration_order, level_set_order,
+        physics->epsilon, false), design_marker);
+    effective_pressure_form.AddDomainIntegrator(
+        new MassIntegrator(effective_acoustic_mass), fixed_air_marker);
+    effective_pressure_form.AddDomainIntegrator(
+        new DiffusionIntegrator(acoustic_stiffness), fixed_air_marker);
+    effective_pressure_form.AddBoundaryIntegrator(
+        new BoundaryMassIntegrator(effective_inverse_impedance),
+        absorbing_marker);
+    effective_pressure_form.Assemble();
+    effective_pressure_form.Finalize();
+    state.effective_pressure.reset(
+        effective_pressure_form.ParallelAssemble());
+
+    Array2D<const HypreParMatrix*> effective_blocks(2, 2);
+    effective_blocks(0, 0) = state.effective_displacement.get();
+    effective_blocks(0, 1) = Kup.get();
+    effective_blocks(1, 0) = Mpu.get();
+    effective_blocks(1, 1) = state.effective_pressure.get();
+    Array2D<real_t> effective_coefficients(2, 2);
+    effective_coefficients = 1.0;
+    effective_coefficients(1, 0) = a_6;
+    state.effective_matrix.reset(HypreParMatrixFromBlocks(
+        effective_blocks, &effective_coefficients));
+    write_mumps_diagnostic(
+        state.rank, "event=matrix_complete matrix=effective");
+
+    bool reference_matrices_are_finite = true;
     if (!state.reference_M) {
         ParBilinearForm reference_Muu_form(state.displacement_fes.get());
         reference_Muu_form.AddDomainIntegrator(
@@ -925,26 +1097,86 @@ bool App::Solver::assembleSolutionSpaceParallelLocal()
         write_mumps_diagnostic(
             state.rank, "event=matrix_complete matrix=reference_Kpp");
 
-        state.reference_Cuu.reset(Add(
-            alpha_d, *state.reference_Muu,
-            beta_d, *state.reference_Kuu));
+        ParBilinearForm reference_Cuu_form(state.displacement_fes.get());
+        reference_Cuu_form.AddDomainIntegrator(
+            new VectorMassIntegrator(damped_fictitious_solid_density));
+        reference_Cuu_form.AddDomainIntegrator(new ElasticityIntegrator(
+            damped_fictitious_solid_lambda,
+            damped_fictitious_solid_mu));
+        reference_Cuu_form.Assemble();
+        reference_Cuu_form.Finalize();
+        state.reference_Cuu.reset(reference_Cuu_form.ParallelAssemble());
+        write_mumps_diagnostic(
+            state.rank, "event=matrix_complete matrix=reference_Cuu");
+
         state.reference_M = block_matrix(
             state.reference_Muu.get(), nullptr,
             nullptr, state.reference_Mpp.get());
+        write_mumps_diagnostic(
+            state.rank, "event=matrix_complete matrix=reference_M");
         state.reference_C = block_matrix(
             state.reference_Cuu.get(), nullptr,
             nullptr, state.Cpp.get());
+        write_mumps_diagnostic(
+            state.rank, "event=matrix_complete matrix=reference_C");
         state.reference_K = block_matrix(
             state.reference_Kuu.get(), nullptr,
             nullptr, state.reference_Kpp.get());
+        write_mumps_diagnostic(
+            state.rank, "event=matrix_complete matrix=reference_K");
+
+        ParBilinearForm reference_effective_displacement_form(
+            state.displacement_fes.get());
+        reference_effective_displacement_form.AddDomainIntegrator(
+            new VectorMassIntegrator(effective_fictitious_solid_density));
+        reference_effective_displacement_form.AddDomainIntegrator(
+            new ElasticityIntegrator(
+                effective_fictitious_solid_lambda,
+                effective_fictitious_solid_mu));
+        reference_effective_displacement_form.Assemble();
+        reference_effective_displacement_form.Finalize();
+        state.reference_effective_displacement.reset(
+            reference_effective_displacement_form.ParallelAssemble());
+
+        ParBilinearForm reference_effective_pressure_form(
+            state.scalar_fes.get());
+        reference_effective_pressure_form.AddDomainIntegrator(
+            new MassIntegrator(effective_acoustic_mass));
+        reference_effective_pressure_form.AddDomainIntegrator(
+            new DiffusionIntegrator(acoustic_stiffness));
+        reference_effective_pressure_form.AddBoundaryIntegrator(
+            new BoundaryMassIntegrator(effective_inverse_impedance),
+            absorbing_marker);
+        reference_effective_pressure_form.Assemble();
+        reference_effective_pressure_form.Finalize();
+        state.reference_effective_pressure.reset(
+            reference_effective_pressure_form.ParallelAssemble());
+        state.reference_effective_matrix = block_matrix(
+            state.reference_effective_displacement.get(), nullptr,
+            nullptr, state.reference_effective_pressure.get());
+        write_mumps_diagnostic(
+            state.rank, "event=matrix_complete matrix=reference_effective");
+
+        reference_matrices_are_finite =
+            reference_Muu_form.SpMat().CheckFinite() == 0
+            && reference_Kuu_form.SpMat().CheckFinite() == 0
+            && reference_Mpp_form.SpMat().CheckFinite() == 0
+            && reference_Kpp_form.SpMat().CheckFinite() == 0
+            && reference_Cuu_form.SpMat().CheckFinite() == 0
+            && reference_effective_displacement_form.SpMat().CheckFinite() == 0
+            && reference_effective_pressure_form.SpMat().CheckFinite() == 0;
     }
     const bool matrices_are_finite = Muu_form.SpMat().CheckFinite() == 0
         && Kuu_form.SpMat().CheckFinite() == 0
+        && Cuu_form.SpMat().CheckFinite() == 0
         && Mpp_form.SpMat().CheckFinite() == 0
         && Kpp_form.SpMat().CheckFinite() == 0
         && Kup_form.SpMat().CheckFinite() == 0
         && Mpu_form.SpMat().CheckFinite() == 0
-        && cpp_is_finite;
+        && effective_displacement_form.SpMat().CheckFinite() == 0
+        && effective_pressure_form.SpMat().CheckFinite() == 0
+        && cpp_is_finite
+        && reference_matrices_are_finite;
     if (!all_succeeded(state.comm, matrices_are_finite)) {
         if (state.rank == 0) {
             log(LogLevel::Error,
@@ -1082,6 +1314,11 @@ bool App::Solver::solveParallelLocal()
         && state.Muu && state.Cuu && state.Kuu
         && state.Mpp && state.Cpp && state.Kpp && state.phi
         && state.reference_M && state.reference_C && state.reference_K
+        && state.effective_matrix && state.effective_displacement
+        && state.effective_pressure
+        && state.reference_effective_matrix
+        && state.reference_effective_displacement
+        && state.reference_effective_pressure
         && state.reference_Muu && state.reference_Cuu
         && state.reference_Kuu && state.reference_Mpp
         && state.reference_Kpp
@@ -1119,14 +1356,17 @@ bool App::Solver::solveParallelLocal()
             ? *state.reference_K : *state.K;
         const HypreParMatrix& analysis_Muu = reference_analysis
             ? *state.reference_Muu : *state.Muu;
-        const HypreParMatrix& analysis_Cuu = reference_analysis
-            ? *state.reference_Cuu : *state.Cuu;
-        const HypreParMatrix& analysis_Kuu = reference_analysis
-            ? *state.reference_Kuu : *state.Kuu;
         const HypreParMatrix& analysis_Mpp = reference_analysis
             ? *state.reference_Mpp : *state.Mpp;
-        const HypreParMatrix& analysis_Kpp = reference_analysis
-            ? *state.reference_Kpp : *state.Kpp;
+        const HypreParMatrix& assembled_effective_matrix = reference_analysis
+            ? *state.reference_effective_matrix : *state.effective_matrix;
+        const HypreParMatrix& assembled_effective_displacement =
+            reference_analysis
+                ? *state.reference_effective_displacement
+                : *state.effective_displacement;
+        const HypreParMatrix& assembled_effective_pressure = reference_analysis
+            ? *state.reference_effective_pressure
+            : *state.effective_pressure;
 
         int communicator_relation = MPI_UNEQUAL;
         MPI_Comm_compare(
@@ -1168,34 +1408,23 @@ bool App::Solver::solveParallelLocal()
 
         const auto* physics =
             std::get_if<VibroacousticSettings>(&settings.physics);
-        const double beta = settings.newmarkBeta;
-        const double gamma = settings.newmarkGamma;
-        if (physics == nullptr || beta <= 0.0 || gamma < 0.5
-            || beta < 0.25 * std::pow(gamma + 0.5, 2.0)) {
+        if (physics == nullptr) {
             if (state.rank == 0) {
                 log(LogLevel::Error,
-                    "The Newmark parameters do not satisfy the stability bound.");
+                    "Parallel solve currently supports vibroacoustics only.");
             }
             return fail(SolverStatus::Error);
         }
 
-        const double a_3 = gamma / (beta * settings.dt);
-        const double a_6 = 1.0 / (beta * settings.dt * settings.dt);
-        std::unique_ptr<HypreParMatrix> M_and_C(
-            Add(a_6, analysis_M, a_3, analysis_C));
         std::unique_ptr<HypreParMatrix> K_hat(
-            Add(1.0, analysis_K, 1.0, *M_and_C));
+            new HypreParMatrix(assembled_effective_matrix));
         K_hat->EliminateBC(
             state.displacement_essential_tdofs, Operator::DIAG_ONE);
 
-        std::unique_ptr<HypreParMatrix> Muu_and_Cuu(
-            Add(a_6, analysis_Muu, a_3, analysis_Cuu));
         std::unique_ptr<HypreParMatrix> effective_displacement(
-            Add(1.0, analysis_Kuu, 1.0, *Muu_and_Cuu));
-        std::unique_ptr<HypreParMatrix> Mpp_and_Cpp(
-            Add(a_6, analysis_Mpp, a_3, *state.Cpp));
+            new HypreParMatrix(assembled_effective_displacement));
         std::unique_ptr<HypreParMatrix> effective_pressure(
-            Add(1.0, analysis_Kpp, 1.0, *Mpp_and_Cpp));
+            new HypreParMatrix(assembled_effective_pressure));
         effective_displacement->EliminateBC(
             state.displacement_essential_tdofs, Operator::DIAG_ONE);
 
@@ -1830,19 +2059,69 @@ bool App::Solver::differentiateFrequencyResponsesParallelLocal(
         parallel_pass_gradient.ParallelAssemble());
     std::unique_ptr<HypreParVector> stop_true_gradient(
         parallel_stop_gradient.ParallelAssemble());
-    parallel_pass_gradient.Distribute(pass_true_gradient.get());
-    parallel_stop_gradient.Distribute(stop_true_gradient.get());
-    GridFunction serial_pass_gradient =
-        parallel_pass_gradient.GetSerialGridFunction(
-            0, *level_set_fes);
-    GridFunction serial_stop_gradient =
-        parallel_stop_gradient.GetSerialGridFunction(
-            0, *level_set_fes);
     Vector pass_physical_gradient;
     Vector stop_physical_gradient;
-    if (state.rank == 0) {
-        serial_pass_gradient.GetTrueDofs(pass_physical_gradient);
-        serial_stop_gradient.GetTrueDofs(stop_physical_gradient);
+    auto gather_gradient = [&](const HypreParVector& local_gradient,
+                               Vector& serial_gradient) {
+        const int local_size = local_gradient.Size();
+        const bool local_map_is_valid =
+            state.true_to_serial_design_dofs.Size() == local_size;
+        if (!all_succeeded(state.comm, local_map_is_valid)) {
+            return false;
+        }
+
+        std::vector<int> counts(state.ranks);
+        MPI_Gather(&local_size, 1, MPI_INT,
+                   counts.data(), 1, MPI_INT, 0, state.comm);
+        std::vector<int> displacements(state.ranks);
+        int gathered_size = 0;
+        if (state.rank == 0) {
+            for (int rank = 0; rank < state.ranks; ++rank) {
+                displacements[rank] = gathered_size;
+                gathered_size += counts[rank];
+            }
+        }
+        std::vector<double> gathered_values(
+            state.rank == 0 ? gathered_size : 0);
+        std::vector<int> gathered_dofs(
+            state.rank == 0 ? gathered_size : 0);
+        MPI_Gatherv(
+            const_cast<real_t*>(local_gradient.HostRead()), local_size,
+            MPI_DOUBLE, gathered_values.data(), counts.data(),
+            displacements.data(), MPI_DOUBLE, 0, state.comm);
+        MPI_Gatherv(
+            state.true_to_serial_design_dofs.GetData(), local_size,
+            MPI_INT, gathered_dofs.data(), counts.data(),
+            displacements.data(), MPI_INT, 0, state.comm);
+
+        bool gathered = true;
+        if (state.rank == 0) {
+            serial_gradient.SetSize(level_set_fes->GetTrueVSize());
+            serial_gradient = 0.0;
+            Array<int> visits(serial_gradient.Size());
+            visits = 0;
+            for (int i = 0; i < gathered_size; ++i) {
+                const int dof = gathered_dofs[i];
+                if (dof < 0 || dof >= serial_gradient.Size()) {
+                    gathered = false;
+                    continue;
+                }
+                serial_gradient[dof] = gathered_values[i];
+                ++visits[dof];
+            }
+            for (int dof = 0; dof < visits.Size(); ++dof) {
+                gathered = gathered && visits[dof] == 1;
+            }
+        }
+        return all_succeeded(state.comm, gathered);
+    };
+    if (!gather_gradient(*pass_true_gradient, pass_physical_gradient)
+        || !gather_gradient(*stop_true_gradient, stop_physical_gradient)) {
+        if (state.rank == 0) {
+            log(LogLevel::Error,
+                "Could not gather the distributed design gradients.");
+        }
+        return false;
     }
     MPI_Allreduce(&local_cut_elements, &performance_data.cutElements,
                   1, MPI_INT, MPI_SUM, state.comm);
