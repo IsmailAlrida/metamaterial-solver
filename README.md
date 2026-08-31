@@ -92,6 +92,14 @@ build.bat serial
 build.bat parallel-cpu
 ```
 
+Compilation jobs are bounded explicitly; override the default with `-j N`.
+Project checks and diagnostic miniapps are excluded unless `tests` is passed:
+
+```bat
+build.bat serial -j 4
+build.bat parallel-cpu tests -j 4
+```
+
 Debug is opt-in and uses a separate build directory:
 
 ```bat
@@ -186,6 +194,14 @@ CPU builds:
 ./build.sh deps serial
 ```
 
+CPU builds default to four jobs and CUDA builds to two. Override that limit
+with `-j N`; pass `tests` only when the diagnostic executables are needed:
+
+```bash
+./build.sh serial -j 4
+./build.sh parallel-cpu tests -j 4
+```
+
 Run the MPI backend with the same rank/worker model:
 
 ```bash
@@ -209,8 +225,10 @@ An optional CUDA architecture can be supplied after the backend; Blackwell is
 `120`:
 
 ```bash
-./build.sh serial-cuda 120
+./build.sh serial-cuda 120 -j 2
 ```
+
+Use `-j 1` if a memory-constrained WSL2 instance still runs out of memory.
 
 For WSL2, install the Windows NVIDIA driver and follow NVIDIA's
 [CUDA on WSL guide](https://docs.nvidia.com/cuda/wsl-user-guide/index.html);

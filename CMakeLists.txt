@@ -44,6 +44,14 @@ if(CMAKE_CUDA_COMPILER)
 endif()
 
 option(METAMATERIAL_DEMO_MODE "Use deterministic fake solver, optimizer, and exporter classes" OFF)
+option(METAMATERIAL_BUILD_TESTS "Build project checks and diagnostic miniapps" OFF)
+
+# Keep memory-heavy link steps out of each other's way. Compilation parallelism
+# is still controlled by build.bat/build.sh.
+if(CMAKE_GENERATOR MATCHES "Ninja")
+  set_property(GLOBAL PROPERTY JOB_POOLS metamaterial_link_pool=1)
+  set(CMAKE_JOB_POOL_LINK metamaterial_link_pool)
+endif()
 
 # ---------------------------------------------------------
 # AUTOMATED DEPENDENCY MANAGEMENT
@@ -68,6 +76,7 @@ FetchContent_MakeAvailable(Eigen3)
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 set(SDL_STATIC ON CACHE BOOL "" FORCE)
 set(SDL_TEST OFF CACHE BOOL "" FORCE)
+set(SDL_TESTS OFF CACHE BOOL "" FORCE)
 set(SDL2_DISABLE_UNINSTALL ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
   SDL2
@@ -81,6 +90,10 @@ FetchContent_MakeAvailable(SDL2)
 # 3. Fetch Assimp
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_ASSIMP_TOOLS OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_ALL_IMPORTERS_BY_DEFAULT OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_ALL_EXPORTERS_BY_DEFAULT OFF CACHE BOOL "" FORCE)
 set(ASSIMP_INSTALL OFF CACHE BOOL "" FORCE)
 set(ASSIMP_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
 # Assimp carries the ZIP implementation through its 3MF exporter sources.
@@ -547,25 +560,36 @@ configure_file(
 )
 
 file(GLOB sources "src/*.cpp")
+list(REMOVE_ITEM sources "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
 if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
   file(GLOB cuda_sources "src/*.cu")
   list(APPEND sources ${cuda_sources})
 endif()
 
-add_executable(metamaterial_app 
-    ${sources} 
+add_library(metamaterial_imgui STATIC
     ${IMGUI_DIR}/backends/imgui_impl_sdl2.cpp
-    ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp 
-    ${IMGUI_DIR}/imgui.cpp 
-    ${IMGUI_DIR}/imgui_draw.cpp 
-    ${IMGUI_DIR}/imgui_demo.cpp 
-    ${IMGUI_DIR}/imgui_tables.cpp 
+    ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
+    ${IMGUI_DIR}/imgui.cpp
+    ${IMGUI_DIR}/imgui_draw.cpp
+    ${IMGUI_DIR}/imgui_tables.cpp
     ${IMGUI_DIR}/imgui_widgets.cpp
+)
+target_include_directories(metamaterial_imgui PUBLIC
+    ${IMGUI_DIR}
+    ${IMGUI_DIR}/backends
+)
+target_link_libraries(metamaterial_imgui PUBLIC SDL2::SDL2 OpenGL::GL)
+
+add_library(metamaterial_implot STATIC
     ${implot_SOURCE_DIR}/implot.cpp
     ${implot_SOURCE_DIR}/implot_items.cpp
 )
+target_include_directories(metamaterial_implot PUBLIC ${implot_SOURCE_DIR})
+target_link_libraries(metamaterial_implot PUBLIC metamaterial_imgui)
 
-target_compile_definitions(metamaterial_app PRIVATE
+add_library(metamaterial_core STATIC ${sources})
+
+target_compile_definitions(metamaterial_core PUBLIC
     METAMATERIAL_DEMO_MODE=$<BOOL:${METAMATERIAL_DEMO_MODE}>
     METAMATERIAL_USE_CUDA=$<BOOL:${MFEM_USE_CUDA}>
     METAMATERIAL_USE_MPI=$<BOOL:${METAMATERIAL_USE_MPI}>
@@ -573,11 +597,8 @@ target_compile_definitions(metamaterial_app PRIVATE
 message(STATUS "Interactive demo mode: ${METAMATERIAL_DEMO_MODE}")
 
 # Target-specific paths
-target_include_directories(metamaterial_app PRIVATE
+target_include_directories(metamaterial_core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    ${IMGUI_DIR}
-    ${IMGUI_DIR}/backends
-    ${implot_SOURCE_DIR}
     "${fftw_SOURCE_DIR}/api"
     "${assimp_SOURCE_DIR}/contrib/zip/src"
     "${CMAKE_CURRENT_BINARY_DIR}/generated"
@@ -585,9 +606,9 @@ target_include_directories(metamaterial_app PRIVATE
 
 # Link all targets cleanly
 # MFEM injects its internal include paths automatically when linked as PRIVATE
-target_link_libraries(metamaterial_app PRIVATE 
-    SDL2::SDL2
-    OpenGL::GL
+target_link_libraries(metamaterial_core PUBLIC
+    metamaterial_imgui
+    metamaterial_implot
     assimp
     Eigen3::Eigen
     fftw3
@@ -596,12 +617,15 @@ target_link_libraries(metamaterial_app PRIVATE
     glvis
 )
 
+add_executable(metamaterial_app src/main.cpp)
+target_link_libraries(metamaterial_app PRIVATE metamaterial_core)
+
 if(TARGET SDL2::SDL2main)
   target_link_libraries(metamaterial_app PRIVATE SDL2::SDL2main)
 endif()
 
 if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
-  target_link_libraries(metamaterial_app PRIVATE
+  target_link_libraries(metamaterial_core PUBLIC
       CUDA::cudart
       CUDA::cublas
       CUDA::cusparse
@@ -609,6 +633,7 @@ if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
   )
 endif()
 
+if(METAMATERIAL_BUILD_TESTS)
 enable_testing()
 
 add_executable(dispatcher_backend_check
@@ -622,14 +647,8 @@ add_test(NAME dispatcher_backend COMMAND dispatcher_backend_check)
 
 add_executable(exporter_bundle_check
     tests/exporter_bundle_check.cpp
-    src/exporter.cpp
 )
-target_include_directories(exporter_bundle_check PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    "${assimp_SOURCE_DIR}/contrib/zip/src"
-    "${CMAKE_CURRENT_BINARY_DIR}/generated"
-)
-target_link_libraries(exporter_bundle_check PRIVATE assimp mfem)
+target_link_libraries(exporter_bundle_check PRIVATE metamaterial_core)
 add_test(NAME exporter_bundle COMMAND exporter_bundle_check)
 
 add_executable(paropt_smoke_check
@@ -641,51 +660,17 @@ add_test(NAME paropt_smoke COMMAND paropt_smoke_check)
 if(NOT METAMATERIAL_USE_MPI)
   add_executable(solver_adjoint_check
       tests/solver_adjoint_check.cpp
-      src/solver.cpp
-      src/par_solver.cpp
   )
-  target_include_directories(solver_adjoint_check PRIVATE
-      "${CMAKE_CURRENT_SOURCE_DIR}/src"
-      "${fftw_SOURCE_DIR}/api"
-  )
-  target_link_libraries(solver_adjoint_check PRIVATE fftw3 mfem)
-  target_compile_definitions(solver_adjoint_check PRIVATE
-      METAMATERIAL_USE_CUDA=$<BOOL:${MFEM_USE_CUDA}>
-      METAMATERIAL_USE_MPI=0
-  )
-  if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
-    target_link_libraries(solver_adjoint_check PRIVATE
-        CUDA::cudart CUDA::cublas CUDA::cusparse CUDA::cusolver)
-  endif()
+  target_link_libraries(solver_adjoint_check PRIVATE metamaterial_core)
   add_test(NAME solver_adjoint COMMAND solver_adjoint_check)
 endif()
 
 add_executable(paper_optimizer_miniapp
     tests/paper_optimizer_miniapp.cpp
-    src/optimizer.cpp
-    src/solver.cpp
-    src/par_solver.cpp
-)
-target_include_directories(paper_optimizer_miniapp PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    "${fftw_SOURCE_DIR}/api"
-    "${assimp_SOURCE_DIR}/contrib/zip/src"
 )
 target_link_libraries(paper_optimizer_miniapp PRIVATE
-    assimp
-    Eigen3::Eigen
-    ParOpt::paropt
-    fftw3
-    mfem
+    metamaterial_core
 )
-target_compile_definitions(paper_optimizer_miniapp PRIVATE
-    METAMATERIAL_USE_CUDA=$<BOOL:${MFEM_USE_CUDA}>
-    METAMATERIAL_USE_MPI=$<BOOL:${METAMATERIAL_USE_MPI}>
-)
-if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
-  target_link_libraries(paper_optimizer_miniapp PRIVATE
-      CUDA::cudart CUDA::cublas CUDA::cusparse CUDA::cusolver)
-endif()
 if(METAMATERIAL_USE_MPI)
   add_executable(mumps_smoke_check tests/mumps_smoke_check.cpp)
   target_link_libraries(mumps_smoke_check PRIVATE mfem)
@@ -699,20 +684,9 @@ if(METAMATERIAL_USE_MPI)
 
   add_executable(parallel_solver_check
       tests/parallel_solver_check.cpp
-      src/solver.cpp
-      src/par_solver.cpp
-  )
-  target_include_directories(parallel_solver_check PRIVATE
-      "${CMAKE_CURRENT_SOURCE_DIR}/src"
-      "${fftw_SOURCE_DIR}/api"
   )
   target_link_libraries(parallel_solver_check PRIVATE
-      fftw3
-      mfem
-  )
-  target_compile_definitions(parallel_solver_check PRIVATE
-      METAMATERIAL_USE_CUDA=0
-      METAMATERIAL_USE_MPI=1
+      metamaterial_core
   )
 
   foreach(_ranks 1 2 4)
@@ -723,4 +697,5 @@ if(METAMATERIAL_USE_MPI)
     set_tests_properties(parallel_solver_${_ranks}_ranks PROPERTIES
         PROCESSORS ${_ranks})
   endforeach()
+endif()
 endif()

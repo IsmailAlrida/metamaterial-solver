@@ -7,6 +7,8 @@ mode=build
 backend=${1:-serial}
 build_type=Release
 cuda_arch=
+build_tests=OFF
+jobs=
 glvis_revision=1b9988ade7b78f125377a3be5c2b8514eafbcf0c
 
 if [[ $backend == deps ]]; then
@@ -18,25 +20,36 @@ else
     if (( $# )); then shift; fi
 fi
 
-for option in "$@"; do
-    case $option in
+while (( $# )); do
+    case $1 in
         debug) build_type=Debug ;;
         release) build_type=Release ;;
-        *)
-            if [[ -n $cuda_arch ]]; then
-                echo "Unexpected build option: $option" >&2
+        tests) build_tests=ON ;;
+        -j|--jobs)
+            if (( $# < 2 )); then
+                echo "$1 requires a positive integer." >&2
                 exit 1
             fi
-            cuda_arch=$option
+            jobs=$2
+            shift
+            ;;
+        --jobs=*) jobs=${1#*=} ;;
+        *)
+            if [[ -n $cuda_arch ]]; then
+                echo "Unexpected build option: $1" >&2
+                exit 1
+            fi
+            cuda_arch=$1
             ;;
     esac
+    shift
 done
 
 case $backend in
     serial|serial-cuda|parallel-cpu|parallel-cpu-cuda) ;;
     *)
-        echo "Usage: ./build.sh [serial|serial-cuda|parallel-cpu|parallel-cpu-cuda] [CUDA architecture] [debug]" >&2
-        echo "       ./build.sh deps [serial|serial-cuda|parallel-cpu|parallel-cpu-cuda] [CUDA architecture] [debug]" >&2
+        echo "Usage: ./build.sh [serial|serial-cuda|parallel-cpu|parallel-cpu-cuda] [CUDA architecture] [debug] [tests] [-j N]" >&2
+        echo "       ./build.sh deps [serial|serial-cuda|parallel-cpu|parallel-cpu-cuda] [CUDA architecture] [debug] [tests] [-j N]" >&2
         exit 1
         ;;
 esac
@@ -59,6 +72,20 @@ elif [[ -n $cuda_arch ]]; then
     exit 1
 fi
 
+if [[ -z $jobs ]]; then
+    jobs=${CMAKE_BUILD_PARALLEL_LEVEL:-}
+fi
+if [[ -z $jobs ]]; then
+    processor_count=$(nproc)
+    job_cap=4
+    [[ $backend == *cuda* ]] && job_cap=2
+    jobs=$(( processor_count < job_cap ? processor_count : job_cap ))
+fi
+if [[ ! $jobs =~ ^[1-9][0-9]*$ ]]; then
+    echo "Build jobs must be a positive integer, got: $jobs" >&2
+    exit 1
+fi
+
 build_dir="build/linux/$backend"
 [[ $build_type == Debug ]] && build_dir+="-debug"
 deps_source_dir="$PWD/build/deps/src"
@@ -69,6 +96,8 @@ echo "Build type: $build_type"
 echo "Build dir: $build_dir"
 echo "Deps source dir: $deps_source_dir"
 echo "GLVis source dir: $glvis_source_dir"
+echo "Build jobs: $jobs"
+echo "Project tests: $build_tests"
 [[ -n $cuda_arch ]] && echo "CUDA architecture: $cuda_arch"
 
 mkdir -p "$deps_source_dir" "$PWD/extern"
@@ -100,6 +129,7 @@ cmake_args=(
     -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5
     -DMETAMATERIAL_DEMO_MODE=OFF
+    -DMETAMATERIAL_BUILD_TESTS="$build_tests"
     -DMETAMATERIAL_MFEM_BACKEND="$backend"
     -DMETAMATERIAL_DEPS_SOURCE_DIR="$deps_source_dir"
     -DGLVIS_SOURCE_DIR="$glvis_source_dir"
@@ -114,4 +144,4 @@ if [[ $mode == deps ]]; then
     exit 0
 fi
 
-cmake --build "$build_dir"
+cmake --build "$build_dir" --parallel "$jobs"

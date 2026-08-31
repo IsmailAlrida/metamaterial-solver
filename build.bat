@@ -2,25 +2,67 @@
 setlocal EnableExtensions
 
 set "MODE=build"
-set "BACKEND=%~1"
-set "OPTION=%~2"
 set "BUILD_TYPE=Release"
+set "BUILD_TESTS=OFF"
+set "JOBS="
 set "GLVIS_REVISION=1b9988ade7b78f125377a3be5c2b8514eafbcf0c"
 
-if /I "%BACKEND%"=="deps" (
+if /I "%~1"=="deps" (
     set "MODE=deps"
-    set "BACKEND=%~2"
-    set "OPTION=%~3"
+    shift
 )
 
+set "BACKEND=%~1"
+if not "%~1"=="" shift
 if "%BACKEND%"=="" set "BACKEND=serial"
 
-call :parse_option "%OPTION%"
-if errorlevel 1 exit /b 1
+:parse_options
+if "%~1"=="" goto options_done
+if /I "%~1"=="debug" (
+    set "BUILD_TYPE=Debug"
+    shift
+    goto parse_options
+)
+if /I "%~1"=="release" (
+    set "BUILD_TYPE=Release"
+    shift
+    goto parse_options
+)
+if /I "%~1"=="tests" (
+    set "BUILD_TESTS=ON"
+    shift
+    goto parse_options
+)
+if /I "%~1"=="-j" goto parse_jobs
+if /I "%~1"=="--jobs" goto parse_jobs
+echo Unexpected build option: %~1
+exit /b 1
+
+:parse_jobs
+shift
+if "%~1"=="" (
+    echo --jobs requires a positive integer.
+    exit /b 1
+)
+set "JOBS=%~1"
+shift
+goto parse_options
+
+:options_done
+if not defined JOBS if defined CMAKE_BUILD_PARALLEL_LEVEL set "JOBS=%CMAKE_BUILD_PARALLEL_LEVEL%"
+if not defined JOBS set "JOBS=4"
+for /f "delims=0123456789" %%I in ("%JOBS%") do (
+    echo Build jobs must be a positive integer, got: %JOBS%
+    exit /b 1
+)
+if "%JOBS%"=="0" (
+    echo Build jobs must be greater than zero.
+    exit /b 1
+)
 
 if not "%BACKEND%"=="serial" if not "%BACKEND%"=="parallel-cpu" (
-    echo Usage: build.bat [serial^|parallel-cpu] [debug]
-    echo        build.bat deps [serial^|parallel-cpu] [debug]
+    echo Usage: build.bat [serial^|parallel-cpu] [debug] [tests] [-j N]
+    echo        build.bat deps [serial^|parallel-cpu] [debug] [tests] [-j N]
     exit /b 1
 )
 
@@ -46,6 +88,8 @@ echo Build type: %BUILD_TYPE%
 echo Build dir: %BUILD_DIR%
 echo Deps source dir: %BUILD_ROOT%\deps\src
 echo Preset: %PRESET%
+echo Build jobs: %JOBS%
+echo Project tests: %BUILD_TESTS%
 
 if "%MODE%"=="deps" (
     call :fetch_glvis
@@ -55,7 +99,7 @@ if "%MODE%"=="deps" (
 call :patch_glvis
 if errorlevel 1 exit /b 1
 
-cmake --preset "%PRESET%"
+cmake --preset "%PRESET%" -DMETAMATERIAL_BUILD_TESTS=%BUILD_TESTS%
 if errorlevel 1 exit /b %errorlevel%
 copy /Y "%BUILD_DIR%\compile_commands.json" "%~dp0compile_commands.json" >nul
 if errorlevel 1 exit /b %errorlevel%
@@ -66,21 +110,11 @@ if "%MODE%"=="deps" (
 )
 
 if /I "%BUILD_TYPE%"=="Debug" (
-    cmake --build --preset "%BACKEND%-debug"
+    cmake --build --preset "%BACKEND%-debug" --parallel %JOBS%
 ) else (
-    cmake --build --preset "%BACKEND%"
+    cmake --build --preset "%BACKEND%" --parallel %JOBS%
 )
 exit /b %errorlevel%
-
-:parse_option
-if "%~1"=="" exit /b 0
-if /I "%~1"=="debug" (
-    set "BUILD_TYPE=Debug"
-    exit /b 0
-)
-if /I "%~1"=="release" exit /b 0
-echo Unexpected build option: %~1
-exit /b 1
 
 :activate_msvc
 where cl.exe >nul 2>nul
