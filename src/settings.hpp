@@ -31,6 +31,11 @@ enum class FrequencyBandType {
     stop
 };
 
+enum class ObjectiveMode {
+    band,
+    freeform
+};
+
 using Value = std::variant<int, float, double, long, bool, std::string>;
 using Number = std::variant<int, float>;
 
@@ -80,12 +85,18 @@ struct FrequencyBand {
     double targetTransmission = 1.0e-2;
 };
 
+struct FreeformObjective {
+    std::vector<double> frequencyHz;
+    std::vector<double> targetTransmission;
+};
+
 using PhysicsSettings = std::variant<
     VibroacousticSettings,
     ElectromagneticSettings
 >;
 
 struct OptimizerSettings {
+    ObjectiveMode objectiveMode = ObjectiveMode::band;
     float frequencyMin = 1000.0f;
     float frequencyMax = 4000.0f;
     float attenuationMinDb = -120.0f;
@@ -101,6 +112,7 @@ struct OptimizerSettings {
         {FrequencyBandType::pass, 1000.0, 2500.0, 1.0},
         {FrequencyBandType::stop, 2500.0, 4000.0, 1.0e-2}
     };
+    FreeformObjective freeformObjective;
 };
 
 // TODO: For all settings, pick default app values.
@@ -143,10 +155,21 @@ struct ExporterSettings {
 
 };
 
+struct UiSettings {
+    double plotXMinHz = 60.0;
+    double plotXMaxHz = 600.0;
+    double plotYMinDb = -80.0;
+    double plotYMaxDb = 10.0;
+    double plotYMinLinear = 0.0;
+    double plotYMaxLinear = 1.1;
+    bool displayInDb = true;
+};
+
 struct AppSettings {
     SolverSettings solverSettings{};
     OptimizerSettings optSettings{};
     ExporterSettings exporterSettings{};
+    UiSettings uiSettings{};
 };
 
 std::filesystem::path defaultAppSettingsPath();

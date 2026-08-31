@@ -1423,10 +1423,6 @@ bool App::Solver::solveParallelLocal()
             state.reference_ready = false;
         }
 
-        if (!reference_analysis && state.rank == 0) {
-            streamToGlvis();
-        }
-
         const HypreParMatrix& analysis_M = reference_analysis
             ? *state.reference_M : *state.M;
         const HypreParMatrix& analysis_C = reference_analysis
@@ -1757,6 +1753,7 @@ bool App::Solver::solveParallelLocal()
     status.store(SolverStatus::Converged);
     forward_is_ready = true;
     if (state.rank == 0) {
+        streamToGlvis();
         log(LogLevel::Message,
             "Completed the distributed Newmark solve and outlet FFT.");
     }

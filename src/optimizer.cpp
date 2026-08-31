@@ -358,6 +358,85 @@ bool Optimizer::evaluateObjectives(ObjectiveEvaluation& objective) const
         return false;
     }
 
+    objective.pass_spectrum_derivative.assign(bin_count, {0.0, 0.0});
+    objective.stop_spectrum_derivative.assign(bin_count, {0.0, 0.0});
+    if (settings.objectiveMode == ObjectiveMode::freeform) {
+        const FreeformObjective& freeform = settings.freeformObjective;
+        if (freeform.frequencyHz.size() != freeform.targetTransmission.size()) {
+            log(LogLevel::Error,
+                "The freeform objective frequency and target arrays must match.");
+            return false;
+        }
+
+        constexpr double target_floor = 1.0e-6;
+        int objective_bins = 0;
+        for (std::size_t bin = 0; bin < bin_count; ++bin) {
+            if (response.valid[bin] == 0 || freeform.frequencyHz.empty()) {
+                continue;
+            }
+            const auto found = std::lower_bound(
+                freeform.frequencyHz.begin(),
+                freeform.frequencyHz.end(),
+                response.frequency[bin]);
+            std::size_t sample = found == freeform.frequencyHz.end()
+                ? freeform.frequencyHz.size() - 1
+                : static_cast<std::size_t>(found - freeform.frequencyHz.begin());
+            if (sample > 0
+                && std::abs(freeform.frequencyHz[sample - 1] - response.frequency[bin])
+                    < std::abs(freeform.frequencyHz[sample] - response.frequency[bin])) {
+                --sample;
+            }
+            const double bin_width = bin_count > 1
+                ? (bin + 1 < bin_count
+                    ? response.frequency[bin + 1] - response.frequency[bin]
+                    : response.frequency[bin] - response.frequency[bin - 1])
+                : 0.0;
+            if (std::abs(freeform.frequencyHz[sample] - response.frequency[bin])
+                    > 0.5 * std::abs(bin_width) + 1.0e-9) {
+                continue;
+            }
+
+            const double target = freeform.targetTransmission[sample];
+            const double reference_amplitude = std::abs(response.reference[bin]);
+            const double outlet_amplitude = std::abs(response.outlet[bin]);
+            if (!std::isfinite(target) || target <= 0.0
+                || !std::isfinite(reference_amplitude)
+                || !std::isfinite(outlet_amplitude)
+                || reference_amplitude <= 0.0) {
+                log(LogLevel::Error,
+                    "A freeform objective bin contains a non-finite response or target.");
+                return false;
+            }
+
+            const double denominator = std::max(target, target_floor);
+            const double transmission = outlet_amplitude / reference_amplitude;
+            const double relative_error = (transmission - target) / denominator;
+            objective.pass += relative_error * relative_error;
+            const double derivative_scale = outlet_amplitude
+                    > std::numeric_limits<double>::epsilon()
+                        * std::max(1.0, reference_amplitude)
+                ? 2.0 * (transmission - target)
+                    / (denominator * denominator
+                       * reference_amplitude * outlet_amplitude)
+                : 0.0;
+            objective.pass_spectrum_derivative[bin]
+                = derivative_scale * response.outlet[bin];
+            ++objective_bins;
+        }
+        if (objective_bins == 0) {
+            log(LogLevel::Error,
+                "The freeform objective needs at least one excited FFT bin.");
+            return false;
+        }
+        objective.pass /= objective_bins;
+        for (std::complex<double>& derivative
+                : objective.pass_spectrum_derivative) {
+            derivative /= objective_bins;
+        }
+        objective.has_pass = true;
+        return true;
+    }
+
     std::vector<const FrequencyBand*> bands;
     bands.reserve(settings.frequencyBands.size());
     bool pass_configured = false;
@@ -393,8 +472,6 @@ bool Optimizer::evaluateObjectives(ObjectiveEvaluation& objective) const
         }
     }
 
-    objective.pass_spectrum_derivative.assign(bin_count, {0.0, 0.0});
-    objective.stop_spectrum_derivative.assign(bin_count, {0.0, 0.0});
     int pass_bins = 0;
     int stop_bins = 0;
     for (std::size_t bin = 0; bin < bin_count; ++bin) {

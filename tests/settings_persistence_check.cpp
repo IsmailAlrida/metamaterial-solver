@@ -27,6 +27,10 @@ int main()
         {App::FrequencyBandType::stop, 60.0, 600.0, 1.0e-2},
         {App::FrequencyBandType::pass, 600.0, 4000.0, 1.0}
     };
+    written.optSettings.objectiveMode = App::ObjectiveMode::freeform;
+    written.optSettings.freeformObjective = {
+        {60.0, 110.0}, {1.0, 0.01}};
+    written.uiSettings.plotXMinHz = 55.0;
 
     std::string error;
     assert(App::saveAppSettings(written, path, &error));
@@ -43,6 +47,10 @@ int main()
     assert(loaded_material.f2 == 600.0f);
     assert(loaded.optSettings.frequencyBands.size() == 2);
     assert(loaded.optSettings.frequencyBands.front().startHz == 60.0);
+    assert(loaded.optSettings.objectiveMode == App::ObjectiveMode::freeform);
+    assert(loaded.optSettings.freeformObjective.frequencyHz.size() == 2);
+    assert(loaded.optSettings.freeformObjective.targetTransmission[1] == 0.01);
+    assert(loaded.uiSettings.plotXMinHz == 55.0);
 
     std::filesystem::remove_all(directory);
 }

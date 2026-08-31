@@ -10,6 +10,12 @@
 #include <thread>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <winsock2.h>
 #else
 #include <arpa/inet.h>
@@ -24,6 +30,8 @@
 #include "aux_vis.hpp"
 #include "glwindow.hpp"
 #include "stream_reader.hpp"
+#include "vsdata.hpp"
+#include "vssolution.hpp"
 #include "window.hpp"
 
 thread_local mfem::GeometryRefiner GLVisGeometryRefiner;
@@ -412,6 +420,9 @@ struct GlvisAdapter::Impl {
             if (!session->SetNewMeshAndSolution(std::move(*nextState))) {
                 setStatus("GLVis rejected a supposedly compatible stream update.");
             }
+            else {
+                configureGeometry();
+            }
             return;
         }
 
@@ -445,7 +456,7 @@ struct GlvisAdapter::Impl {
             previousClearColor[0], previousClearColor[1],
             previousClearColor[2], previousClearColor[3]);
 
-        setStatus("Rendering the live GLVis stream.");
+        configureGeometry();
     }
 
     bool render(int width, int height)
@@ -488,6 +499,45 @@ struct GlvisAdapter::Impl {
             previousClearColor[0], previousClearColor[1],
             previousClearColor[2], previousClearColor[3]);
         return true;
+    }
+
+    bool configureGeometry()
+    {
+        if (!session || !session->vs || !session->data_state.mesh
+            || !session->data_state.grid_f) {
+            return false;
+        }
+
+        if (session->data_state.mesh->SpaceDimension() == 2) {
+            if (auto* scene = dynamic_cast<VisualizationSceneSolution*>(
+                    session->vs.get())) {
+                scene->SetDrawMesh(2);
+                scene->SetLevelLines(0.0, 0.0, 1, 0);
+                scene->UpdateLevelLines();
+            }
+        }
+        setStatus("Geometry: solid phi > 0, air phi < 0, interface phi = 0.");
+        return true;
+    }
+
+    int dimension() const
+    {
+        return session && session->data_state.mesh
+            ? session->data_state.mesh->SpaceDimension()
+            : 0;
+    }
+
+    void fitView()
+    {
+        if (!embeddedWindow) {
+            return;
+        }
+        if (dimension() == 2) {
+            embeddedWindow->callKeyDown('R');
+        }
+        else {
+            embeddedWindow->callKeyDown('r');
+        }
     }
 
     void processEvent(const SDL_Event& event)
@@ -662,9 +712,17 @@ void GlvisAdapter::draw()
         return;
     }
 
-    ImGui::TextColored(ImVec4(0.35f, 0.69f, 1.0f, 1.0f), "GLVIS");
+    ImGui::TextDisabled(
+        impl->dimension() == 3 ? "3D"
+        : impl->dimension() == 2 ? "2D"
+        : "Waiting for mesh");
     ImGui::SameLine();
-    ImGui::TextDisabled("%s", impl->getStatus().c_str());
+    if (ImGui::Button("Fit view")) {
+        impl->fitView();
+    }
+    ImGui::SameLine();
+    const std::string status = impl->getStatus();
+    ImGui::TextDisabled("%s", status.c_str());
     ImGui::Separator();
 
     const ImVec2 available = ImGui::GetContentRegionAvail();
@@ -687,7 +745,8 @@ void GlvisAdapter::draw()
         const bool hovered = ImGui::IsItemHovered();
         impl->mouseInput(origin, hovered);
         impl->setInputFocused(
-            ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows));
+            hovered
+            && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows));
     }
     else {
         ImGui::InvisibleButton("##glvis-canvas", imageSize);

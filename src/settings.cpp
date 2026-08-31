@@ -103,6 +103,30 @@ bool readObject(const picojson::object& parent,
     return true;
 }
 
+bool readNumberArray(const picojson::object& object,
+                     const std::string& key,
+                     std::vector<double>& destination,
+                     std::string* error)
+{
+    const auto found = object.find(key);
+    if (found == object.end()) {
+        return true;
+    }
+    if (!found->second.is<picojson::array>()) {
+        return fail(error, "Expected an array for " + key);
+    }
+
+    std::vector<double> values;
+    for (const picojson::value& value : found->second.get<picojson::array>()) {
+        if (!value.is<double>() || !std::isfinite(value.get<double>())) {
+            return fail(error, "Expected finite numbers in " + key);
+        }
+        values.push_back(value.get<double>());
+    }
+    destination = std::move(values);
+    return true;
+}
+
 picojson::value number(double value)
 {
     return picojson::value(value);
@@ -304,6 +328,17 @@ bool App::loadAppSettings(AppSettings& settings,
             return false;
         }
 
+        std::string objective_mode = optimizer.objectiveMode == ObjectiveMode::freeform
+            ? "freeform" : "band";
+        if (!readString(*object, "objectiveMode", objective_mode, error)) {
+            return false;
+        }
+        if (objective_mode == "band") optimizer.objectiveMode = ObjectiveMode::band;
+        else if (objective_mode == "freeform" || objective_mode == "painted") {
+            optimizer.objectiveMode = ObjectiveMode::freeform;
+        }
+        else return fail(error, "Unknown objective mode");
+
         const auto bands = object->find("frequencyBands");
         if (bands != object->end()) {
             if (!bands->second.is<picojson::array>()) {
@@ -332,6 +367,61 @@ bool App::loadAppSettings(AppSettings& settings,
             }
             optimizer.frequencyBands = std::move(loaded_bands);
         }
+
+        const picojson::object* freeform = nullptr;
+        if (!readObject(*object, "freeformObjective", freeform, error)) {
+            return false;
+        }
+        if (freeform == nullptr
+            && !readObject(*object, "paintedObjective", freeform, error)) {
+            return false;
+        }
+        if (freeform
+            && (!readNumberArray(*freeform, "frequencyHz",
+                                 optimizer.freeformObjective.frequencyHz, error)
+                || !readNumberArray(*freeform, "targetTransmission",
+                                     optimizer.freeformObjective.targetTransmission, error))) {
+            return false;
+        }
+    }
+
+    object = nullptr;
+    if (!readObject(root, "ui", object, error)) {
+        return false;
+    }
+    if (object) {
+        UiSettings& ui = loaded.uiSettings;
+#define READ_UI(name) \
+        if (!readNumber(*object, #name, ui.name, error)) return false
+        READ_UI(plotXMinHz);
+        READ_UI(plotXMaxHz);
+        READ_UI(plotYMinDb);
+        READ_UI(plotYMaxDb);
+        READ_UI(plotYMinLinear);
+        READ_UI(plotYMaxLinear);
+#undef READ_UI
+        if (!readBool(*object, "displayInDb", ui.displayInDb, error)) {
+            return false;
+        }
+    }
+
+    const FreeformObjective& freeform = loaded.optSettings.freeformObjective;
+    if (freeform.frequencyHz.size() != freeform.targetTransmission.size()) {
+        return fail(error, "Freeform objective arrays must have equal lengths");
+    }
+    for (std::size_t i = 0; i < freeform.frequencyHz.size(); ++i) {
+        if (freeform.frequencyHz[i] < 0.0
+            || freeform.targetTransmission[i] <= 0.0
+            || (i > 0 && freeform.frequencyHz[i] <= freeform.frequencyHz[i - 1])) {
+            return fail(error,
+                "Freeform objective frequencies must increase and targets must be positive");
+        }
+    }
+    const UiSettings& ui = loaded.uiSettings;
+    if (!(ui.plotXMinHz < ui.plotXMaxHz)
+        || !(ui.plotYMinDb < ui.plotYMaxDb)
+        || !(ui.plotYMinLinear < ui.plotYMaxLinear)) {
+        return fail(error, "Saved UI ranges are invalid");
     }
 
     settings = std::move(loaded);
@@ -416,6 +506,8 @@ bool App::saveAppSettings(const AppSettings& settings,
 #undef WRITE_OPTIMIZER
     optimizer_object["displayTargetInDb"] =
         picojson::value(optimizer.displayTargetInDb);
+    optimizer_object["objectiveMode"] = picojson::value(std::string(
+        optimizer.objectiveMode == ObjectiveMode::freeform ? "freeform" : "band"));
 
     picojson::array bands;
     for (const FrequencyBand& band : optimizer.frequencyBands) {
@@ -429,10 +521,36 @@ bool App::saveAppSettings(const AppSettings& settings,
     }
     optimizer_object["frequencyBands"] = picojson::value(bands);
 
+    picojson::array freeform_frequency;
+    for (double value : optimizer.freeformObjective.frequencyHz) {
+        freeform_frequency.emplace_back(number(value));
+    }
+    picojson::array freeform_target;
+    for (double value : optimizer.freeformObjective.targetTransmission) {
+        freeform_target.emplace_back(number(value));
+    }
+    picojson::object freeform_objective;
+    freeform_objective["frequencyHz"] = picojson::value(freeform_frequency);
+    freeform_objective["targetTransmission"] = picojson::value(freeform_target);
+    optimizer_object["freeformObjective"] = picojson::value(freeform_objective);
+
+    const UiSettings& ui = settings.uiSettings;
+    picojson::object ui_object;
+#define WRITE_UI(name) ui_object[#name] = number(ui.name)
+    WRITE_UI(plotXMinHz);
+    WRITE_UI(plotXMaxHz);
+    WRITE_UI(plotYMinDb);
+    WRITE_UI(plotYMaxDb);
+    WRITE_UI(plotYMinLinear);
+    WRITE_UI(plotYMaxLinear);
+#undef WRITE_UI
+    ui_object["displayInDb"] = picojson::value(ui.displayInDb);
+
     picojson::object root;
     root["version"] = number(1);
     root["solver"] = picojson::value(solver_object);
     root["optimizer"] = picojson::value(optimizer_object);
+    root["ui"] = picojson::value(ui_object);
 
     std::error_code file_error;
     std::filesystem::create_directories(path.parent_path(), file_error);

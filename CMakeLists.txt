@@ -271,7 +271,7 @@ add_library(GKlib STATIC ${_gklib_sources})
 target_include_directories(GKlib PUBLIC "${gklib_SOURCE_DIR}")
 set_target_properties(GKlib PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON)
 if(MSVC)
-  target_compile_definitions(GKlib PUBLIC
+  set(_gklib_msvc_definitions
     WIN32
     MSC
     _CRT_SECURE_NO_DEPRECATE
@@ -280,6 +280,7 @@ if(MSVC)
     NDEBUG2
     "__thread=__declspec(thread)"
   )
+  target_compile_definitions(GKlib PRIVATE ${_gklib_msvc_definitions})
 endif()
 if(UNIX)
   target_link_libraries(GKlib PUBLIC m)
@@ -299,6 +300,9 @@ target_include_directories(metis
   PRIVATE "${metis_SOURCE_DIR}/libmetis"
 )
 target_link_libraries(metis PUBLIC GKlib)
+if(MSVC)
+  target_compile_definitions(metis PRIVATE ${_gklib_msvc_definitions})
+endif()
 set_target_properties(metis PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON)
 
 # ParOpt is source-only upstream, so expose only its C++ core as a static target.

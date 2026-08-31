@@ -1009,10 +1009,6 @@ bool App::Solver::solve()
             reference_ready = false;
         }
 
-        if (!reference_analysis) {
-            streamToGlvis();
-        }
-
         const SparseMatrix& analysis_M = reference_analysis
             ? *reference_M : *M;
         const SparseMatrix& analysis_C = reference_analysis
@@ -1211,6 +1207,7 @@ bool App::Solver::solve()
     result.success = 1;
     status.store(SolverStatus::Converged);
     forward_is_ready = true;
+    streamToGlvis();
     log(LogLevel::Message,
         "Completed the Newmark solve and published the outlet transmission FFT.");
     return true;

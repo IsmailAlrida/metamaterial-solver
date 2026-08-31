@@ -3,6 +3,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include "dispatcher.hpp"
 #include "exporter.hpp"
@@ -71,13 +72,20 @@ namespace App {
 
             std::vector<float> objectiveFrequency;
             std::vector<float> objectiveTarget;
+            int selectedFreeformSample = -1;
+            int selectedBand = -1;
+            int lastFreeformDragSample = -1;
+            double lastFreeformDragValue = 1.0;
+            bool fitFrequencyPlot = false;
+            bool frequencyPlotCrosshairs = false;
+            std::unordered_map<ImGuiID, double> committedScientificInputs;
 
             SDL_Window* window = nullptr;
             SDL_GLContext glContext = nullptr;
             ImFont* uiFont = nullptr;
             ImFont* consoleFont = nullptr;
             const char* glslVersion = nullptr;
-            ImVec4 clearColor = ImVec4(0.035f, 0.047f, 0.067f, 1.0f);
+            ImVec4 clearColor = ImVec4(0.035f, 0.067f, 0.114f, 1.0f);
 
             bool sdlInitialized = false;
             bool imguiContextCreated = false;
@@ -103,6 +111,17 @@ namespace App {
                                         const ImGuiViewport& viewport);
             void updateObjectiveCurve();
             void rebuildImplicitPassBands();
+            void ensureFreeformObjectiveGrid();
+            void scientificInput(const char* label,
+                                 double& value,
+                                 double minimum,
+                                 double maximum,
+                                 const char* format);
+            void scientificInput(const char* label,
+                                 float& value,
+                                 float minimum,
+                                 float maximum,
+                                 const char* format);
 
             //todo: maybe just pass refs to the class objects in each functions JUST to make the interface obvious.
             // Or be a devious dev and just do this in the implementation
@@ -157,7 +176,7 @@ namespace App {
             void SimulationInfoPanel(const dispatcher_t& dispatcher);
 
             /*
-            OptimizerDesignPanel
+            FilterDesignerPanel
                 Designing the objective function graphically here
                 You get a sweet plot of the filter frequency response
                 Two input fields for the overall filter bandwidth (Basically X-range)
@@ -169,7 +188,7 @@ namespace App {
                     - Stop bands are edited as start/end frequencies above one attenuation target
                     - The invisible band row scrolls horizontally when it overflows
 
-                TODO: Add Freeform mode later:
+                Freeform mode:
                 On the plot itself, since we already have a fixed number of points in the background, we
                 can draw them in the following way:
                     - Mouse pointer down and hold
@@ -178,7 +197,7 @@ namespace App {
                     - Also should have clamps to min/max attenuation; clamp to Y-range value
                     - Reset button
             
-                Optional but real nice is Level Mode:
+                TODO: Optional Level Mode:
                 Similar to bandgap mode:
                     - Small checkbox toggle inside free form mode
                     - add discrete attenuation/amp levels
@@ -188,11 +207,12 @@ namespace App {
                     - Feature could be folded directly into freeform mode, replacing the bandgap row of triple sandwiches with single-entry attenuation levels.
 
             */
-            void OptimizerDesignPanel(const dispatcher_t& dispatcher);
+            void FilterDesignerPanel(const dispatcher_t& dispatcher);
             bool frequencyBandGroup(FrequencyBand& band,
                                     double lowerBound,
                                     double upperBound,
-                                    bool locked);
+                                    bool locked,
+                                    int bandNumber);
             
     };
 
