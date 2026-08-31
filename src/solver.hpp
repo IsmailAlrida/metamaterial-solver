@@ -49,26 +49,15 @@ namespace App {
     public:
 
         Solver(SolverSettings& settings,
-               OptimizerSettings& optimizer_settings,
                LevelSet& lset,
                SolverResult& result,
-               const LogFunction& log,
-               bool manage_parallel_workers = false);
+               const LogFunction& log);
 
         ~Solver();
 
         bool setMesh();
         bool assembleSolutionSpace();
         bool solve();
-        bool setMesh(bool parallel);
-        bool assembleSolutionSpace(bool parallel);
-        bool solve(bool parallel);
-        bool differentiateFrequencyResponses(
-            const std::vector<std::complex<double>>& pass_spectrum_derivative,
-            const std::vector<std::complex<double>>& stop_spectrum_derivative,
-            mfem::Vector& pass_design_gradient,
-            mfem::Vector& stop_design_gradient,
-            bool parallel);
         void parallelWorkerLoop();
         void shutdownParallelWorkers();
         SolverStatus get_status() const;
@@ -88,7 +77,6 @@ namespace App {
 
         // Settings are edited by the UI and read at the start of each sequential solver step.
         SolverSettings& settings;
-        OptimizerSettings& optimizer_settings;
         LevelSet& lset;
         SolverResult& result;
         const LogFunction& log;
@@ -98,21 +86,32 @@ namespace App {
         std::unique_ptr<mfem::FiniteElementSpace> level_set_fes;
         std::unique_ptr<mfem::FiniteElementSpace> scalar_fes;
         std::unique_ptr<mfem::FiniteElementSpace> displacement_fes;
+        std::unique_ptr<mfem::GridFunction> phi_field;
 
         int fe_order;
         int level_set_order;
         int cut_integration_order;
 
         // Newmark discrete matrices. What else should be classwide? the state vectors?
+#if !METAMATERIAL_USE_MPI
         std::unique_ptr<mfem::SparseMatrix> M;
         std::unique_ptr<mfem::SparseMatrix> C;
         std::unique_ptr<mfem::SparseMatrix> K;
+        std::unique_ptr<mfem::SparseMatrix> reference_M;
+        std::unique_ptr<mfem::SparseMatrix> reference_C;
+        std::unique_ptr<mfem::SparseMatrix> reference_K;
         std::unique_ptr<mfem::SparseMatrix> Muu_block;
         std::unique_ptr<mfem::SparseMatrix> Cuu_block;
         std::unique_ptr<mfem::SparseMatrix> Kuu_block;
         std::unique_ptr<mfem::SparseMatrix> Mpp_block;
         std::unique_ptr<mfem::SparseMatrix> Cpp_block;
         std::unique_ptr<mfem::SparseMatrix> Kpp_block;
+        std::unique_ptr<mfem::SparseMatrix> reference_Muu_block;
+        std::unique_ptr<mfem::SparseMatrix> reference_Cuu_block;
+        std::unique_ptr<mfem::SparseMatrix> reference_Kuu_block;
+        std::unique_ptr<mfem::SparseMatrix> reference_Mpp_block;
+        std::unique_ptr<mfem::SparseMatrix> reference_Cpp_block;
+        std::unique_ptr<mfem::SparseMatrix> reference_Kpp_block;
         std::unique_ptr<mfem::SparseMatrix> effective_displacement_block;
         std::unique_ptr<mfem::SparseMatrix> effective_pressure_block;
         std::unique_ptr<mfem::SparseMatrix> initial_displacement_block;
@@ -121,6 +120,7 @@ namespace App {
         std::unique_ptr<mfem::SparseMatrix> effective_matrix_transpose;
         std::unique_ptr<mfem::SparseMatrix> initial_matrix;
         std::unique_ptr<mfem::SparseMatrix> initial_matrix_transpose;
+#endif
         std::unique_ptr<mfem::SparseMatrix> design_to_cell;
         std::unique_ptr<mfem::SparseMatrix> cell_to_level_set;
         std::unique_ptr<mfem::SparseMatrix> filter_matrix;
@@ -145,18 +145,36 @@ namespace App {
         double design_region_measure = 0.0;
         int pressure_offset = 0;
         int glvis_connection_failures = 0;
-        bool design_initialized = false;
+        int mesh_nx = -1;
+        int mesh_ny = -1;
+        int mesh_nz = -1;
+        bool initialize_design_on_next_mesh = true;
+        bool mesh_is_ready = false;
+        bool assembly_is_ready = false;
+        bool forward_is_ready = false;
         bool reference_ready = false;
         std::atomic<SolverStatus> status{SolverStatus::Idle};
 
+#if METAMATERIAL_USE_MPI
         struct ParallelState;
-        std::shared_ptr<ParallelState> parallel_state;
-        bool manage_parallel_workers;
+        std::unique_ptr<ParallelState> parallel_state;
         bool parallel_workers_shutdown = false;
+#endif
 
         bool smooth_level_set(
             const mfem::GridFunction& level_set,
             mfem::GridFunction& smoothed_level_set);
+        bool buildDesignMesh();
+#if METAMATERIAL_USE_MPI
+        bool setMeshParallelLocal();
+        bool assembleSolutionSpaceParallelLocal();
+        bool solveParallelLocal();
+        bool differentiateFrequencyResponsesParallelLocal(
+            const std::vector<std::complex<double>>& pass_spectrum_derivative,
+            const std::vector<std::complex<double>>& stop_spectrum_derivative,
+            mfem::Vector& pass_design_gradient,
+            mfem::Vector& stop_design_gradient);
+#endif
         bool prepareLevelSetAndSource();
         bool bindToGlvis();
         void streamToGlvis();

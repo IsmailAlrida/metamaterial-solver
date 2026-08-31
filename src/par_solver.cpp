@@ -125,26 +125,30 @@ void factor_mumps(
         rank, "event=factor_complete matrix=" + name);
 }
 
-void broadcast_command(
-    MPI_Comm comm,
+template <typename callback_t>
+bool abort_on_distributed_exception(
     int rank,
-    int command_depth,
-    ParallelCommand command)
+    const char* stage,
+    callback_t&& callback)
 {
-    if (rank == 0 && command_depth == 0) {
-        int value = static_cast<int>(command);
-        MPI_Bcast(&value, 1, MPI_INT, 0, comm);
+    try {
+        return callback();
     }
+    catch (const std::exception& error) {
+        write_mumps_diagnostic(
+            rank,
+            "event=distributed_exception stage=" + std::string(stage)
+                + " exception=" + error.what());
+    }
+    catch (...) {
+        write_mumps_diagnostic(
+            rank,
+            "event=distributed_exception stage=" + std::string(stage)
+                + " exception=unknown");
+    }
+    MPI_Abort(MPI_COMM_WORLD, 1);
+    return false;
 }
-
-struct DepthGuard {
-    int& depth;
-
-    ~DepthGuard()
-    {
-        --depth;
-    }
-};
 
 template <typename T>
 void broadcast_value(MPI_Comm comm, T& value)
@@ -168,8 +172,7 @@ void broadcast_string(MPI_Comm comm, int rank, std::string& value)
 bool synchronize_settings(
     MPI_Comm comm,
     int rank,
-    App::SolverSettings& solver,
-    App::OptimizerSettings& optimizer)
+    App::SolverSettings& solver)
 {
     broadcast_value(comm, solver.nx);
     broadcast_value(comm, solver.ny);
@@ -191,6 +194,8 @@ bool synchronize_settings(
     broadcast_value(comm, solver.initialPatternY);
     broadcast_value(comm, solver.initialPatternBias);
     broadcast_value(comm, solver.initialPatternThreshold);
+    broadcast_value(comm, solver.filterRadius);
+    broadcast_value(comm, solver.cutDerivativeRelativeStep);
     broadcast_string(comm, rank, solver.algo);
     broadcast_value(comm, solver.isotropicGrid);
     broadcast_value(comm, solver.useHannWindow);
@@ -224,35 +229,6 @@ bool synchronize_settings(
         return false;
     }
 
-    broadcast_value(comm, optimizer.filterRadius);
-    broadcast_value(comm, optimizer.frequencyMin);
-    broadcast_value(comm, optimizer.frequencyMax);
-    broadcast_value(comm, optimizer.attenuationMinDb);
-    broadcast_value(comm, optimizer.attenuationMaxDb);
-    broadcast_value(comm, optimizer.frequencySamples);
-    broadcast_value(comm, optimizer.maxIterations);
-    broadcast_value(comm, optimizer.mmaInitialAsymptote);
-    broadcast_value(comm, optimizer.mmaDecreaseAsymptote);
-    broadcast_value(comm, optimizer.mmaIncreaseAsymptote);
-    broadcast_value(comm, optimizer.mmaConstraintPenalty);
-    broadcast_value(comm, optimizer.cutDerivativeRelativeStep);
-    broadcast_value(comm, optimizer.displayTargetInDb);
-
-    int band_count = rank == 0
-        ? static_cast<int>(optimizer.frequencyBands.size()) : 0;
-    broadcast_value(comm, band_count);
-    if (band_count < 0 || band_count > 10000) {
-        return false;
-    }
-    if (rank != 0) {
-        optimizer.frequencyBands.resize(band_count);
-    }
-    for (App::FrequencyBand& band : optimizer.frequencyBands) {
-        broadcast_value(comm, band.type);
-        broadcast_value(comm, band.startHz);
-        broadcast_value(comm, band.endHz);
-        broadcast_value(comm, band.targetTransmission);
-    }
     return true;
 }
 
@@ -296,16 +272,6 @@ void broadcast_vector(MPI_Comm comm, int rank, Vector& values)
     values.SetSize(size);
     if (size > 0) {
         MPI_Bcast(values.GetData(), size, MPI_DOUBLE, 0, comm);
-    }
-}
-
-void broadcast_array(MPI_Comm comm, int rank, Array<int>& values)
-{
-    int size = rank == 0 ? values.Size() : 0;
-    MPI_Bcast(&size, 1, MPI_INT, 0, comm);
-    values.SetSize(size);
-    if (size > 0) {
-        MPI_Bcast(values.GetData(), size, MPI_INT, 0, comm);
     }
 }
 
@@ -362,12 +328,20 @@ struct App::Solver::ParallelState {
     std::unique_ptr<HypreParMatrix> M;
     std::unique_ptr<HypreParMatrix> C;
     std::unique_ptr<HypreParMatrix> K;
+    std::unique_ptr<HypreParMatrix> reference_M;
+    std::unique_ptr<HypreParMatrix> reference_C;
+    std::unique_ptr<HypreParMatrix> reference_K;
     std::unique_ptr<HypreParMatrix> Muu;
     std::unique_ptr<HypreParMatrix> Cuu;
     std::unique_ptr<HypreParMatrix> Kuu;
     std::unique_ptr<HypreParMatrix> Mpp;
     std::unique_ptr<HypreParMatrix> Cpp;
     std::unique_ptr<HypreParMatrix> Kpp;
+    std::unique_ptr<HypreParMatrix> reference_Muu;
+    std::unique_ptr<HypreParMatrix> reference_Cuu;
+    std::unique_ptr<HypreParMatrix> reference_Kuu;
+    std::unique_ptr<HypreParMatrix> reference_Mpp;
+    std::unique_ptr<HypreParMatrix> reference_Kpp;
     std::unique_ptr<HypreParMatrix> initial_matrix;
     std::unique_ptr<HypreParMatrix> effective_matrix;
     std::unique_ptr<HypreParMatrix> initial_displacement;
@@ -386,10 +360,26 @@ struct App::Solver::ParallelState {
     Vector system_inlet_load;
     Vector system_outlet_functional;
     Array<int> displacement_essential_tdofs;
+    Array<int> active_design_dofs;
     bool boundary_data_ready = false;
     bool reference_ready = false;
-    int command_depth = 0;
 };
+
+App::Solver::Solver(App::SolverSettings& settings,
+                    App::LevelSet& lset,
+                    App::SolverResult& result,
+                    const App::LogFunction& log)
+    : settings(settings),
+      lset(lset),
+      result(result),
+      log(log),
+      fe_order(1),
+      level_set_order(1),
+      cut_integration_order(4)
+{
+}
+
+App::Solver::~Solver() = default;
 
 #endif
 
@@ -410,30 +400,36 @@ void App::Solver::parallelWorkerLoop()
         MPI_Bcast(&command_value, 1, MPI_INT, 0, MPI_COMM_WORLD);
         const auto command = static_cast<ParallelCommand>(command_value);
         if (command == ParallelCommand::shutdown) {
+            if (parallel_state) {
+                parallel_state->initial_mumps.reset();
+                parallel_state->effective_mumps.reset();
+            }
             parallel_workers_shutdown = true;
+            MPI_Barrier(MPI_COMM_WORLD);
             return;
         }
         try {
             if (command == ParallelCommand::set_mesh) {
-                setMesh(true);
+                setMeshParallelLocal();
             }
             else if (command == ParallelCommand::assemble) {
-                assembleSolutionSpace(true);
+                assembleSolutionSpaceParallelLocal();
             }
             else if (command == ParallelCommand::solve) {
-                solve(true);
+                solveParallelLocal();
             }
             else if (command == ParallelCommand::differentiate) {
                 std::vector<std::complex<double>> pass;
                 std::vector<std::complex<double>> stop;
                 Vector pass_gradient;
                 Vector stop_gradient;
-                differentiateFrequencyResponses(
-                    pass, stop, pass_gradient, stop_gradient, true);
+                differentiateFrequencyResponsesParallelLocal(
+                    pass, stop, pass_gradient, stop_gradient);
             }
             else {
                 std::cerr << "Unknown parallel solver command on MPI rank "
                           << rank << ".\n";
+                MPI_Abort(MPI_COMM_WORLD, 1);
                 return;
             }
         }
@@ -443,6 +439,8 @@ void App::Solver::parallelWorkerLoop()
                 "event=worker_error command="
                     + std::to_string(command_value)
                     + " exception=" + error.what());
+            MPI_Abort(MPI_COMM_WORLD, 1);
+            return;
         }
         catch (...) {
             write_mumps_diagnostic(
@@ -450,6 +448,8 @@ void App::Solver::parallelWorkerLoop()
                 "event=worker_error command="
                     + std::to_string(command_value)
                     + " exception=unknown");
+            MPI_Abort(MPI_COMM_WORLD, 1);
+            return;
         }
     }
 #endif
@@ -458,7 +458,7 @@ void App::Solver::parallelWorkerLoop()
 void App::Solver::shutdownParallelWorkers()
 {
 #if METAMATERIAL_USE_MPI
-    if (!manage_parallel_workers || parallel_workers_shutdown) {
+    if (parallel_workers_shutdown) {
         return;
     }
     int initialized = 0;
@@ -477,82 +477,143 @@ void App::Solver::shutdownParallelWorkers()
         int command = static_cast<int>(ParallelCommand::shutdown);
         MPI_Bcast(&command, 1, MPI_INT, 0, MPI_COMM_WORLD);
     }
+    if (parallel_state) {
+        parallel_state->initial_mumps.reset();
+        parallel_state->effective_mumps.reset();
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
     parallel_workers_shutdown = true;
 #endif
 }
 
-bool App::Solver::setMesh(bool parallel)
+#if METAMATERIAL_USE_MPI
+bool App::Solver::setMesh()
 {
-    if (!parallel) {
-        return setMesh();
+    int rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    if (rank != 0) {
+        return false;
     }
+    int command = static_cast<int>(ParallelCommand::set_mesh);
+    MPI_Bcast(&command, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    return abort_on_distributed_exception(
+        rank, "set_mesh", [this]() { return setMeshParallelLocal(); });
+}
 
-#if !METAMATERIAL_USE_MPI
-    log(LogLevel::Error,
-        "The parallel solver requires a parallel-cpu build.");
-    return false;
-#else
+bool App::Solver::setMeshParallelLocal()
+{
     int rank = 0;
     int ranks = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
-    broadcast_command(
-        MPI_COMM_WORLD, rank, 0, ParallelCommand::set_mesh);
-    if (!synchronize_settings(
-            MPI_COMM_WORLD, rank, settings, optimizer_settings)) {
+    write_mumps_diagnostic(rank, "event=stage_begin stage=set_mesh");
+    if (!synchronize_settings(MPI_COMM_WORLD, rank, settings)) {
         if (rank == 0) {
             log(LogLevel::Error, "Could not broadcast the solver settings.");
         }
         return false;
     }
+    write_mumps_diagnostic(rank, "event=stage_complete stage=settings_broadcast");
 
-    parallel_state = std::make_shared<ParallelState>();
+    if (parallel_state) {
+        parallel_state->initial_mumps.reset();
+        parallel_state->effective_mumps.reset();
+    }
+    parallel_state = std::make_unique<ParallelState>();
     parallel_state->rank = rank;
     parallel_state->ranks = ranks;
     performance_data.mpiRanks = ranks;
     parallel_workers_shutdown = false;
-    const bool ready = setMesh();
+    const bool ready = buildDesignMesh();
     int all_ready = ready ? 1 : 0;
     MPI_Allreduce(MPI_IN_PLACE, &all_ready, 1, MPI_INT, MPI_MIN,
                   parallel_state->comm);
+    if (all_ready) {
+        const int dim = mesh->Dimension();
+        parallel_state->partition.resize(mesh->GetNE());
+        for (int element = 0; element < mesh->GetNE(); ++element) {
+            parallel_state->partition[element] = std::min(
+                ranks - 1, element * ranks / mesh->GetNE());
+        }
+        parallel_state->mesh = std::make_unique<ParMesh>(
+            parallel_state->comm, *mesh,
+            parallel_state->partition.data());
+        parallel_state->collection =
+            std::make_unique<H1_FECollection>(fe_order, dim);
+        parallel_state->scalar_fes =
+            std::make_unique<ParFiniteElementSpace>(
+                parallel_state->mesh.get(),
+                parallel_state->collection.get());
+        parallel_state->displacement_fes =
+            std::make_unique<ParFiniteElementSpace>(
+                parallel_state->mesh.get(),
+                parallel_state->collection.get(),
+                dim, Ordering::byVDIM);
+
+        Vector active_true_dofs(level_set_fes->GetTrueVSize());
+        active_true_dofs = 0.0;
+        for (int i = 0; i < lset.activeDesignDofs.Size(); ++i) {
+            active_true_dofs[lset.activeDesignDofs[i]] = 1.0;
+        }
+        GridFunction global_active_design(level_set_fes.get());
+        global_active_design.SetFromTrueDofs(active_true_dofs);
+        ParGridFunction active_design(
+            parallel_state->mesh.get(), &global_active_design,
+            parallel_state->partition.data());
+        parallel_state->active_design_dofs.SetSize(active_design.Size());
+        for (int dof = 0; dof < active_design.Size(); ++dof) {
+            parallel_state->active_design_dofs[dof] =
+                active_design[dof] > 0.5 ? 1 : 0;
+        }
+        write_mumps_diagnostic(
+            rank, "event=stage_complete stage=parmesh");
+    }
     if (all_ready && parallel_state->rank == 0) {
         log(LogLevel::Message,
             "Prepared the global mesh for "
                 + std::to_string(parallel_state->ranks) + " MPI ranks.");
     }
+    write_mumps_diagnostic(
+        rank, all_ready
+            ? "event=stage_complete stage=set_mesh"
+            : "event=stage_error stage=set_mesh");
     return all_ready != 0;
-#endif
 }
 
-bool App::Solver::assembleSolutionSpace(bool parallel)
+bool App::Solver::assembleSolutionSpace()
 {
-    if (!parallel) {
-        return assembleSolutionSpace();
-    }
-
-#if !METAMATERIAL_USE_MPI
-    log(LogLevel::Error,
-        "The parallel solver requires a parallel-cpu build.");
-    return false;
-#else
     int rank = 0;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    broadcast_command(
-        MPI_COMM_WORLD,
-        rank,
-        parallel_state ? parallel_state->command_depth : 0,
-        ParallelCommand::assemble);
-    const bool assembly_ready = parallel_state && mesh;
+    if (rank != 0) {
+        return false;
+    }
+    int command = static_cast<int>(ParallelCommand::assemble);
+    MPI_Bcast(&command, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    return abort_on_distributed_exception(
+        rank, "assemble",
+        [this]() { return assembleSolutionSpaceParallelLocal(); });
+}
+
+bool App::Solver::assembleSolutionSpaceParallelLocal()
+{
+    int rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    const bool assembly_ready = parallel_state && mesh && mesh_is_ready
+        && parallel_state->mesh && parallel_state->collection
+        && parallel_state->scalar_fes
+        && parallel_state->displacement_fes;
     if (!all_succeeded(MPI_COMM_WORLD, assembly_ready)) {
         if (rank == 0) {
             log(LogLevel::Error,
-                "Call setMesh(true) before parallel assembly.");
+                "Call setMesh() before parallel assembly.");
         }
         return false;
     }
     ParallelState& state = *parallel_state;
-    ++state.command_depth;
-    DepthGuard depth_guard{state.command_depth};
+    write_mumps_diagnostic(
+        state.rank, "event=stage_begin stage=assemble");
+    assembly_is_ready = false;
+    forward_is_ready = false;
     const auto started_at = std::chrono::steady_clock::now();
 
     // A new assembly invalidates every state, adjoint, factorization, and
@@ -574,6 +635,15 @@ bool App::Solver::assembleSolutionSpace(bool parallel)
     state.initial_pressure.reset();
     state.effective_displacement.reset();
     state.effective_pressure.reset();
+    state.M.reset();
+    state.C.reset();
+    state.K.reset();
+    state.Muu.reset();
+    state.Cuu.reset();
+    state.Kuu.reset();
+    state.Mpp.reset();
+    state.Kpp.reset();
+    state.phi.reset();
 
     // Rank zero owns the replicated design and paper cell-centred filter.
     // The distributed ranks receive only the filtered level set and source.
@@ -587,56 +657,27 @@ bool App::Solver::assembleSolutionSpace(bool parallel)
     }
 
     const int dim = mesh->Dimension();
-    const double design_start = settings.inletLength;
-    const double design_end = settings.inletLength + settings.designLength;
-    for (int element = 0; element < mesh->GetNE(); ++element) {
-        Vector center(dim);
-        mesh->GetElementCenter(element, center);
-        mesh->SetAttribute(
-            element,
-            center[0] < design_start
-                ? static_cast<int>(DomainAttribute::inlet)
-                : center[0] < design_end
-                    ? static_cast<int>(DomainAttribute::design)
-                    : static_cast<int>(DomainAttribute::outlet));
-    }
-    mesh->SetAttributes();
-
     Vector global_phi;
     if (state.rank == 0) {
-        lset.phi->GetTrueDofs(global_phi);
+        global_phi = lset.phi;
     }
     broadcast_vector(state.comm, state.rank, lset.design);
     broadcast_vector(state.comm, state.rank, global_phi);
-    broadcast_array(state.comm, state.rank, lset.activeDesignDofs);
+    if (state.rank != 0) {
+        lset.phi = global_phi;
+    }
     MPI_Bcast(&level_set_scale, 1, MPI_DOUBLE, 0, state.comm);
     broadcast_vector(state.comm, state.rank, source_pressure);
     broadcast_vector(state.comm, state.rank, source_pressure_derivative);
 
     int time_steps = state.rank == 0 ? result.timeSteps : 0;
     MPI_Bcast(&time_steps, 1, MPI_INT, 0, state.comm);
-    if (!state.mesh) {
-        state.partition.resize(mesh->GetNE());
-        for (int element = 0; element < mesh->GetNE(); ++element) {
-            state.partition[element] = std::min(
-                state.ranks - 1,
-                element * state.ranks / mesh->GetNE());
-        }
-        state.mesh = std::make_unique<ParMesh>(
-            state.comm, *mesh, state.partition.data());
-        state.collection = std::make_unique<H1_FECollection>(fe_order, dim);
-        state.scalar_fes = std::make_unique<ParFiniteElementSpace>(
-            state.mesh.get(), state.collection.get());
-        state.displacement_fes = std::make_unique<ParFiniteElementSpace>(
-            state.mesh.get(), state.collection.get(), dim, Ordering::byVDIM);
-    }
-
-    H1_FECollection global_collection(fe_order, dim);
-    FiniteElementSpace global_space(mesh.get(), &global_collection);
-    GridFunction global_level_set(&global_space);
+    GridFunction global_level_set(level_set_fes.get());
     global_level_set.SetFromTrueDofs(global_phi);
     state.phi = std::make_unique<ParGridFunction>(
         state.mesh.get(), &global_level_set, state.partition.data());
+    write_mumps_diagnostic(
+        state.rank, "event=stage_complete stage=level_set_transfer");
 
     const auto* physics = std::get_if<VibroacousticSettings>(&settings.physics);
     if (physics == nullptr) {
@@ -690,6 +731,7 @@ bool App::Solver::assembleSolutionSpace(bool parallel)
     Muu_form.Assemble();
     Muu_form.Finalize();
     state.Muu.reset(Muu_form.ParallelAssemble());
+    write_mumps_diagnostic(state.rank, "event=matrix_complete matrix=Muu");
 
     double solid_measure = solid_domain_integrator->GetCutMeasure();
     MPI_Allreduce(MPI_IN_PLACE, &solid_measure, 1, MPI_DOUBLE, MPI_SUM,
@@ -728,6 +770,7 @@ bool App::Solver::assembleSolutionSpace(bool parallel)
     Kuu_form.Assemble();
     Kuu_form.Finalize();
     state.Kuu.reset(Kuu_form.ParallelAssemble());
+    write_mumps_diagnostic(state.rank, "event=matrix_complete matrix=Kuu");
 
     ParBilinearForm Mpp_form(state.scalar_fes.get());
     Mpp_form.AddDomainIntegrator(new ImplicitDomainIntegrator(
@@ -742,6 +785,7 @@ bool App::Solver::assembleSolutionSpace(bool parallel)
     Mpp_form.Assemble();
     Mpp_form.Finalize();
     state.Mpp.reset(Mpp_form.ParallelAssemble());
+    write_mumps_diagnostic(state.rank, "event=matrix_complete matrix=Mpp");
 
     ParBilinearForm Kpp_form(state.scalar_fes.get());
     Kpp_form.AddDomainIntegrator(new ImplicitDomainIntegrator(
@@ -756,6 +800,7 @@ bool App::Solver::assembleSolutionSpace(bool parallel)
     Kpp_form.Assemble();
     Kpp_form.Finalize();
     state.Kpp.reset(Kpp_form.ParallelAssemble());
+    write_mumps_diagnostic(state.rank, "event=matrix_complete matrix=Kpp");
 
     ParMixedBilinearForm Kup_form(
         state.scalar_fes.get(), state.displacement_fes.get());
@@ -765,6 +810,7 @@ bool App::Solver::assembleSolutionSpace(bool parallel)
     Kup_form.Assemble();
     Kup_form.Finalize();
     std::unique_ptr<HypreParMatrix> Kup(Kup_form.ParallelAssemble());
+    write_mumps_diagnostic(state.rank, "event=matrix_complete matrix=Kup");
 
     ParMixedBilinearForm Mpu_form(
         state.displacement_fes.get(), state.scalar_fes.get());
@@ -774,6 +820,7 @@ bool App::Solver::assembleSolutionSpace(bool parallel)
     Mpu_form.Assemble();
     Mpu_form.Finalize();
     std::unique_ptr<HypreParMatrix> Mpu(Mpu_form.ParallelAssemble());
+    write_mumps_diagnostic(state.rank, "event=matrix_complete matrix=Mpu");
     int local_degenerate_normals = std::max(
         Kup_integrator->GetDegenerateNormalCount(),
         Mpu_integrator->GetDegenerateNormalCount());
@@ -818,6 +865,7 @@ bool App::Solver::assembleSolutionSpace(bool parallel)
         Cpp_form.Finalize();
         cpp_is_finite = Cpp_form.SpMat().CheckFinite() == 0;
         state.Cpp.reset(Cpp_form.ParallelAssemble());
+        write_mumps_diagnostic(state.rank, "event=matrix_complete matrix=Cpp");
     }
 
     std::unique_ptr<SparseMatrix> Kup_transpose(
@@ -839,6 +887,57 @@ bool App::Solver::assembleSolutionSpace(bool parallel)
     state.M = block_matrix(state.Muu.get(), nullptr, Mpu.get(), state.Mpp.get());
     state.C = block_matrix(state.Cuu.get(), nullptr, nullptr, state.Cpp.get());
     state.K = block_matrix(state.Kuu.get(), Kup.get(), nullptr, state.Kpp.get());
+
+    if (!state.reference_M) {
+        ParBilinearForm reference_Muu_form(state.displacement_fes.get());
+        reference_Muu_form.AddDomainIntegrator(
+            new VectorMassIntegrator(fictitious_solid_density));
+        reference_Muu_form.Assemble();
+        reference_Muu_form.Finalize();
+        state.reference_Muu.reset(reference_Muu_form.ParallelAssemble());
+        write_mumps_diagnostic(
+            state.rank, "event=matrix_complete matrix=reference_Muu");
+
+        ParBilinearForm reference_Kuu_form(state.displacement_fes.get());
+        reference_Kuu_form.AddDomainIntegrator(new ElasticityIntegrator(
+            fictitious_solid_lambda, fictitious_solid_mu));
+        reference_Kuu_form.Assemble();
+        reference_Kuu_form.Finalize();
+        state.reference_Kuu.reset(reference_Kuu_form.ParallelAssemble());
+        write_mumps_diagnostic(
+            state.rank, "event=matrix_complete matrix=reference_Kuu");
+
+        ParBilinearForm reference_Mpp_form(state.scalar_fes.get());
+        reference_Mpp_form.AddDomainIntegrator(
+            new MassIntegrator(acoustic_mass));
+        reference_Mpp_form.Assemble();
+        reference_Mpp_form.Finalize();
+        state.reference_Mpp.reset(reference_Mpp_form.ParallelAssemble());
+        write_mumps_diagnostic(
+            state.rank, "event=matrix_complete matrix=reference_Mpp");
+
+        ParBilinearForm reference_Kpp_form(state.scalar_fes.get());
+        reference_Kpp_form.AddDomainIntegrator(
+            new DiffusionIntegrator(acoustic_stiffness));
+        reference_Kpp_form.Assemble();
+        reference_Kpp_form.Finalize();
+        state.reference_Kpp.reset(reference_Kpp_form.ParallelAssemble());
+        write_mumps_diagnostic(
+            state.rank, "event=matrix_complete matrix=reference_Kpp");
+
+        state.reference_Cuu.reset(Add(
+            alpha_d, *state.reference_Muu,
+            beta_d, *state.reference_Kuu));
+        state.reference_M = block_matrix(
+            state.reference_Muu.get(), nullptr,
+            nullptr, state.reference_Mpp.get());
+        state.reference_C = block_matrix(
+            state.reference_Cuu.get(), nullptr,
+            nullptr, state.Cpp.get());
+        state.reference_K = block_matrix(
+            state.reference_Kuu.get(), nullptr,
+            nullptr, state.reference_Kpp.get());
+    }
     const bool matrices_are_finite = Muu_form.SpMat().CheckFinite() == 0
         && Kuu_form.SpMat().CheckFinite() == 0
         && Mpp_form.SpMat().CheckFinite() == 0
@@ -932,43 +1031,45 @@ bool App::Solver::assembleSolutionSpace(bool parallel)
             "Assembled distributed vibroacoustic matrices on "
                 + std::to_string(state.ranks) + " MPI ranks.");
     }
+    assembly_is_ready = true;
+    write_mumps_diagnostic(
+        state.rank, "event=stage_complete stage=assemble");
     return true;
-#endif
 }
 
-bool App::Solver::solve(bool parallel)
+bool App::Solver::solve()
 {
-    if (!parallel) {
-        return solve();
-    }
-
-#if !METAMATERIAL_USE_MPI
-    log(LogLevel::Error,
-        "The parallel solver requires a parallel-cpu build.");
-    return false;
-#else
     int rank = 0;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    broadcast_command(
-        MPI_COMM_WORLD,
-        rank,
-        parallel_state ? parallel_state->command_depth : 0,
-        ParallelCommand::solve);
-    const bool solver_ready = parallel_state && mesh;
+    if (rank != 0) {
+        return false;
+    }
+    int command = static_cast<int>(ParallelCommand::solve);
+    MPI_Bcast(&command, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    return abort_on_distributed_exception(
+        rank, "solve", [this]() { return solveParallelLocal(); });
+}
+
+bool App::Solver::solveParallelLocal()
+{
+    int rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    const bool solver_ready = parallel_state && mesh
+        && mesh_is_ready && assembly_is_ready;
     if (!all_succeeded(MPI_COMM_WORLD, solver_ready)) {
         if (rank == 0) {
             log(LogLevel::Error,
-                "Call setMesh(true) before the parallel solve.");
+                "Call setMesh() before the parallel solve.");
         }
         status.store(SolverStatus::Error);
         return false;
     }
     ParallelState& state = *parallel_state;
-    ++state.command_depth;
-    DepthGuard depth_guard{state.command_depth};
+    write_mumps_diagnostic(state.rank, "event=stage_begin stage=solve");
     status.store(SolverStatus::Working);
     result.success = 0;
     frequency_response = {};
+    forward_is_ready = false;
     performance_data.forwardFgmresIterations = 0;
     performance_data.forwardFgmresSolves = 0;
     performance_data.maximumForwardFgmresIterations = 0;
@@ -980,20 +1081,21 @@ bool App::Solver::solve(bool parallel)
     bool designed_assembly_ready = state.M && state.C && state.K
         && state.Muu && state.Cuu && state.Kuu
         && state.Mpp && state.Cpp && state.Kpp && state.phi
+        && state.reference_M && state.reference_C && state.reference_K
+        && state.reference_Muu && state.reference_Cuu
+        && state.reference_Kuu && state.reference_Mpp
+        && state.reference_Kpp
         && lset.design.Size() > 0;
     if (!all_succeeded(state.comm, designed_assembly_ready)) {
         if (state.rank == 0) {
             log(LogLevel::Error,
-                "Call assembleSolutionSpace(true) before solve(true).");
+                "Call assembleSolutionSpace() before solve().");
         }
         status.store(SolverStatus::Error);
         return false;
     }
 
-    const Vector designed_geometry(lset.design);
-    auto fail = [this, &state, &designed_geometry](SolverStatus failure) {
-        lset.design = designed_geometry;
-        state.reference_ready = false;
+    auto fail = [this](SolverStatus failure) {
         status.store(failure);
         return false;
     };
@@ -1003,19 +1105,65 @@ bool App::Solver::solve(bool parallel)
         const bool reference_analysis = analysis == 0;
         if (reference_analysis) {
             state.reference_ready = false;
-            lset.design = 0.0;
         }
-        else {
-            lset.design = designed_geometry;
-        }
-        if ((reference_analysis || !designed_assembly_ready)
-            && !assembleSolutionSpace(true)) {
-            return fail(SolverStatus::Error);
-        }
-        designed_assembly_ready = !reference_analysis;
 
         if (!reference_analysis && state.rank == 0) {
             streamToGlvis();
+        }
+
+        const HypreParMatrix& analysis_M = reference_analysis
+            ? *state.reference_M : *state.M;
+        const HypreParMatrix& analysis_C = reference_analysis
+            ? *state.reference_C : *state.C;
+        const HypreParMatrix& analysis_K = reference_analysis
+            ? *state.reference_K : *state.K;
+        const HypreParMatrix& analysis_Muu = reference_analysis
+            ? *state.reference_Muu : *state.Muu;
+        const HypreParMatrix& analysis_Cuu = reference_analysis
+            ? *state.reference_Cuu : *state.Cuu;
+        const HypreParMatrix& analysis_Kuu = reference_analysis
+            ? *state.reference_Kuu : *state.Kuu;
+        const HypreParMatrix& analysis_Mpp = reference_analysis
+            ? *state.reference_Mpp : *state.Mpp;
+        const HypreParMatrix& analysis_Kpp = reference_analysis
+            ? *state.reference_Kpp : *state.Kpp;
+
+        int communicator_relation = MPI_UNEQUAL;
+        MPI_Comm_compare(
+            state.comm, analysis_M.GetComm(), &communicator_relation);
+        long long global_rows = analysis_M.GetGlobalNumRows();
+        long long minimum_rows = global_rows;
+        long long maximum_rows = global_rows;
+        MPI_Allreduce(
+            MPI_IN_PLACE, &minimum_rows, 1,
+            MPI_LONG_LONG, MPI_MIN, state.comm);
+        MPI_Allreduce(
+            MPI_IN_PLACE, &maximum_rows, 1,
+            MPI_LONG_LONG, MPI_MAX, state.comm);
+        const int expected_local_size =
+            state.displacement_fes->GetTrueVSize()
+            + state.scalar_fes->GetTrueVSize();
+        const bool distributed_contract_ready =
+            (communicator_relation == MPI_IDENT
+                || communicator_relation == MPI_CONGRUENT)
+            && analysis_M.GetGlobalNumRows()
+                == analysis_M.GetGlobalNumCols()
+            && analysis_C.GetGlobalNumRows() == global_rows
+            && analysis_C.GetGlobalNumCols() == global_rows
+            && analysis_K.GetGlobalNumRows() == global_rows
+            && analysis_K.GetGlobalNumCols() == global_rows
+            && minimum_rows == maximum_rows
+            && analysis_M.Height() == expected_local_size
+            && state.system_inlet_load.Size() == expected_local_size
+            && state.system_outlet_functional.Size() == expected_local_size
+            && state.phi->Size() == state.scalar_fes->GetVSize()
+            && state.active_design_dofs.Size() == state.phi->Size();
+        if (!all_succeeded(state.comm, distributed_contract_ready)) {
+            if (state.rank == 0) {
+                log(LogLevel::Error,
+                    "The distributed matrix, vector, or level-set dimensions are inconsistent.");
+            }
+            return fail(SolverStatus::Error);
         }
 
         const auto* physics =
@@ -1034,33 +1182,56 @@ bool App::Solver::solve(bool parallel)
         const double a_3 = gamma / (beta * settings.dt);
         const double a_6 = 1.0 / (beta * settings.dt * settings.dt);
         std::unique_ptr<HypreParMatrix> M_and_C(
-            Add(a_6, *state.M, a_3, *state.C));
+            Add(a_6, analysis_M, a_3, analysis_C));
         std::unique_ptr<HypreParMatrix> K_hat(
-            Add(1.0, *state.K, 1.0, *M_and_C));
+            Add(1.0, analysis_K, 1.0, *M_and_C));
         K_hat->EliminateBC(
             state.displacement_essential_tdofs, Operator::DIAG_ONE);
 
         std::unique_ptr<HypreParMatrix> Muu_and_Cuu(
-            Add(a_6, *state.Muu, a_3, *state.Cuu));
+            Add(a_6, analysis_Muu, a_3, analysis_Cuu));
         std::unique_ptr<HypreParMatrix> effective_displacement(
-            Add(1.0, *state.Kuu, 1.0, *Muu_and_Cuu));
+            Add(1.0, analysis_Kuu, 1.0, *Muu_and_Cuu));
         std::unique_ptr<HypreParMatrix> Mpp_and_Cpp(
-            Add(a_6, *state.Mpp, a_3, *state.Cpp));
+            Add(a_6, analysis_Mpp, a_3, *state.Cpp));
         std::unique_ptr<HypreParMatrix> effective_pressure(
-            Add(1.0, *state.Kpp, 1.0, *Mpp_and_Cpp));
+            Add(1.0, analysis_Kpp, 1.0, *Mpp_and_Cpp));
         effective_displacement->EliminateBC(
             state.displacement_essential_tdofs, Operator::DIAG_ONE);
 
         std::unique_ptr<HypreParMatrix> M_system(
-            new HypreParMatrix(*state.M));
+            new HypreParMatrix(analysis_M));
         M_system->EliminateBC(
             state.displacement_essential_tdofs, Operator::DIAG_ONE);
         std::unique_ptr<HypreParMatrix> initial_displacement(
-            new HypreParMatrix(*state.Muu));
+            new HypreParMatrix(analysis_Muu));
         initial_displacement->EliminateBC(
             state.displacement_essential_tdofs, Operator::DIAG_ONE);
         std::unique_ptr<HypreParMatrix> initial_pressure(
-            new HypreParMatrix(*state.Mpp));
+            new HypreParMatrix(analysis_Mpp));
+
+        int initial_relation = MPI_UNEQUAL;
+        int effective_relation = MPI_UNEQUAL;
+        MPI_Comm_compare(
+            state.comm, M_system->GetComm(), &initial_relation);
+        MPI_Comm_compare(
+            state.comm, K_hat->GetComm(), &effective_relation);
+        const bool solve_operators_ready =
+            (initial_relation == MPI_IDENT
+                || initial_relation == MPI_CONGRUENT)
+            && (effective_relation == MPI_IDENT
+                || effective_relation == MPI_CONGRUENT)
+            && M_system->Height() == expected_local_size
+            && K_hat->Height() == expected_local_size
+            && M_system->GetGlobalNumRows() == global_rows
+            && K_hat->GetGlobalNumRows() == global_rows;
+        if (!all_succeeded(state.comm, solve_operators_ready)) {
+            if (state.rank == 0) {
+                log(LogLevel::Error,
+                    "The distributed Newmark solve operators have incompatible dimensions.");
+            }
+            return fail(SolverStatus::Error);
+        }
 
         Array<int> offsets(3);
         offsets[0] = 0;
@@ -1187,6 +1358,11 @@ bool App::Solver::solve(bool parallel)
 
         std::vector<double>& measured_outlet = reference_analysis
             ? reference_outlet_pressure : outlet_pressure;
+        write_mumps_diagnostic(
+            state.rank,
+            std::string("event=stage_begin stage=")
+                + (reference_analysis
+                    ? "reference_transient" : "designed_transient"));
         const auto transient_started_at = std::chrono::steady_clock::now();
         const LogFunction rank_log = state.rank == 0
             ? log
@@ -1194,9 +1370,9 @@ bool App::Solver::solve(bool parallel)
         const bool transient_ready = detail::runNewmark(
                 settings,
                 *physics,
-                *state.M,
-                *state.C,
-                *state.K,
+                analysis_M,
+                analysis_C,
+                analysis_K,
                 *M_system,
                 *K_hat,
                 state.displacement_essential_tdofs,
@@ -1236,6 +1412,11 @@ bool App::Solver::solve(bool parallel)
         }
         const double transient_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - transient_started_at).count();
+        write_mumps_diagnostic(
+            state.rank,
+            std::string("event=stage_complete stage=")
+                + (reference_analysis
+                    ? "reference_transient" : "designed_transient"));
         if (reference_analysis) {
             state.initial_u_amg.reset();
             state.initial_p_amg.reset();
@@ -1255,52 +1436,58 @@ bool App::Solver::solve(bool parallel)
         }
     }
 
-    lset.design = designed_geometry;
     const auto fourier_started_at = std::chrono::steady_clock::now();
+    write_mumps_diagnostic(state.rank, "event=stage_begin stage=fft");
     const bool fourier_ready = postprocessFourierResponse();
     if (!all_succeeded(state.comm, fourier_ready)) {
         return fail(SolverStatus::Error);
     }
     performance_data.fourierSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - fourier_started_at).count();
+    write_mumps_diagnostic(state.rank, "event=stage_complete stage=fft");
     result.success = 1;
     status.store(SolverStatus::Converged);
+    forward_is_ready = true;
     if (state.rank == 0) {
         log(LogLevel::Message,
             "Completed the distributed Newmark solve and outlet FFT.");
     }
+    write_mumps_diagnostic(state.rank, "event=stage_complete stage=solve");
     return true;
-#endif
 }
 
 bool App::Solver::differentiateFrequencyResponses(
     const std::vector<std::complex<double>>& pass_spectrum_derivative,
     const std::vector<std::complex<double>>& stop_spectrum_derivative,
     Vector& pass_design_gradient,
-    Vector& stop_design_gradient,
-    bool parallel)
+    Vector& stop_design_gradient)
 {
-    if (!parallel) {
-        return differentiateFrequencyResponses(
-            pass_spectrum_derivative,
-            stop_spectrum_derivative,
-            pass_design_gradient,
-            stop_design_gradient);
-    }
-
-#if !METAMATERIAL_USE_MPI
-    log(LogLevel::Error,
-        "The parallel adjoint requires a parallel-cpu build.");
-    return false;
-#else
     int rank = 0;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    broadcast_command(
-        MPI_COMM_WORLD,
-        rank,
-        parallel_state ? parallel_state->command_depth : 0,
-        ParallelCommand::differentiate);
-    const bool adjoint_ready = static_cast<bool>(parallel_state);
+    if (rank != 0) {
+        return false;
+    }
+    int command = static_cast<int>(ParallelCommand::differentiate);
+    MPI_Bcast(&command, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    return abort_on_distributed_exception(
+        rank, "differentiate", [&]() {
+            return differentiateFrequencyResponsesParallelLocal(
+                pass_spectrum_derivative,
+                stop_spectrum_derivative,
+                pass_design_gradient,
+                stop_design_gradient);
+        });
+}
+
+bool App::Solver::differentiateFrequencyResponsesParallelLocal(
+    const std::vector<std::complex<double>>& pass_spectrum_derivative,
+    const std::vector<std::complex<double>>& stop_spectrum_derivative,
+    Vector& pass_design_gradient,
+    Vector& stop_design_gradient)
+{
+    int rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    const bool adjoint_ready = parallel_state && forward_is_ready;
     if (!all_succeeded(MPI_COMM_WORLD, adjoint_ready)) {
         if (rank == 0) {
             log(LogLevel::Error,
@@ -1309,8 +1496,8 @@ bool App::Solver::differentiateFrequencyResponses(
         return false;
     }
     ParallelState& state = *parallel_state;
-    ++state.command_depth;
-    DepthGuard depth_guard{state.command_depth};
+    write_mumps_diagnostic(
+        state.rank, "event=stage_begin stage=differentiate");
 
     std::vector<std::complex<double>> pass = pass_spectrum_derivative;
     std::vector<std::complex<double>> stop = stop_spectrum_derivative;
@@ -1516,6 +1703,8 @@ bool App::Solver::differentiateFrequencyResponses(
     if (!all_succeeded(state.comm, stop_adjoint_ready)) {
         return false;
     }
+    write_mumps_diagnostic(
+        state.rank, "event=stage_complete stage=adjoint");
 
     const int displacement_true_size =
         state.displacement_fes->GetTrueVSize();
@@ -1595,55 +1784,6 @@ bool App::Solver::differentiateFrequencyResponses(
         return false;
     }
 
-    H1_FECollection global_collection(fe_order, mesh->Dimension());
-    FiniteElementSpace global_level_set_fes(mesh.get(), &global_collection);
-    Array<int> local_to_global(state.phi->Size());
-    local_to_global = -1;
-    int local_element = 0;
-    bool dof_map_ready = true;
-    Array<int> local_dofs;
-    Array<int> global_dofs;
-    for (int global_element = 0;
-         global_element < mesh->GetNE();
-         ++global_element) {
-        if (state.partition[global_element] != state.rank) {
-            continue;
-        }
-        state.phi->FESpace()->GetElementDofs(local_element, local_dofs);
-        global_level_set_fes.GetElementDofs(global_element, global_dofs);
-        if (local_dofs.Size() != global_dofs.Size()) {
-            dof_map_ready = false;
-            break;
-        }
-        for (int i = 0; i < local_dofs.Size(); ++i) {
-            const int local_dof = local_dofs[i] >= 0
-                ? local_dofs[i] : -1 - local_dofs[i];
-            const int global_dof = global_dofs[i] >= 0
-                ? global_dofs[i] : -1 - global_dofs[i];
-            local_to_global[local_dof] = global_dof;
-        }
-        ++local_element;
-    }
-    if (!all_succeeded(state.comm, dof_map_ready)) {
-        if (state.rank == 0) {
-            log(LogLevel::Error,
-                "Could not map distributed level-set DOFs to the global design.");
-        }
-        return false;
-    }
-    Array<int> active_global(global_level_set_fes.GetVSize());
-    active_global = 0;
-    for (int i = 0; i < lset.activeDesignDofs.Size(); ++i) {
-        active_global[lset.activeDesignDofs[i]] = 1;
-    }
-    Array<int> active_local(local_to_global.Size());
-    active_local = 0;
-    for (int local_dof = 0; local_dof < local_to_global.Size(); ++local_dof) {
-        if (local_to_global[local_dof] >= 0) {
-            active_local[local_dof] = active_global[local_to_global[local_dof]];
-        }
-    }
-
     Vector local_pass_gradient;
     Vector local_stop_gradient;
     int local_cut_elements = 0;
@@ -1651,13 +1791,12 @@ bool App::Solver::differentiateFrequencyResponses(
     const auto differentiation_started_at = std::chrono::steady_clock::now();
     const bool cut_derivative_ready = detail::differentiateCutElements(
             settings,
-            optimizer_settings,
             *state.mesh,
             *state.phi->FESpace(),
             *state.displacement_fes,
             *state.scalar_fes,
             *state.phi,
-            active_local,
+            state.active_design_dofs,
             local_forward_history,
             has_pass ? &pass_adjoint_history : nullptr,
             has_stop ? &stop_adjoint_history : nullptr,
@@ -1680,32 +1819,31 @@ bool App::Solver::differentiateFrequencyResponses(
         }
         return false;
     }
+    write_mumps_diagnostic(
+        state.rank, "event=stage_complete stage=cut_differentiation");
 
-    Vector pass_contribution(global_level_set_fes.GetVSize());
-    Vector stop_contribution(global_level_set_fes.GetVSize());
-    pass_contribution = 0.0;
-    stop_contribution = 0.0;
-    for (int local_dof = 0; local_dof < local_to_global.Size(); ++local_dof) {
-        const int global_dof = local_to_global[local_dof];
-        if (global_dof >= 0) {
-            pass_contribution[global_dof] += local_pass_gradient[local_dof];
-            stop_contribution[global_dof] += local_stop_gradient[local_dof];
-        }
-    }
+    ParGridFunction parallel_pass_gradient(state.scalar_fes.get());
+    ParGridFunction parallel_stop_gradient(state.scalar_fes.get());
+    parallel_pass_gradient = local_pass_gradient;
+    parallel_stop_gradient = local_stop_gradient;
+    std::unique_ptr<HypreParVector> pass_true_gradient(
+        parallel_pass_gradient.ParallelAssemble());
+    std::unique_ptr<HypreParVector> stop_true_gradient(
+        parallel_stop_gradient.ParallelAssemble());
+    parallel_pass_gradient.Distribute(pass_true_gradient.get());
+    parallel_stop_gradient.Distribute(stop_true_gradient.get());
+    GridFunction serial_pass_gradient =
+        parallel_pass_gradient.GetSerialGridFunction(
+            0, *level_set_fes);
+    GridFunction serial_stop_gradient =
+        parallel_stop_gradient.GetSerialGridFunction(
+            0, *level_set_fes);
     Vector pass_physical_gradient;
     Vector stop_physical_gradient;
     if (state.rank == 0) {
-        pass_physical_gradient.SetSize(pass_contribution.Size());
-        stop_physical_gradient.SetSize(stop_contribution.Size());
+        serial_pass_gradient.GetTrueDofs(pass_physical_gradient);
+        serial_stop_gradient.GetTrueDofs(stop_physical_gradient);
     }
-    MPI_Reduce(
-        pass_contribution.GetData(),
-        state.rank == 0 ? pass_physical_gradient.GetData() : nullptr,
-        pass_contribution.Size(), MPI_DOUBLE, MPI_SUM, 0, state.comm);
-    MPI_Reduce(
-        stop_contribution.GetData(),
-        state.rank == 0 ? stop_physical_gradient.GetData() : nullptr,
-        stop_contribution.Size(), MPI_DOUBLE, MPI_SUM, 0, state.comm);
     MPI_Allreduce(&local_cut_elements, &performance_data.cutElements,
                   1, MPI_INT, MPI_SUM, state.comm);
     MPI_Allreduce(&local_differentiated_dofs,
@@ -1736,10 +1874,19 @@ bool App::Solver::differentiateFrequencyResponses(
             log);
     }
     MPI_Bcast(&filter_success, 1, MPI_INT, 0, state.comm);
+    write_mumps_diagnostic(
+        state.rank,
+        filter_success
+            ? "event=stage_complete stage=design_gradient_redistribution"
+            : "event=stage_error stage=design_gradient_redistribution");
     if (filter_success && state.rank == 0) {
         log(LogLevel::Message,
             "Completed the distributed pass/stop adjoints and reduced the design gradients.");
     }
+    if (filter_success) {
+        write_mumps_diagnostic(
+            state.rank, "event=stage_complete stage=differentiate");
+    }
     return filter_success != 0;
-#endif
 }
+#endif

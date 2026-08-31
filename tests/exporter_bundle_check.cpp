@@ -34,16 +34,19 @@ int main()
         std::filesystem::create_directories(directory);
 
         App::AppSettings settings;
+        settings.solverSettings.nx = 2;
+        settings.solverSettings.ny = 1;
         App::SolverResult result;
         mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(
             2, 1, mfem::Element::QUADRILATERAL, true, 0.5, 0.1);
         mfem::H1_FECollection collection(1, mesh.Dimension());
         mfem::FiniteElementSpace space(&mesh, &collection);
-        App::LevelSet geometry(space);
+        App::LevelSet geometry;
+        geometry.design.SetSize(space.GetTrueVSize());
         for (int dof = 0; dof < geometry.design.Size(); ++dof) {
             geometry.design[dof] = dof % 2 == 0 ? 0.25 : 0.75;
         }
-        geometry.phi->SetFromTrueDofs(geometry.design);
+        geometry.phi = geometry.design;
 
         auto signal = std::make_shared<App::SignalTD>();
         signal->size = 2;
@@ -82,7 +85,7 @@ int main()
         App::Exporter exporter(settings, result, geometry, log);
 
         require(exporter.exportRunData(
-                    directory, App::OptimizerStatus::Paused,
+                    directory, App::OptimizerStatus::MaximumIterations,
                     7, 1.5, 2.5, 2.5),
                 "First bundle export failed.");
         std::vector<std::filesystem::path> archives;
@@ -96,7 +99,7 @@ int main()
         const auto first_size = std::filesystem::file_size(first_archive);
 
         require(exporter.exportRunData(
-                    directory, App::OptimizerStatus::Paused,
+                    directory, App::OptimizerStatus::MaximumIterations,
                     7, 1.5, 2.5, 2.5),
                 "Second bundle export failed.");
         archives.clear();

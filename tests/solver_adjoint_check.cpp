@@ -122,9 +122,6 @@ int main()
     solver_settings.duration = 0.002;
     solver_settings.dt = 0.0001;
 
-    App::OptimizerSettings optimizer_settings;
-    optimizer_settings.maxIterations = 1;
-
     App::LevelSet geometry;
     App::SolverResult result;
     App::LogFunction log = [](App::LogLevel level, std::string message) {
@@ -133,7 +130,7 @@ int main()
         }
     };
     App::Solver solver(
-        solver_settings, optimizer_settings, geometry, result, log);
+        solver_settings, geometry, result, log);
 
     if (!solver.setMesh()
         || !solver.assembleSolutionSpace()
@@ -261,7 +258,7 @@ int main()
         return 1;
     }
 
-    const double step = optimizer_settings.cutDerivativeRelativeStep;
+    const double step = solver_settings.cutDerivativeRelativeStep;
     auto check_gradient = [&](const char* name,
                               std::size_t bin,
                               double target,

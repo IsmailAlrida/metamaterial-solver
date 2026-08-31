@@ -85,7 +85,6 @@ using PhysicsSettings = std::variant<
 >;
 
 struct OptimizerSettings {
-    float filterRadius = 0.008f;
     float frequencyMin = 1000.0f;
     float frequencyMax = 4000.0f;
     float attenuationMinDb = -120.0f;
@@ -96,7 +95,6 @@ struct OptimizerSettings {
     double mmaDecreaseAsymptote = 0.7;
     double mmaIncreaseAsymptote = 1.2;
     double mmaConstraintPenalty = 1000.0;
-    double cutDerivativeRelativeStep = 1.0e-4;
     bool displayTargetInDb = true;
     std::vector<FrequencyBand> frequencyBands{
         {FrequencyBandType::pass, 1000.0, 2500.0, 1.0},
@@ -126,6 +124,8 @@ struct SolverSettings {
     int initialPatternY = 7;
     double initialPatternBias = 0.1;
     double initialPatternThreshold = 0.01;
+    float filterRadius = 0.008f;
+    double cutDerivativeRelativeStep = 1.0e-4;
     std::string algo = "newmark";
     bool isotropicGrid = false;
     bool useHannWindow = true;

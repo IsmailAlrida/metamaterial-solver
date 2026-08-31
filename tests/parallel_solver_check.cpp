@@ -118,7 +118,6 @@ int main(int argc, char** argv)
     settings.ny = 4;
     settings.duration = 1.0e-4;
     settings.dt = 2.0e-5;
-    App::OptimizerSettings optimizer_settings;
     App::LevelSet level_set;
     App::SolverResult result;
     const App::LogFunction log = [rank](
@@ -128,7 +127,7 @@ int main(int argc, char** argv)
         }
     };
     App::Solver solver(
-        settings, optimizer_settings, level_set, result, log, true);
+        settings, level_set, result, log);
 
     int success = provided >= MPI_THREAD_SERIALIZED ? 1 : 0;
     if (!success) {
@@ -140,11 +139,11 @@ int main(int argc, char** argv)
         solver.parallelWorkerLoop();
     }
     else {
-        std::cout << "[1/4] Running parallel FGMRES forward/adjoint...\n";
+        std::cout << "[1/3] Running parallel FGMRES forward/adjoint...\n";
         settings.linearSolveMethod = App::LinearSolveMethod::fgmres;
-        bool fgmres_forward = solver.setMesh(true)
-            && solver.assembleSolutionSpace(true)
-            && solver.solve(true);
+        bool fgmres_forward = solver.setMesh()
+            && solver.assembleSolutionSpace()
+            && solver.solve();
         const auto fgmres_signal = result.outletPressure;
         const double fgmres_infill = result.solidInfillFraction.load(
             std::memory_order_acquire);
@@ -164,8 +163,7 @@ int main(int argc, char** argv)
                 derivative,
                 {},
                 fgmres_gradient,
-                unused_gradient,
-                true);
+                unused_gradient);
         }
         fgmres_forward = fgmres_forward && fgmres_signal
             && finite_signal(*fgmres_signal)
@@ -176,45 +174,11 @@ int main(int argc, char** argv)
                   << ", adjoint: "
                   << (fgmres_adjoint ? "pass" : "fail") << ".\n";
 
-        App::LevelSet serial_level_set;
-        App::SolverResult serial_result;
-        std::cout << "[2/4] Comparing against the serial Solver...\n";
-        App::Solver serial_solver(
-            settings,
-            optimizer_settings,
-            serial_level_set,
-            serial_result,
-            log);
-        const bool serial_forward = serial_solver.setMesh()
-            && serial_solver.assembleSolutionSpace()
-            && serial_solver.solve();
-        const bool serial_match = fgmres_forward && serial_forward
-            && serial_result.outletPressure
-            && std::isfinite(fgmres_infill)
-            && std::abs(fgmres_infill
-                - serial_result.solidInfillFraction.load(
-                    std::memory_order_acquire)) <= 1.0e-10
-            && matching_signal(*fgmres_signal, *serial_result.outletPressure)
-            && matching_response(
-                fgmres_response, serial_solver.frequencyResponse());
-        mfem::Vector serial_gradient;
-        bool serial_adjoint_match = serial_match && fgmres_adjoint;
-        if (serial_adjoint_match) {
-            serial_adjoint_match =
-                serial_solver.differentiateFrequencyResponses(
-                    derivative, {}, serial_gradient, unused_gradient)
-                && matching_vector(fgmres_gradient, serial_gradient);
-        }
-        std::cout << "      Serial forward parity: "
-                  << (serial_match ? "pass" : "fail")
-                  << ", adjoint parity: "
-                  << (serial_adjoint_match ? "pass" : "fail") << ".\n";
-
-        std::cout << "[3/4] Running parallel MUMPS forward/adjoint...\n";
+        std::cout << "[2/3] Running parallel MUMPS forward/adjoint...\n";
         settings.linearSolveMethod = App::LinearSolveMethod::mumps;
-        bool mumps_forward = solver.setMesh(true)
-            && solver.assembleSolutionSpace(true)
-            && solver.solve(true);
+        bool mumps_forward = solver.setMesh()
+            && solver.assembleSolutionSpace()
+            && solver.solve();
         const auto mumps_signal = result.outletPressure;
         const double mumps_infill = result.solidInfillFraction.load(
             std::memory_order_acquire);
@@ -227,8 +191,7 @@ int main(int argc, char** argv)
                 derivative,
                 {},
                 mumps_gradient,
-                unused_gradient,
-                true);
+                unused_gradient);
         }
         mumps_forward = mumps_forward && mumps_signal
             && finite_signal(*mumps_signal)
@@ -248,9 +211,8 @@ int main(int argc, char** argv)
                   << (mumps_parity ? "pass" : "fail") << ".\n";
 
         success = fgmres_forward && fgmres_adjoint
-            && serial_match && serial_adjoint_match
             && mumps_forward && mumps_adjoint && mumps_parity;
-        std::cout << "[4/4] Parallel Solver check "
+        std::cout << "[3/3] Parallel Solver check "
                   << (success ? "passed" : "failed") << ".\n";
         solver.shutdownParallelWorkers();
     }

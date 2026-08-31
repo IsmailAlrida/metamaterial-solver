@@ -102,7 +102,6 @@ const char* status_name(OptimizerStatus status)
     switch (status) {
         case OptimizerStatus::Idle: return "idle";
         case OptimizerStatus::Working: return "working";
-        case OptimizerStatus::Paused: return "paused";
         case OptimizerStatus::Converged: return "converged";
         case OptimizerStatus::MaximumIterations: return "maximum_iterations";
         case OptimizerStatus::Diverged: return "diverged";
@@ -137,15 +136,48 @@ std::string make_json(const AppSettings& settings,
                       double stop,
                       double mma_bound)
 {
-    if (!geometry.phi || geometry.phi->FESpace() == nullptr
-        || geometry.phi->FESpace()->GetMesh() == nullptr) {
+    if (geometry.design.Size() == 0
+        || geometry.phi.Size() != geometry.design.Size()) {
         throw std::runtime_error(
-            "The level set is not attached to an exportable MFEM mesh.");
+            "The level-set vectors are not ready for export.");
     }
 
     const SolverSettings& solver = settings.solverSettings;
     const OptimizerSettings& optimizer = settings.optSettings;
-    const mfem::Mesh& mesh = *geometry.phi->FESpace()->GetMesh();
+    const double length = solver.inletLength
+        + solver.designLength + solver.outletLength;
+    std::unique_ptr<mfem::Mesh> export_mesh;
+    if (solver.nz > 0) {
+        export_mesh = std::make_unique<mfem::Mesh>(
+            mfem::Mesh::MakeCartesian3D(
+                solver.nx, solver.ny, solver.nz,
+                mfem::Element::HEXAHEDRON,
+                length, solver.sy, solver.sz));
+    }
+    else {
+        export_mesh = std::make_unique<mfem::Mesh>(
+            mfem::Mesh::MakeCartesian2D(
+                solver.nx, solver.ny,
+                mfem::Element::QUADRILATERAL,
+                true, length, solver.sy));
+    }
+    const double design_end = solver.inletLength + solver.designLength;
+    mfem::Vector center(export_mesh->Dimension());
+    for (int element = 0; element < export_mesh->GetNE(); ++element) {
+        export_mesh->GetElementCenter(element, center);
+        export_mesh->SetAttribute(
+            element,
+            center[0] < solver.inletLength ? 1 : center[0] < design_end ? 2 : 3);
+    }
+    export_mesh->SetAttributes();
+    mfem::H1_FECollection export_collection(1, export_mesh->Dimension());
+    mfem::FiniteElementSpace export_space(
+        export_mesh.get(), &export_collection);
+    if (geometry.design.Size() != export_space.GetTrueVSize()) {
+        throw std::runtime_error(
+            "The level-set vectors do not match the configured export mesh.");
+    }
+    const mfem::Mesh& mesh = *export_mesh;
     const auto inlet = std::atomic_load(&result.inletPressure);
     const auto outlet = std::atomic_load(&result.outletPressure);
     const auto reference = std::atomic_load(&result.referenceOutletPressure);
@@ -186,6 +218,9 @@ std::string make_json(const AppSettings& settings,
            << ",\"initial_pattern_y\":" << solver.initialPatternY
            << ",\"initial_pattern_bias\":" << solver.initialPatternBias
            << ",\"initial_pattern_threshold\":" << solver.initialPatternThreshold
+           << ",\"filter_radius_m\":" << solver.filterRadius
+           << ",\"cut_derivative_relative_step\":"
+           << solver.cutDerivativeRelativeStep
            << ",\"algorithm\":";
     write_string(output, solver.algo);
     output << ",\"isotropic_grid\":"
@@ -215,8 +250,7 @@ std::string make_json(const AppSettings& settings,
         output << ",\"physics\":{\"type\":\"electromagnetic\"}";
     }
     output << "},\n    \"optimizer\":{"
-           << "\"filter_radius_m\":" << optimizer.filterRadius
-           << ",\"frequency_min_hz\":" << optimizer.frequencyMin
+           << "\"frequency_min_hz\":" << optimizer.frequencyMin
            << ",\"frequency_max_hz\":" << optimizer.frequencyMax
            << ",\"attenuation_min_db\":" << optimizer.attenuationMinDb
            << ",\"attenuation_max_db\":" << optimizer.attenuationMaxDb
@@ -226,8 +260,6 @@ std::string make_json(const AppSettings& settings,
            << ",\"mma_decrease_asymptote\":" << optimizer.mmaDecreaseAsymptote
            << ",\"mma_increase_asymptote\":" << optimizer.mmaIncreaseAsymptote
            << ",\"mma_constraint_penalty\":" << optimizer.mmaConstraintPenalty
-           << ",\"cut_derivative_relative_step\":"
-           << optimizer.cutDerivativeRelativeStep
            << ",\"display_target_in_db\":"
            << (optimizer.displayTargetInDb ? "true" : "false")
            << ",\"frequency_bands\":[";
@@ -348,7 +380,7 @@ std::string make_json(const AppSettings& settings,
     output << "],\"design_values\":";
     write_vector(output, geometry.design);
     output << ",\"filtered_phi\":";
-    write_vector(output, *geometry.phi);
+    write_vector(output, geometry.phi);
 
     std::vector<unsigned char> active(
         static_cast<std::size_t>(geometry.design.Size()), 0);
@@ -518,7 +550,7 @@ bool Exporter::exportMesh()
 
     // Exporter implementation roadmap:
     //
-    // 1. Read geometry.phi and obtain its finite-element space/background mesh.
+    // 1. Read geometry.phi and reconstruct its background mesh from the settings.
     //    Only visit elements classified as the design domain. The inlet and outlet
     //    are simulation space, not part of the manufactured object.
     //

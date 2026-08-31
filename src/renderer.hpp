@@ -48,7 +48,7 @@ namespace App {
         
         public:
             bool shouldClose = false;
-            Renderer(AppSettings& settings, SolverResult& result, LevelSet& geometry);
+            Renderer(AppSettings& settings, const SolverResult& result);
             ~Renderer();
 
             // Need to understand what c++ does with these
@@ -67,8 +67,7 @@ namespace App {
 
         private:
             AppSettings& settings;
-            SolverResult& result;
-            LevelSet& geometry;
+            const SolverResult& result;
 
             std::vector<float> objectiveFrequency;
             std::vector<float> objectiveTarget;

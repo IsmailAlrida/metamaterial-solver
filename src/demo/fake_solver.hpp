@@ -14,13 +14,10 @@ namespace App::Demo {
 class FakeSolver {
     public:
         FakeSolver(SolverSettings& settings,
-                   OptimizerSettings& optimizerSettings,
                    LevelSet& lset,
                    SolverResult& result,
-                   const LogFunction& log,
-                   bool = false)
+                   const LogFunction& log)
             : settings(settings),
-              optimizerSettings(optimizerSettings),
               lset(lset),
               result(result),
               log(log),
@@ -34,13 +31,18 @@ class FakeSolver {
               fec(1, mesh.Dimension()),
               fespace(&mesh, &fec)
         {
-            lset.setSpace(fespace);
+            const int size = fespace.GetTrueVSize();
+            if (lset.design.Size() != size) {
+                lset.design.SetSize(size);
+                lset.design = 0.5;
+            }
+            lset.phi = lset.design;
+            mfem::Array<int> active(size);
+            for (int dof = 0; dof < size; ++dof) {
+                active[dof] = dof;
+            }
+            lset.setActiveDesignDofs(active);
             populateResponse();
-        }
-
-        ~FakeSolver()
-        {
-            lset.detach();
         }
 
         bool setMesh()
@@ -49,20 +51,11 @@ class FakeSolver {
             return true;
         }
 
-        bool setMesh(bool)
-        {
-            return setMesh();
-        }
-
         bool assembleSolutionSpace()
         {
+            lset.phi = lset.design;
             log(LogLevel::Message, "MFEM Example 1 prepared the Poisson problem.");
             return true;
-        }
-
-        bool assembleSolutionSpace(bool)
-        {
-            return assembleSolutionSpace();
         }
 
         bool solve()
@@ -137,11 +130,6 @@ class FakeSolver {
             status.store(SolverStatus::Converged);
             log(LogLevel::Message, "MFEM Example 1 solved and published its demo response.");
             return true;
-        }
-
-        bool solve(bool)
-        {
-            return solve();
         }
 
         void parallelWorkerLoop()
@@ -267,7 +255,6 @@ class FakeSolver {
         }
 
         const SolverSettings& settings;
-        const OptimizerSettings& optimizerSettings;
         LevelSet& lset;
         SolverResult& result;
         const LogFunction& log;

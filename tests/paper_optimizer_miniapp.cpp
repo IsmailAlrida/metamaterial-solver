@@ -170,7 +170,6 @@ const char* status_name(App::OptimizerStatus status)
     switch (status) {
     case App::OptimizerStatus::Idle: return "idle";
     case App::OptimizerStatus::Working: return "working";
-    case App::OptimizerStatus::Paused: return "paused";
     case App::OptimizerStatus::Converged: return "converged";
     case App::OptimizerStatus::MaximumIterations: return "maximum_iterations";
     case App::OptimizerStatus::Diverged: return "diverged";
@@ -204,12 +203,16 @@ bool write_report_data(
     const std::string& failure_message,
     double total_wall_seconds)
 {
-    if (!geometry.phi || geometry.phi->FESpace() == nullptr) {
-        return false;
-    }
-    const mfem::FiniteElementSpace& fes = *geometry.phi->FESpace();
-    const mfem::Mesh& mesh = *fes.GetMesh();
-    if (mesh.Dimension() != 2 || geometry.design.Size() != fes.GetTrueVSize()) {
+    const double length = solver_settings.inletLength
+        + solver_settings.designLength + solver_settings.outletLength;
+    mfem::Mesh mesh = mfem::Mesh::MakeCartesian2D(
+        solver_settings.nx, solver_settings.ny,
+        mfem::Element::QUADRILATERAL, true,
+        length, solver_settings.sy);
+    mfem::H1_FECollection collection(1, mesh.Dimension());
+    mfem::FiniteElementSpace fes(&mesh, &collection);
+    if (geometry.design.Size() != fes.GetTrueVSize()
+        || geometry.phi.Size() != fes.GetTrueVSize()) {
         return false;
     }
 
@@ -280,7 +283,7 @@ bool write_report_data(
                     == App::LinearSolveMethod::mumps ? "mumps" : "fgmres")
            << "\",\n"
            << "    \"mpi_ranks\": " << solver_performance.mpiRanks << ",\n"
-           << "    \"filter_radius_m\": " << optimizer_settings.filterRadius << ",\n"
+           << "    \"filter_radius_m\": " << solver_settings.filterRadius << ",\n"
            << "    \"maximum_iterations\": " << optimizer_settings.maxIterations << "\n"
            << "  },\n"
            << "  \"runtime\": {\n"
@@ -497,10 +500,10 @@ bool write_report_data(
         output << "      {\"x\": " << position[0]
                << ", \"y\": " << position[1]
                << ", \"design\": " << geometry.design[dof]
-               << ", \"phi\": " << (*geometry.phi)[dof]
+               << ", \"phi\": " << geometry.phi[dof]
                << ", \"active\": " << (active[dof] ? "true" : "false")
                << ", \"solid\": "
-               << ((*geometry.phi)[dof] >= 0.0 ? "true" : "false")
+               << (geometry.phi[dof] >= 0.0 ? "true" : "false")
                << "}" << (vertex + 1 == mesh.GetNV() ? "\n" : ",\n");
     }
     output << "    ]\n"
@@ -631,14 +634,16 @@ int main(int argc, char** argv)
             physics.rho_s = 1340.0f;
             physics.poisson_ratio = 0.36f;
             physics.youngs_modulus = 2.5e9f;
-            solver_settings.nx = 150;
+            solver_settings.nx = 100;
             solver_settings.inletLength = 0.07;
             solver_settings.designLength = 0.20;
             solver_settings.outletLength = 0.07;
             optimizer_settings.frequencyMin = 60.0f;
-            optimizer_settings.frequencyMax = 600.0f;
+            optimizer_settings.frequencyMax = 4000.0f;
+            optimizer_settings.maxIterations = 150;
             optimizer_settings.frequencyBands = {
-                {App::FrequencyBandType::stop, 60.0, 600.0, 1.0e-2}
+                {App::FrequencyBandType::stop, 60.0, 600.0, 1.0e-2},
+                {App::FrequencyBandType::pass, 600.0, 4000.0, 1.0}
             };
         }
         else if (high_pass_20db) {
@@ -709,17 +714,16 @@ int main(int argc, char** argv)
 
         App::Solver solver(
             solver_settings,
-            optimizer_settings,
             geometry,
             result,
-            log,
-            METAMATERIAL_USE_MPI != 0);
+            log);
         if (rank != 0) {
             solver.parallelWorkerLoop();
         }
         else {
+            try {
             App::Optimizer optimizer_instance(
-                optimizer_settings, solver, geometry, result, log);
+                optimizer_settings, solver, geometry, log);
             optimizer = &optimizer_instance;
             started_at = std::chrono::steady_clock::now();
             std::atomic<bool> optimizer_finished{false};
@@ -732,12 +736,16 @@ int main(int argc, char** argv)
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 }
             });
-            optimizer->run();
+            try {
+                optimizer->run();
+            }
+            catch (...) {
+                optimizer_finished.store(true, std::memory_order_relaxed);
+                interrupt_watcher.join();
+                throw;
+            }
             optimizer_finished.store(true, std::memory_order_relaxed);
             interrupt_watcher.join();
-#if METAMATERIAL_USE_MPI
-            solver.shutdownParallelWorkers();
-#endif
             const double total_wall_seconds = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - started_at).count();
 
@@ -809,6 +817,19 @@ int main(int argc, char** argv)
                 std::cerr << "The optimizer did not improve the app-like objective.\n";
                 exit_code = 1;
             }
+            }
+            catch (const std::exception& error) {
+                std::cerr << "Optimizer miniapp failed: "
+                          << error.what() << '\n';
+                exit_code = 1;
+            }
+            catch (...) {
+                std::cerr << "Optimizer miniapp failed with an unknown error.\n";
+                exit_code = 1;
+            }
+#if METAMATERIAL_USE_MPI
+            solver.shutdownParallelWorkers();
+#endif
         }
     }
 

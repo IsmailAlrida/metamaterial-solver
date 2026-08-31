@@ -53,31 +53,23 @@ using PhysicsBlockSmoother = GSSmoother;
 
 // move this later outside?
 // TODO: Make comments doxygen-style with math and all to explain ur stuff
+#if !METAMATERIAL_USE_MPI
 App::Solver::Solver(App::SolverSettings& settings,
-                    App::OptimizerSettings& optimizer_settings,
                     App::LevelSet& lset,
                     App::SolverResult& result,
-                    const App::LogFunction& log,
-                    bool manage_parallel_workers)
+                    const App::LogFunction& log)
     : settings(settings),
-      optimizer_settings(optimizer_settings),
       lset(lset),
       result(result),
       log(log),
       fe_order(1),
       level_set_order(1),
-      cut_integration_order(4),
-      manage_parallel_workers(manage_parallel_workers)
+      cut_integration_order(4)
 {
 }
 
-App::Solver::~Solver()
-{
-    if (manage_parallel_workers) {
-        shutdownParallelWorkers();
-    }
-    lset.detach();
-}
+App::Solver::~Solver() = default;
+#endif
 
 App::SolverStatus App::Solver::get_status() const
 {
@@ -127,7 +119,7 @@ void App::Solver::streamToGlvis()
     if (!glvis_stream && !bindToGlvis()) {
         return;
     }
-    *glvis_stream << "solution\n" << *mesh << *lset.phi << std::flush;
+    *glvis_stream << "solution\n" << *mesh << *phi_field << std::flush;
     if (glvis_stream->good()) {
         log(LogLevel::Message,
             "Streamed the filtered design geometry to GLVis.");
@@ -143,21 +135,29 @@ void App::Solver::streamToGlvis()
 }
 
 // TODO: Do something about the mixed camelCase and snake_case. Choose one.
-bool App::Solver::setMesh()
+bool App::Solver::buildDesignMesh()
 {
     const auto started_at = std::chrono::steady_clock::now();
     performance_data = {};
+    mesh_is_ready = false;
+    assembly_is_ready = false;
+    forward_is_ready = false;
     const int nx = settings.nx;
     const int ny = settings.ny;
     const int nz = settings.nz;
+    initialize_design_on_next_mesh =
+        nx != mesh_nx || ny != mesh_ny || nz != mesh_nz;
     const real_t sx = settings.inletLength
         + settings.designLength + settings.outletLength;
     if (nx <= 0 || ny <= 0 || nz < 0
         || settings.inletLength <= 0.0
         || settings.designLength <= 0.0
         || settings.outletLength <= 0.0
-        || settings.sy <= 0.0 || settings.sz <= 0.0) {
-        log(LogLevel::Error, "Mesh element counts and extents must be positive.");
+        || settings.sy <= 0.0 || settings.sz <= 0.0
+        || settings.initialPatternLx <= 0.0
+        || settings.initialPatternLy <= 0.0) {
+        log(LogLevel::Error,
+            "Mesh counts, extents, and initial-pattern lengths must be positive.");
         return false;
     }
 
@@ -175,16 +175,25 @@ bool App::Solver::setMesh()
 
     // GridFunctions and finite-element spaces borrow their parents. Destroy
     // every borrower before replacing the mesh they point into.
-    lset.detach();
+#if !METAMATERIAL_USE_MPI
     M.reset();
     C.reset();
     K.reset();
+    reference_M.reset();
+    reference_C.reset();
+    reference_K.reset();
     Muu_block.reset();
     Cuu_block.reset();
     Kuu_block.reset();
     Mpp_block.reset();
     Cpp_block.reset();
     Kpp_block.reset();
+    reference_Muu_block.reset();
+    reference_Cuu_block.reset();
+    reference_Kuu_block.reset();
+    reference_Mpp_block.reset();
+    reference_Cpp_block.reset();
+    reference_Kpp_block.reset();
     effective_displacement_block.reset();
     effective_pressure_block.reset();
     initial_displacement_block.reset();
@@ -193,14 +202,19 @@ bool App::Solver::setMesh()
     effective_matrix_transpose.reset();
     initial_matrix.reset();
     initial_matrix_transpose.reset();
+#endif
     design_to_cell.reset();
     cell_to_level_set.reset();
     filter_matrix.reset();
+    phi_field.reset();
     level_set_fes.reset();
     scalar_fes.reset();
     displacement_fes.reset();
     fec.reset();
     mesh = std::move(next_mesh);
+    mesh_nx = nx;
+    mesh_ny = ny;
+    mesh_nz = nz;
     inlet_load.SetSize(0);
     outlet_functional.SetSize(0);
     system_inlet_load.SetSize(0);
@@ -217,7 +231,6 @@ bool App::Solver::setMesh()
     stop_adjoint_history.clear();
     level_set_scale = 0.0;
     design_region_measure = 0.0;
-    design_initialized = false;
     reference_ready = false;
     reference_outlet_pressure.clear();
     fft_window.clear();
@@ -234,12 +247,154 @@ bool App::Solver::setMesh()
         &result.referenceOutletPressure, std::shared_ptr<const SignalTD>{});
     std::atomic_store(
         &result.materialImpulseResponse, std::shared_ptr<const SignalFFT>{});
+
+    const int dim = mesh->Dimension();
+    fec = std::make_unique<H1_FECollection>(fe_order, dim);
+    level_set_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get());
+    scalar_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get());
+    displacement_fes = std::make_unique<FiniteElementSpace>(
+        mesh.get(), fec.get(), dim, Ordering::byVDIM);
+    phi_field = std::make_unique<GridFunction>(level_set_fes.get());
+    const bool initialize_design = initialize_design_on_next_mesh
+        || lset.design.Size() != level_set_fes->GetTrueVSize();
+    if (initialize_design) {
+        lset.design.SetSize(level_set_fes->GetTrueVSize());
+        lset.design = 0.5;
+    }
+    lset.phi.SetSize(level_set_fes->GetTrueVSize());
+
+    // Domain regions along x
+    const double design_start = settings.inletLength;
+    const double design_end = settings.inletLength + settings.designLength;
+    const int cell_count = mesh->GetNE();
+    int inlet_count = 0;
+    int design_count = 0;
+    int outlet_count = 0;
+    design_region_measure = 0.0;
+    element_centers.SetSize(cell_count, dim);
+    cell_volumes.SetSize(cell_count);
+    Vector center(dim);
+    for (int element = 0; element < cell_count; ++element) {
+        mesh->GetElementCenter(element, center);
+        element_centers.SetRow(element, center);
+        cell_volumes[element] = mesh->GetElementVolume(element);
+        if (center[0] < design_start) {
+            mesh->SetAttribute(element, static_cast<int>(DomainAttribute::inlet));
+            ++inlet_count;
+        }
+        else if (center[0] < design_end) {
+            mesh->SetAttribute(element, static_cast<int>(DomainAttribute::design));
+            ++design_count;
+            design_region_measure += cell_volumes[element];
+        }
+        else {
+            mesh->SetAttribute(element, static_cast<int>(DomainAttribute::outlet));
+            ++outlet_count;
+        }
+    }
+    mesh->SetAttributes();
+    if (inlet_count + design_count + outlet_count != cell_count
+        || inlet_count == 0 || design_count == 0 || outlet_count == 0) {
+        log(LogLevel::Error,
+            "Each duct region must contain at least one mesh element center.");
+        return false;
+    }
+
+    // Only DOFs exclusively supported by design elements are editable.
+    Array<int> design_incidence(level_set_fes->GetVSize());
+    Array<int> fixed_incidence(level_set_fes->GetVSize());
+    design_incidence = 0;
+    fixed_incidence = 0;
+    const int level_set_size = level_set_fes->GetTrueVSize();
+    design_to_cell = std::make_unique<SparseMatrix>(
+        cell_count, level_set_size);
+    cell_to_level_set = std::make_unique<SparseMatrix>(
+        level_set_size, cell_count);
+    Array<int> element_dofs;
+    Vector shape;
+    for (int element = 0; element < cell_count; ++element) {
+        level_set_fes->GetElementDofs(element, element_dofs);
+        const FiniteElement* finite_element = level_set_fes->GetFE(element);
+        const IntegrationPoint& reference_center =
+            Geometries.GetCenter(mesh->GetElementBaseGeometry(element));
+        shape.SetSize(finite_element->GetDof());
+        finite_element->CalcShape(reference_center, shape);
+        Array<int>& incidence = mesh->GetAttribute(element)
+                == static_cast<int>(DomainAttribute::design)
+            ? design_incidence
+            : fixed_incidence;
+        for (int i = 0; i < element_dofs.Size(); ++i) {
+            const int encoded_dof = element_dofs[i];
+            const int dof = encoded_dof >= 0
+                ? encoded_dof : -1 - encoded_dof;
+            const real_t sign = encoded_dof >= 0 ? 1.0 : -1.0;
+            ++incidence[dof];
+            design_to_cell->Add(element, dof, sign * shape[i]);
+            cell_to_level_set->Add(dof, element, sign);
+        }
+    }
+    design_to_cell->Finalize();
+    cell_to_level_set->Finalize();
+    const int* cell_to_level_set_rows = cell_to_level_set->GetI();
+    real_t* cell_to_level_set_values = cell_to_level_set->GetData();
+    for (int dof = 0; dof < level_set_size; ++dof) {
+        const int incidence = design_incidence[dof] + fixed_incidence[dof];
+        for (int entry = cell_to_level_set_rows[dof];
+             entry < cell_to_level_set_rows[dof + 1];
+             ++entry) {
+            cell_to_level_set_values[entry] /= incidence;
+        }
+    }
+    Array<int> active_dofs;
+    for (int dof = 0; dof < design_incidence.Size(); ++dof) {
+        if (design_incidence[dof] > 0 && fixed_incidence[dof] == 0) {
+            active_dofs.Append(dof);
+        }
+    }
+    if (active_dofs.Size() == 0
+        || active_dofs.Size() == level_set_fes->GetTrueVSize()) {
+        log(LogLevel::Error,
+            "The level-set space must contain active design and fixed-air DOFs.");
+        return false;
+    }
+    lset.setActiveDesignDofs(active_dofs);
+    if (initialize_design) {
+        FunctionCoefficient paper_initial_guess(
+            [this, design_start](const Vector& position) {
+                const double x = position[0] - design_start;
+                const double y = position.Size() > 1 ? position[1] : 0.0;
+                const double value = std::cos(
+                    settings.initialPatternX * std::acos(-1.0) * x
+                    / settings.initialPatternLx)
+                    * std::cos(
+                        settings.initialPatternY * std::acos(-1.0) * y
+                        / settings.initialPatternLy)
+                    + settings.initialPatternBias;
+                return value >= settings.initialPatternThreshold ? 0.0 : 1.0;
+            });
+        GridFunction initial(level_set_fes.get());
+        initial.ProjectCoefficient(paper_initial_guess);
+        initial.GetTrueDofs(lset.design);
+        lset.enforceDesignConstraints();
+        log(LogLevel::Message,
+            "Initialized the paper cosine level-set design.");
+    }
+    initialize_design_on_next_mesh = false;
+    mesh_is_ready = true;
+
     log(LogLevel::Message,
         nz > 0 ? "Created 3D Cartesian mesh." : "Created 2D Cartesian mesh.");
     performance_data.meshSetupSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started_at).count();
     return true;
 }
+
+#if !METAMATERIAL_USE_MPI
+bool App::Solver::setMesh()
+{
+    return buildDesignMesh();
+}
+#endif
 
 bool App::Solver::prepareLevelSetAndSource()
 {
@@ -279,134 +434,6 @@ bool App::Solver::prepareLevelSetAndSource()
         return false;
     }
 
-    const int dim = mesh->Dimension();
-    if (!level_set_fes) {
-        fec = std::make_unique<H1_FECollection>(fe_order, dim);
-        level_set_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get());
-        scalar_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get());
-        displacement_fes = std::make_unique<FiniteElementSpace>(
-            mesh.get(), fec.get(), dim, Ordering::byVDIM);
-        lset.setSpace(*level_set_fes);
-
-        // Domain regions along x
-        const double design_start = settings.inletLength;
-        const double design_end = settings.inletLength + settings.designLength;
-        const int cell_count = mesh->GetNE();
-        int inlet_count = 0;
-        int design_count = 0;
-        int outlet_count = 0;
-        design_region_measure = 0.0;
-        element_centers.SetSize(cell_count, dim);
-        cell_volumes.SetSize(cell_count);
-        Vector center(dim);
-        for (int element = 0; element < cell_count; ++element) {
-            mesh->GetElementCenter(element, center);
-            element_centers.SetRow(element, center);
-            cell_volumes[element] = mesh->GetElementVolume(element);
-            if (center[0] < design_start) {
-                mesh->SetAttribute(element, static_cast<int>(DomainAttribute::inlet));
-                ++inlet_count;
-            }
-            else if (center[0] < design_end) {
-                mesh->SetAttribute(element, static_cast<int>(DomainAttribute::design));
-                ++design_count;
-                design_region_measure += cell_volumes[element];
-            }
-            else {
-                mesh->SetAttribute(element, static_cast<int>(DomainAttribute::outlet));
-                ++outlet_count;
-            }
-        }
-        mesh->SetAttributes();
-        if (inlet_count + design_count + outlet_count != cell_count
-            || inlet_count == 0 || design_count == 0 || outlet_count == 0) {
-            log(LogLevel::Error,
-                "Each duct region must contain at least one mesh element center.");
-            return false;
-        }
-
-        // Only DOFs exclusively supported by design elements are editable.
-        Array<int> design_incidence(level_set_fes->GetVSize());
-        Array<int> fixed_incidence(level_set_fes->GetVSize());
-        design_incidence = 0;
-        fixed_incidence = 0;
-        const int level_set_size = level_set_fes->GetTrueVSize();
-        design_to_cell = std::make_unique<SparseMatrix>(
-            cell_count, level_set_size);
-        cell_to_level_set = std::make_unique<SparseMatrix>(
-            level_set_size, cell_count);
-        Array<int> element_dofs;
-        Vector shape;
-        for (int element = 0; element < cell_count; ++element) {
-            level_set_fes->GetElementDofs(element, element_dofs);
-            const FiniteElement* finite_element = level_set_fes->GetFE(element);
-            const IntegrationPoint& reference_center =
-                Geometries.GetCenter(mesh->GetElementBaseGeometry(element));
-            shape.SetSize(finite_element->GetDof());
-            finite_element->CalcShape(reference_center, shape);
-            Array<int>& incidence = mesh->GetAttribute(element)
-                    == static_cast<int>(DomainAttribute::design)
-                ? design_incidence
-                : fixed_incidence;
-            for (int i = 0; i < element_dofs.Size(); ++i) {
-                const int encoded_dof = element_dofs[i];
-                const int dof = encoded_dof >= 0
-                    ? encoded_dof : -1 - encoded_dof;
-                const real_t sign = encoded_dof >= 0 ? 1.0 : -1.0;
-                ++incidence[dof];
-                design_to_cell->Add(element, dof, sign * shape[i]);
-                cell_to_level_set->Add(dof, element, sign);
-            }
-        }
-        design_to_cell->Finalize();
-        cell_to_level_set->Finalize();
-        const int* cell_to_level_set_rows = cell_to_level_set->GetI();
-        real_t* cell_to_level_set_values = cell_to_level_set->GetData();
-        for (int dof = 0; dof < level_set_size; ++dof) {
-            const int incidence = design_incidence[dof] + fixed_incidence[dof];
-            for (int entry = cell_to_level_set_rows[dof];
-                 entry < cell_to_level_set_rows[dof + 1];
-                 ++entry) {
-                cell_to_level_set_values[entry] /= incidence;
-            }
-        }
-        Array<int> active_dofs;
-        for (int dof = 0; dof < design_incidence.Size(); ++dof) {
-            if (design_incidence[dof] > 0 && fixed_incidence[dof] == 0) {
-                active_dofs.Append(dof);
-            }
-        }
-        if (active_dofs.Size() == 0
-            || active_dofs.Size() == level_set_fes->GetTrueVSize()) {
-            log(LogLevel::Error,
-                "The level-set space must contain active design and fixed-air DOFs.");
-            return false;
-        }
-        lset.setActiveDesignDofs(active_dofs);
-        if (!design_initialized) {
-            FunctionCoefficient paper_initial_guess(
-                [this, design_start](const Vector& position) {
-                    const double x = position[0] - design_start;
-                    const double y = position.Size() > 1 ? position[1] : 0.0;
-                    const double value = std::cos(
-                        settings.initialPatternX * std::acos(-1.0) * x
-                        / settings.initialPatternLx)
-                        * std::cos(
-                            settings.initialPatternY * std::acos(-1.0) * y
-                            / settings.initialPatternLy)
-                        + settings.initialPatternBias;
-                    return value >= settings.initialPatternThreshold ? 0.0 : 1.0;
-                });
-            GridFunction initial(level_set_fes.get());
-            initial.ProjectCoefficient(paper_initial_guess);
-            initial.GetTrueDofs(lset.design);
-            lset.enforceDesignConstraints();
-            design_initialized = true;
-            log(LogLevel::Message,
-                "Initialized the paper cosine level-set design.");
-        }
-    }
-
     if (lset.design.Size() != level_set_fes->GetTrueVSize()) {
         log(LogLevel::Error,
             "The level-set design does not match its finite-element space.");
@@ -416,9 +443,10 @@ bool App::Solver::prepareLevelSetAndSource()
     GridFunction unsmoothed_level_set(level_set_fes.get());
     unsmoothed_level_set.SetFromTrueDofs(lset.design);
     const auto smoothing_started_at = std::chrono::steady_clock::now();
-    if (!smooth_level_set(unsmoothed_level_set, *lset.phi)) {
+    if (!smooth_level_set(unsmoothed_level_set, *phi_field)) {
         return false;
     }
+    phi_field->GetTrueDofs(lset.phi);
     performance_data.levelSetSmoothingSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - smoothing_started_at).count();
 
@@ -448,8 +476,16 @@ bool App::Solver::prepareLevelSetAndSource()
 }
 
 // TODO: Make a bloch-floquet periodic boundary condition?
+#if !METAMATERIAL_USE_MPI
 bool App::Solver::assembleSolutionSpace()
 {
+    if (!mesh_is_ready) {
+        log(LogLevel::Error,
+            "Call setMesh() successfully before assembleSolutionSpace().");
+        return false;
+    }
+    assembly_is_ready = false;
+    forward_is_ready = false;
     const auto assembly_started_at = std::chrono::steady_clock::now();
     // A new assembly invalidates every state and adjoint from the old one.
     result.U.clear();
@@ -457,12 +493,6 @@ bool App::Solver::assembleSolutionSpace()
     pass_adjoint_history.clear();
     stop_adjoint_history.clear();
     outlet_pressure.clear();
-    if (!prepareLevelSetAndSource()) {
-        return false;
-    }
-    const auto* physics = std::get_if<VibroacousticSettings>(&settings.physics);
-    const int dim = mesh->Dimension();
-    const int time_steps = result.timeSteps;
     M.reset();
     C.reset();
     K.reset();
@@ -479,6 +509,12 @@ bool App::Solver::assembleSolutionSpace()
     effective_matrix_transpose.reset();
     initial_matrix.reset();
     initial_matrix_transpose.reset();
+    if (!prepareLevelSetAndSource()) {
+        return false;
+    }
+    const auto* physics = std::get_if<VibroacousticSettings>(&settings.physics);
+    const int dim = mesh->Dimension();
+    const int time_steps = result.timeSteps;
 
     Array<int> design_domain_marker(mesh->attributes.Max());
     Array<int> fixed_air_marker(mesh->attributes.Max());
@@ -515,7 +551,7 @@ bool App::Solver::assembleSolutionSpace()
     BilinearForm Muu_form(displacement_fes.get());
     auto* solid_domain_integrator = new ImplicitDomainIntegrator(
         std::make_unique<VectorMassIntegrator>(solid_density),
-        *lset.phi,
+        *phi_field,
         cut_integration_order,
         level_set_order,
         physics->epsilon,
@@ -544,7 +580,7 @@ bool App::Solver::assembleSolutionSpace()
     BilinearForm Kuu_form(displacement_fes.get());
     Kuu_form.AddDomainIntegrator(new ImplicitDomainIntegrator(
         std::make_unique<ElasticityIntegrator>(solid_lambda, solid_mu),
-        *lset.phi,
+        *phi_field,
         cut_integration_order,
         level_set_order,
         physics->epsilon,
@@ -558,7 +594,7 @@ bool App::Solver::assembleSolutionSpace()
     BilinearForm Mpp_form(scalar_fes.get());
     Mpp_form.AddDomainIntegrator(new ImplicitDomainIntegrator(
         std::make_unique<MassIntegrator>(acoustic_mass),
-        *lset.phi,
+        *phi_field,
         cut_integration_order,
         level_set_order,
         physics->epsilon,
@@ -572,7 +608,7 @@ bool App::Solver::assembleSolutionSpace()
     BilinearForm Kpp_form(scalar_fes.get());
     Kpp_form.AddDomainIntegrator(new ImplicitDomainIntegrator(
         std::make_unique<DiffusionIntegrator>(acoustic_stiffness),
-        *lset.phi,
+        *phi_field,
         cut_integration_order,
         level_set_order,
         physics->epsilon,
@@ -585,7 +621,7 @@ bool App::Solver::assembleSolutionSpace()
 
     MixedBilinearForm Kup_form(scalar_fes.get(), displacement_fes.get());
     auto* Kup_integrator = new ImplicitSurfaceNormalIntegrator(
-        *lset.phi, cut_integration_order, level_set_order, -1.0, false);
+        *phi_field, cut_integration_order, level_set_order, -1.0, false);
     Kup_form.AddDomainIntegrator(Kup_integrator, design_domain_marker);
     Kup_form.Assemble();
     Kup_form.Finalize();
@@ -593,7 +629,7 @@ bool App::Solver::assembleSolutionSpace()
 
     MixedBilinearForm Mpu_form(displacement_fes.get(), scalar_fes.get());
     auto* Mpu_integrator = new ImplicitSurfaceNormalIntegrator(
-        *lset.phi, cut_integration_order, level_set_order, 1.0, true);
+        *phi_field, cut_integration_order, level_set_order, 1.0, true);
     Mpu_form.AddDomainIntegrator(Mpu_integrator, design_domain_marker);
     Mpu_form.Assemble();
     Mpu_form.Finalize();
@@ -668,8 +704,64 @@ bool App::Solver::assembleSolutionSpace()
     K_blocks.SetBlock(0, 1, Kup.get());
     K_blocks.SetBlock(1, 1, Kpp_block.get());
     K.reset(K_blocks.CreateMonolithic());
+
+    if (!reference_M) {
+        BilinearForm reference_Muu_form(displacement_fes.get());
+        reference_Muu_form.AddDomainIntegrator(
+            new VectorMassIntegrator(fictitious_solid_density));
+        reference_Muu_form.Assemble();
+        reference_Muu_form.Finalize();
+        reference_Muu_block.reset(reference_Muu_form.LoseMat());
+
+        BilinearForm reference_Kuu_form(displacement_fes.get());
+        reference_Kuu_form.AddDomainIntegrator(new ElasticityIntegrator(
+            fictitious_solid_lambda, fictitious_solid_mu));
+        reference_Kuu_form.Assemble();
+        reference_Kuu_form.Finalize();
+        reference_Kuu_block.reset(reference_Kuu_form.LoseMat());
+
+        BilinearForm reference_Mpp_form(scalar_fes.get());
+        reference_Mpp_form.AddDomainIntegrator(
+            new MassIntegrator(acoustic_mass));
+        reference_Mpp_form.Assemble();
+        reference_Mpp_form.Finalize();
+        reference_Mpp_block.reset(reference_Mpp_form.LoseMat());
+
+        BilinearForm reference_Kpp_form(scalar_fes.get());
+        reference_Kpp_form.AddDomainIntegrator(
+            new DiffusionIntegrator(acoustic_stiffness));
+        reference_Kpp_form.Assemble();
+        reference_Kpp_form.Finalize();
+        reference_Kpp_block.reset(reference_Kpp_form.LoseMat());
+
+        reference_Cuu_block.reset(Add(
+            alpha_d, *reference_Muu_block,
+            beta_d, *reference_Kuu_block));
+        reference_Cpp_block =
+            std::make_unique<SparseMatrix>(*Cpp_block);
+
+        BlockMatrix reference_M_blocks(offsets);
+        reference_M_blocks.SetBlock(0, 0, reference_Muu_block.get());
+        reference_M_blocks.SetBlock(1, 1, reference_Mpp_block.get());
+        reference_M.reset(reference_M_blocks.CreateMonolithic());
+        BlockMatrix reference_C_blocks(offsets);
+        reference_C_blocks.SetBlock(0, 0, reference_Cuu_block.get());
+        reference_C_blocks.SetBlock(1, 1, reference_Cpp_block.get());
+        reference_C.reset(reference_C_blocks.CreateMonolithic());
+        BlockMatrix reference_K_blocks(offsets);
+        reference_K_blocks.SetBlock(0, 0, reference_Kuu_block.get());
+        reference_K_blocks.SetBlock(1, 1, reference_Kpp_block.get());
+        reference_K.reset(reference_K_blocks.CreateMonolithic());
+    }
     if (M->CheckFinite() != 0 || C->CheckFinite() != 0 || K->CheckFinite() != 0) {
         log(LogLevel::Error, "The assembled global matrices contain non-finite values.");
+        return false;
+    }
+    if (reference_M->CheckFinite() != 0
+        || reference_C->CheckFinite() != 0
+        || reference_K->CheckFinite() != 0) {
+        log(LogLevel::Error,
+            "The empty-duct reference matrices contain non-finite values.");
         return false;
     }
 
@@ -739,14 +831,18 @@ bool App::Solver::assembleSolutionSpace()
     log(LogLevel::Message,
         "Assembled fictitious-domain vibroacoustic M, C, and K matrices in "
             + std::to_string(performance_data.assemblySeconds) + " s.");
+    assembly_is_ready = true;
     return true;
 }
+#endif
 
+#if !METAMATERIAL_USE_MPI
 bool App::Solver::solve()
 {
     status.store(SolverStatus::Working);
     result.success = 0;
     frequency_response = {};
+    forward_is_ready = false;
     if (settings.linearSolveMethod == LinearSolveMethod::mumps) {
         log(LogLevel::Error,
             "MUMPS requires the parallel-cpu backend.");
@@ -762,7 +858,7 @@ bool App::Solver::solve()
     performance_data.forwardFgmresSolves = 0;
     performance_data.maximumForwardFgmresIterations = 0;
 
-    if (!mesh) {
+    if (!mesh_is_ready) {
         log(LogLevel::Error,
             "Call setMesh() before solve().");
         status.store(SolverStatus::Error);
@@ -771,20 +867,21 @@ bool App::Solver::solve()
 
     bool designed_assembly_ready = M && C && K
         && Muu_block && Cuu_block && Kuu_block
-        && Mpp_block && Cpp_block && Kpp_block;
+        && Mpp_block && Cpp_block && Kpp_block
+        && reference_M && reference_C && reference_K
+        && reference_Muu_block && reference_Cuu_block
+        && reference_Kuu_block && reference_Mpp_block
+        && reference_Cpp_block && reference_Kpp_block;
     if (!level_set_fes
         || lset.design.Size() != level_set_fes->GetTrueVSize()
-        || !designed_assembly_ready) {
+        || !assembly_is_ready || !designed_assembly_ready) {
         log(LogLevel::Error,
             "Call assembleSolutionSpace() before solve().");
         status.store(SolverStatus::Error);
         return false;
     }
 
-    const Vector designed_geometry(lset.design);
-    auto fail = [this, &designed_geometry](SolverStatus failure) {
-        lset.design = designed_geometry;
-        lset.enforceDesignConstraints();
+    auto fail = [this](SolverStatus failure) {
         status.store(failure);
         return false;
     };
@@ -794,21 +891,30 @@ bool App::Solver::solve()
         const bool reference_analysis = analysis == 0;
         if (reference_analysis) {
             reference_ready = false;
-            lset.design = 0.0;
         }
-        else {
-            lset.design = designed_geometry;
-        }
-        lset.enforceDesignConstraints();
-        if ((reference_analysis || !designed_assembly_ready)
-            && !assembleSolutionSpace()) {
-            return fail(SolverStatus::Error);
-        }
-        designed_assembly_ready = !reference_analysis;
 
         if (!reference_analysis) {
             streamToGlvis();
         }
+
+        const SparseMatrix& analysis_M = reference_analysis
+            ? *reference_M : *M;
+        const SparseMatrix& analysis_C = reference_analysis
+            ? *reference_C : *C;
+        const SparseMatrix& analysis_K = reference_analysis
+            ? *reference_K : *K;
+        const SparseMatrix& analysis_Muu = reference_analysis
+            ? *reference_Muu_block : *Muu_block;
+        const SparseMatrix& analysis_Cuu = reference_analysis
+            ? *reference_Cuu_block : *Cuu_block;
+        const SparseMatrix& analysis_Kuu = reference_analysis
+            ? *reference_Kuu_block : *Kuu_block;
+        const SparseMatrix& analysis_Mpp = reference_analysis
+            ? *reference_Mpp_block : *Mpp_block;
+        const SparseMatrix& analysis_Cpp = reference_analysis
+            ? *reference_Cpp_block : *Cpp_block;
+        const SparseMatrix& analysis_Kpp = reference_analysis
+            ? *reference_Kpp_block : *Kpp_block;
 
         const auto* physics =
             std::get_if<VibroacousticSettings>(&settings.physics);
@@ -826,19 +932,21 @@ bool App::Solver::solve()
         const double a_6 =
             1.0 / (beta * settings.dt * settings.dt);
 
-        std::unique_ptr<SparseMatrix> M_and_C(Add(a_6, *M, a_3, *C));
-        std::unique_ptr<SparseMatrix> K_hat(Add(1.0, *K, 1.0, *M_and_C));
+        std::unique_ptr<SparseMatrix> M_and_C(
+            Add(a_6, analysis_M, a_3, analysis_C));
+        std::unique_ptr<SparseMatrix> K_hat(
+            Add(1.0, analysis_K, 1.0, *M_and_C));
         K_hat->EliminateBC(
             displacement_essential_tdofs, Operator::DIAG_ONE);
 
         std::unique_ptr<SparseMatrix> Muu_and_Cuu(
-            Add(a_6, *Muu_block, a_3, *Cuu_block));
+            Add(a_6, analysis_Muu, a_3, analysis_Cuu));
         effective_displacement_block.reset(
-            Add(1.0, *Kuu_block, 1.0, *Muu_and_Cuu));
+            Add(1.0, analysis_Kuu, 1.0, *Muu_and_Cuu));
         std::unique_ptr<SparseMatrix> Mpp_and_Cpp(
-            Add(a_6, *Mpp_block, a_3, *Cpp_block));
+            Add(a_6, analysis_Mpp, a_3, analysis_Cpp));
         effective_pressure_block.reset(
-            Add(1.0, *Kpp_block, 1.0, *Mpp_and_Cpp));
+            Add(1.0, analysis_Kpp, 1.0, *Mpp_and_Cpp));
         effective_displacement_block->EliminateBC(
             displacement_essential_tdofs, Operator::DIAG_ONE);
 
@@ -865,7 +973,7 @@ bool App::Solver::solve()
         K_hat_solver.SetMaxIter(1500);
         K_hat_solver.SetPrintLevel(-1);
 
-        const int state_size = M->Height();
+        const int state_size = analysis_M.Height();
         const int time_steps = result.timeSteps;
         log(LogLevel::Message,
             std::string("Solving the ")
@@ -875,13 +983,13 @@ bool App::Solver::solve()
         const auto transient_started_at = std::chrono::steady_clock::now();
 
         // Paper Eq. (21): M v_ddot^0 = h^0.
-        auto M_system = std::make_unique<SparseMatrix>(*M);
+        auto M_system = std::make_unique<SparseMatrix>(analysis_M);
         M_system->EliminateBC(
             displacement_essential_tdofs, Operator::DIAG_ONE);
         initial_displacement_block =
-            std::make_unique<SparseMatrix>(*Muu_block);
+            std::make_unique<SparseMatrix>(analysis_Muu);
         initial_pressure_block =
-            std::make_unique<SparseMatrix>(*Mpp_block);
+            std::make_unique<SparseMatrix>(analysis_Mpp);
         initial_displacement_block->EliminateBC(
             displacement_essential_tdofs, Operator::DIAG_ONE);
         PhysicsBlockSmoother initial_displacement_preconditioner(
@@ -923,9 +1031,9 @@ bool App::Solver::solve()
         if (!detail::runNewmark(
                 settings,
                 *physics,
-                *M,
-                *C,
-                *K,
+                analysis_M,
+                analysis_C,
+                analysis_K,
                 *M_system,
                 *K_hat,
                 displacement_essential_tdofs,
@@ -966,8 +1074,6 @@ bool App::Solver::solve()
         }
     }
 
-    lset.design = designed_geometry;
-    lset.enforceDesignConstraints();
     const auto fourier_started_at = std::chrono::steady_clock::now();
     if (!postprocessFourierResponse()) {
         return fail(SolverStatus::Error);
@@ -988,10 +1094,12 @@ bool App::Solver::solve()
 
     result.success = 1;
     status.store(SolverStatus::Converged);
+    forward_is_ready = true;
     log(LogLevel::Message,
         "Completed the Newmark solve and published the outlet transmission FFT.");
     return true;
 }
+#endif
 
 bool App::Solver::smooth_level_set(
     const GridFunction& level_set,
@@ -1027,7 +1135,7 @@ bool App::Solver::smooth_level_set(
     level_set_scale = std::min({hx, hy, hz});
 
     // Paper Eq. (28): -r^2 Laplacian(phi_c) + phi_c = mapped_design_c.
-    const real_t filter_radius = optimizer_settings.filterRadius;
+    const real_t filter_radius = settings.filterRadius;
     if (filter_radius < 0.0) {
         log(LogLevel::Error, "The PDE filter radius cannot be negative.");
         return false;
@@ -1241,6 +1349,7 @@ bool App::Solver::postprocessFourierResponse()
     return true;
 }
 
+#if !METAMATERIAL_USE_MPI
 bool App::Solver::differentiateFrequencyResponses(
     const std::vector<std::complex<double>>& pass_spectrum_derivative,
     const std::vector<std::complex<double>>& stop_spectrum_derivative,
@@ -1259,7 +1368,7 @@ bool App::Solver::differentiateFrequencyResponses(
                 && value.size()
                     == static_cast<std::size_t>(time_steps / 2 + 1));
     };
-    if (!mesh || mesh->Dimension() != 2 || !M || !C || !K
+    if (!forward_is_ready || !mesh || mesh->Dimension() != 2 || !M || !C || !K
         || !effective_matrix || !initial_matrix
         || !effective_displacement_block || !effective_pressure_block
         || !initial_displacement_block || !initial_pressure_block
@@ -1426,12 +1535,11 @@ bool App::Solver::differentiateFrequencyResponses(
     const auto differentiation_started_at = std::chrono::steady_clock::now();
     if (!detail::differentiateCutElements(
             settings,
-            optimizer_settings,
             *mesh,
             *level_set_fes,
             *displacement_fes,
             *scalar_fes,
-            *lset.phi,
+            *phi_field,
             active,
             result.U,
             has_pass ? &pass_adjoint_history : nullptr,
@@ -1486,3 +1594,4 @@ bool App::Solver::differentiateFrequencyResponses(
             + " s.");
     return true;
 }
+#endif

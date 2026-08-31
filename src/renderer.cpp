@@ -29,10 +29,9 @@
 
 namespace App {
 
-Renderer::Renderer(AppSettings& settings, SolverResult& result, LevelSet& geometry)
+Renderer::Renderer(AppSettings& settings, const SolverResult& result)
     : settings(settings),
       result(result),
-      geometry(geometry),
       exportDirectoryBrowser(
           ImGuiFileBrowserFlags_SelectDirectory
           | ImGuiFileBrowserFlags_CreateNewDir
@@ -327,18 +326,8 @@ void Renderer::StartMenu(const dispatcher_t& dispatcher)
     const char* state = "IDLE";
     ImVec4 stateColor(0.52f, 0.61f, 0.72f, 1.0f);
     if (dispatcher.get_state() == dispatcher_t::State::Working) {
-        if (dispatcher.is_pause_requested()) {
-            state = "PAUSE REQUESTED";
-            stateColor = ImVec4(0.95f, 0.72f, 0.28f, 1.0f);
-        }
-        else {
-            state = "WORKING";
-            stateColor = ImVec4(0.35f, 0.69f, 1.0f, 1.0f);
-        }
-    }
-    else if (dispatcher.get_state() == dispatcher_t::State::Paused) {
-        state = "PAUSED";
-        stateColor = ImVec4(0.95f, 0.72f, 0.28f, 1.0f);
+        state = "WORKING";
+        stateColor = ImVec4(0.35f, 0.69f, 1.0f, 1.0f);
     }
     else if (dispatcher.get_state() == dispatcher_t::State::Exporting) {
         state = "EXPORTING";
@@ -374,10 +363,6 @@ void Renderer::StartMenu(const dispatcher_t& dispatcher)
     }
     else if (optimizerStatus == OptimizerStatus::Cancelled) {
         outcome = "CANCELLED";
-        outcomeColor = ImVec4(0.95f, 0.72f, 0.28f, 1.0f);
-    }
-    else if (optimizerStatus == OptimizerStatus::Paused) {
-        outcome = "PAUSED";
         outcomeColor = ImVec4(0.95f, 0.72f, 0.28f, 1.0f);
     }
     else if (dispatcher.get_state() == dispatcher_t::State::Working
@@ -601,15 +586,15 @@ void Renderer::SimulationSettingsPanel(const dispatcher_t& dispatcher)
     ImGui::Spacing();
 
     if (ImGui::CollapsingHeader("Optimizer Settings")) {
-        ImGui::InputFloat("Smoothing radius (m)", &optimizer.filterRadius, 0.0001f, 0.001f, "%.5f");
+        ImGui::InputFloat("Smoothing radius (m)", &solver.filterRadius, 0.0001f, 0.001f, "%.5f");
         ImGui::InputInt("Maximum iterations", &optimizer.maxIterations);
         ImGui::InputDouble("Initial asymptote", &optimizer.mmaInitialAsymptote, 0.01, 0.1, "%.3f");
         ImGui::InputDouble("Asymptote decrease", &optimizer.mmaDecreaseAsymptote, 0.01, 0.1, "%.3f");
         ImGui::InputDouble("Asymptote increase", &optimizer.mmaIncreaseAsymptote, 0.01, 0.1, "%.3f");
         ImGui::InputDouble("Constraint penalty", &optimizer.mmaConstraintPenalty, 10.0, 100.0, "%.1f");
-        ImGui::InputDouble("Cut derivative / h", &optimizer.cutDerivativeRelativeStep, 1.0e-5, 1.0e-4, "%.2e");
+        ImGui::InputDouble("Cut derivative / h", &solver.cutDerivativeRelativeStep, 1.0e-5, 1.0e-4, "%.2e");
         if (!locked) {
-            optimizer.filterRadius = std::max(optimizer.filterRadius, 0.0f);
+            solver.filterRadius = std::max(solver.filterRadius, 0.0f);
             optimizer.maxIterations = std::clamp(optimizer.maxIterations, 1, 10000);
         }
     }
@@ -1273,19 +1258,11 @@ void Renderer::LogPanel(dispatcher_t& dispatcher)
 
     constexpr float iconFontSize = 20.0f;
     const float buttonSize = ImGui::GetFrameHeight() * 1.2f;
-    const bool canRun = dispatcher.get_state() == dispatcher_t::State::Idle
-        || dispatcher.get_state() == dispatcher_t::State::Paused;
+    const bool canRun = dispatcher.get_state() == dispatcher_t::State::Idle;
     const OptimizerStatus optimizerStatus = dispatcher.get_optimizer_status();
-    const bool canPause = dispatcher.get_state() == dispatcher_t::State::Working
-        && optimizerStatus == OptimizerStatus::Working
-        && !dispatcher.is_pause_requested();
-    const bool canCancel =
-        (dispatcher.get_state() == dispatcher_t::State::Working
-            && optimizerStatus == OptimizerStatus::Working)
-        || (dispatcher.get_state() == dispatcher_t::State::Paused
-            && optimizerStatus == OptimizerStatus::Paused);
-    const bool canExport = (dispatcher.get_state() == dispatcher_t::State::Idle
-        || dispatcher.get_state() == dispatcher_t::State::Paused)
+    const bool canCancel = dispatcher.get_state() == dispatcher_t::State::Working
+        && optimizerStatus == OptimizerStatus::Working;
+    const bool canExport = dispatcher.get_state() == dispatcher_t::State::Idle
         && dispatcher.is_exportable();
 
     const auto actionButton = [&](const char* id,
@@ -1314,29 +1291,11 @@ void Renderer::LogPanel(dispatcher_t& dispatcher)
     if (actionButton(
             "run-optimization",
             Icons::Play,
-            dispatcher.get_state() == dispatcher_t::State::Paused
-                ? "Resume optimization"
-                : canRun ? "Start optimization"
+            canRun ? "Start optimization"
                    : "Wait for the current operation to finish before starting again.",
             ImVec4(0.30f, 0.82f, 0.61f, 1.0f),
             canRun)) {
-        dispatcher.dispatch(
-            dispatcher.get_state() == dispatcher_t::State::Paused
-                ? dispatcher_t::Event::Resume
-                : dispatcher_t::Event::Start);
-    }
-
-    ImGui::SameLine();
-    if (actionButton(
-            "pause-optimization",
-            Icons::Pause,
-            canPause ? "Pause after the current safe optimizer operation"
-                     : dispatcher.is_pause_requested()
-                         ? "Pause requested; finishing the current operation."
-                         : "Pause is available while optimization is running.",
-            ImVec4(0.95f, 0.72f, 0.28f, 1.0f),
-            canPause)) {
-        dispatcher.dispatch(dispatcher_t::Event::Pause);
+        dispatcher.dispatch(dispatcher_t::Event::Start);
     }
 
     ImGui::SameLine();

@@ -2,9 +2,10 @@
 #define NOMINMAX
 #endif
 
+#include <csignal>
 #include <exception>
 #include <iostream>
-#include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -17,6 +18,17 @@
 #include "renderer.hpp"
 #include "solver.hpp"
 #include "dispatcher.hpp"
+
+namespace {
+
+volatile std::sig_atomic_t interrupt_requested = 0;
+
+void request_shutdown(int)
+{
+    interrupt_requested = 1;
+}
+
+} // namespace
 
 // OK so what is left?
 /*
@@ -46,6 +58,7 @@
 */
 int main(int argc, char** argv)
 {
+    std::signal(SIGINT, request_shutdown);
     int provided_thread_level = 0;
 #if METAMATERIAL_USE_MPI
     mfem::Mpi::Init(
@@ -80,20 +93,17 @@ int main(int argc, char** argv)
 
         // Construct the top-level data. Everyone below receives references to these.
         // TODO: Make App settings construct defaults
-        auto settings = std::make_unique<App::AppSettings>();
-        auto& appSettings = *settings;
+        App::AppSettings appSettings;
         auto& solverSettings = appSettings.solverSettings;
         auto& optimizerSettings = appSettings.optSettings;
 
-        auto result = std::make_unique<App::SolverResult>();
-        auto& solverResult = *result;
+        App::SolverResult solverResult;
 
-        // The solver attaches the FE space and initializes the paper's cosine design.
-        auto lset = std::make_unique<App::LevelSet>();
-        auto& geometry = *lset;
+        // The solver owns its FE spaces and initializes these persistent vectors.
+        App::LevelSet geometry;
 
         // Keep the renderer alive longer than the objects that will publish to it.
-        std::unique_ptr<App::Renderer> renderer;
+        std::optional<App::Renderer> renderer;
         App::LogFunction log = [&renderer, rank](
             App::LogLevel level, std::string message) {
             if (rank != 0) {
@@ -108,53 +118,53 @@ int main(int argc, char** argv)
         };
 
         // Every MPI process owns one local handle to the same collective solver.
-        auto solver = std::make_unique<App::solver_t>(
+        App::solver_t solver(
             solverSettings,
-            optimizerSettings,
             geometry,
             solverResult,
-            log,
-            METAMATERIAL_USE_MPI != 0);
+            log);
 
 #if METAMATERIAL_USE_MPI
         if (rank != 0) {
-            solver->parallelWorkerLoop();
+            solver.parallelWorkerLoop();
         }
         else
 #endif
         {
-            renderer = std::make_unique<App::Renderer>(
-                appSettings,
-                solverResult,
-                geometry);
-            // in opt, result is const, not edited.
-            auto optimizer = std::make_unique<App::optimizer_t>(
-                optimizerSettings,
-                *solver,
-                geometry,
-                solverResult,
-                log);
-            auto exporter = std::make_unique<App::exporter_t>(
-                appSettings,
-                solverResult,
-                geometry,
-                log);
-            auto dispatcher = std::make_unique<App::dispatcher_t>(
-                *optimizer,
-                *exporter,
-                log);
-            renderer->setup();
-            log(App::LogLevel::Message, "Renderer initialized");
+            try {
+                renderer.emplace(appSettings, solverResult);
+                App::optimizer_t optimizer(
+                    optimizerSettings, solver, geometry, log);
+                App::exporter_t exporter(
+                    appSettings, solverResult, geometry, log);
+                App::dispatcher_t dispatcher(optimizer, exporter, log);
+                renderer->setup();
+                log(App::LogLevel::Message, "Renderer initialized");
 
-            while (!renderer->shouldClose) {
-                dispatcher->dispatch();
-                renderer->displayFrame(*dispatcher);
+                while (!renderer->shouldClose && !interrupt_requested) {
+                    dispatcher.dispatch();
+                    renderer->displayFrame(dispatcher);
+                }
             }
+            catch (...) {
+#if METAMATERIAL_USE_MPI
+                solver.shutdownParallelWorkers();
+#endif
+                throw;
+            }
+#if METAMATERIAL_USE_MPI
+            solver.shutdownParallelWorkers();
+#endif
         }
 
     } catch (const std::exception& error) {
         std::cerr << "Application startup failed on MPI rank " << rank
                   << ": " << error.what() << '\n';
+        exit_code = 1;
+    }
+    catch (...) {
+        std::cerr << "Application failed with an unknown error on MPI rank "
+                  << rank << ".\n";
         exit_code = 1;
     }
 #if !METAMATERIAL_USE_MPI

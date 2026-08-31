@@ -28,12 +28,10 @@ struct OptimizationCancelled {
 Optimizer::Optimizer(const OptimizerSettings& settings,
                      Solver& solver,
                      LevelSet& geometry,
-                     const SolverResult& result,
                      const LogFunction& log)
     : settings(settings),
       solver(solver),
       geometry(geometry),
-      result(result),
       log(log)
 {
 }
@@ -131,7 +129,7 @@ public:
             constraints[constraint++] =
                 bound - objective.stop / objective_scale;
         }
-        optimizer.pause_at_boundary();
+        optimizer.check_cancelled();
         return 0;
     }
 
@@ -160,7 +158,7 @@ public:
             fillConstraintGradient(
                 stop_gradient, constraint_gradients[constraint++]);
         }
-        optimizer.pause_at_boundary();
+        optimizer.check_cancelled();
         return 0;
     }
 
@@ -179,7 +177,7 @@ public:
 private:
     void evaluate(ParOptVec* variables)
     {
-        optimizer.pause_at_boundary();
+        optimizer.check_cancelled();
         if (matches(variables)) {
             return;
         }
@@ -191,30 +189,45 @@ private:
         ParOptScalar* x;
         variables->getArray(&x);
         const mfem::Vector previous_design(optimizer.geometry.design);
+        const auto restore_previous_design = [&]() {
+            optimizer.geometry.design = previous_design;
+            optimizer.geometry.enforceDesignConstraints();
+            if (!optimizer.solver.assembleSolutionSpace()
+                || !optimizer.solver.solve()) {
+                optimizer.log(LogLevel::Error,
+                    "Could not restore the last completed design after a failed candidate.");
+            }
+        };
         for (int design = 0; design < active_design_size; ++design) {
             const double value = ParOptRealPart(x[design]);
             if (!std::isfinite(value)) {
                 throw std::runtime_error(
                     "ParOpt proposed a non-finite design variable.");
             }
+        }
+        for (int design = 0; design < active_design_size; ++design) {
+            const double value = ParOptRealPart(x[design]);
             optimizer.geometry.design[
                 optimizer.geometry.activeDesignDofs[design]] =
                     std::clamp(value, 0.0, 1.0);
         }
         optimizer.geometry.enforceDesignConstraints();
 
-        if (!optimizer.solver.assembleSolutionSpace(METAMATERIAL_USE_MPI != 0)
-            || !optimizer.solver.solve(METAMATERIAL_USE_MPI != 0)) {
-            optimizer.geometry.design = previous_design;
-            optimizer.geometry.enforceDesignConstraints();
-            throw std::runtime_error("The forward analysis failed inside ParOpt.");
-        }
-
         ObjectiveEvaluation next_objective;
-        if (!optimizer.evaluateObjectives(next_objective)) {
-            optimizer.geometry.design = previous_design;
-            optimizer.geometry.enforceDesignConstraints();
-            throw std::runtime_error("The FFT objective could not be evaluated.");
+        try {
+            if (!optimizer.solver.assembleSolutionSpace()
+                || !optimizer.solver.solve()) {
+                throw std::runtime_error(
+                    "The forward analysis failed inside ParOpt.");
+            }
+            if (!optimizer.evaluateObjectives(next_objective)) {
+                throw std::runtime_error(
+                    "The FFT objective could not be evaluated.");
+            }
+        }
+        catch (...) {
+            restore_previous_design();
+            throw;
         }
 
         objective = std::move(next_objective);
@@ -243,8 +256,7 @@ private:
                 objective.has_stop
                     ? objective.stop_spectrum_derivative : no_derivative,
                 pass_gradient,
-                stop_gradient,
-                METAMATERIAL_USE_MPI != 0)) {
+                stop_gradient)) {
             throw std::runtime_error(
                 "The pass/stop discrete adjoint failed.");
         }
@@ -303,9 +315,9 @@ void Optimizer::run()
         if (cancel_requested.load()) {
             throw OptimizationCancelled{};
         }
-        if (!solver.setMesh(METAMATERIAL_USE_MPI != 0)
-            || !solver.assembleSolutionSpace(METAMATERIAL_USE_MPI != 0)
-            || !solver.solve(METAMATERIAL_USE_MPI != 0)) {
+        if (!solver.setMesh()
+            || !solver.assembleSolutionSpace()
+            || !solver.solve()) {
             status.store(
                 solver.get_status() == SolverStatus::Diverged
                     ? OptimizerStatus::Diverged
@@ -493,7 +505,7 @@ bool Optimizer::optimize()
             + std::to_string(objective.stop) + ".");
 
     try {
-        pause_at_boundary();
+        check_cancelled();
         auto release = [](auto* object) {
             if (object != nullptr) {
                 object->decref();
@@ -543,7 +555,7 @@ bool Optimizer::optimize()
         optimizer->optimize();
         performance_data.paroptSeconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - paropt_started_at).count();
-        pause_at_boundary();
+        check_cancelled();
 
         if (cancel_requested.load()) {
             status.store(OptimizerStatus::Cancelled);
@@ -593,79 +605,22 @@ bool Optimizer::optimize()
 void Optimizer::request_cancel()
 {
     const OptimizerStatus current_status = status.load();
-    if (current_status != OptimizerStatus::Working
-        && current_status != OptimizerStatus::Paused) {
+    if (current_status != OptimizerStatus::Working) {
         return;
     }
     cancel_requested.store(true);
-    {
-        std::lock_guard<std::mutex> lock(pause_mutex);
-        pause_requested = false;
-    }
-    pause_condition.notify_all();
 }
 
-void Optimizer::request_pause()
-{
-    if (status.load() != OptimizerStatus::Working
-        || cancel_requested.load()) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(pause_mutex);
-    pause_requested = true;
-}
-
-void Optimizer::resume()
-{
-    {
-        std::lock_guard<std::mutex> lock(pause_mutex);
-        pause_requested = false;
-    }
-    pause_condition.notify_all();
-}
-
-bool Optimizer::is_pause_requested() const
-{
-    std::lock_guard<std::mutex> lock(pause_mutex);
-    const OptimizerStatus current_status = status.load();
-    return pause_requested
-        && (current_status == OptimizerStatus::Working
-            || current_status == OptimizerStatus::Paused);
-}
-
-void Optimizer::pause_at_boundary()
+void Optimizer::check_cancelled() const
 {
     if (cancel_requested.load()) {
         throw OptimizationCancelled{};
     }
-
-    std::unique_lock<std::mutex> lock(pause_mutex);
-    if (!pause_requested) {
-        return;
-    }
-
-    status.store(OptimizerStatus::Paused);
-    log(LogLevel::Message,
-        "Optimization paused after the latest completed design.");
-    pause_condition.wait(lock, [this]() {
-        return !pause_requested || cancel_requested.load();
-    });
-
-    if (cancel_requested.load()) {
-        throw OptimizationCancelled{};
-    }
-    status.store(OptimizerStatus::Working);
-    log(LogLevel::Message, "Optimization resumed.");
 }
 
 void Optimizer::clear_requests()
 {
     cancel_requested.store(false);
-    {
-        std::lock_guard<std::mutex> lock(pause_mutex);
-        pause_requested = false;
-    }
-    pause_condition.notify_all();
 }
 
 OptimizerStatus Optimizer::get_status() const
@@ -688,8 +643,6 @@ bool Optimizer::is_exportable() const
     const OptimizerStatus current_status = status.load();
     return current_status == OptimizerStatus::Converged
         || current_status == OptimizerStatus::MaximumIterations
-        || (current_status == OptimizerStatus::Paused
-            && solver.get_status() == SolverStatus::Converged)
         || (current_status == OptimizerStatus::Cancelled
             && solver.get_status() == SolverStatus::Converged);
 }

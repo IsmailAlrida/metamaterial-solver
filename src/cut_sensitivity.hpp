@@ -22,7 +22,6 @@ namespace App::detail {
  */
 inline bool differentiateCutElements(
     const SolverSettings& settings,
-    const OptimizerSettings& optimizer_settings,
     mfem::Mesh& mesh,
     mfem::FiniteElementSpace& level_set_fes,
     mfem::FiniteElementSpace& displacement_fes,
@@ -49,7 +48,7 @@ inline bool differentiateCutElements(
         std::get_if<VibroacousticSettings>(&settings.physics);
     if (physics == nullptr || mesh.Dimension() != 2
         || level_set_scale <= 0.0
-        || optimizer_settings.cutDerivativeRelativeStep <= 0.0) {
+        || settings.cutDerivativeRelativeStep <= 0.0) {
         return false;
     }
     const bool has_pass = pass_adjoint != nullptr;
@@ -102,7 +101,7 @@ inline bool differentiateCutElements(
         / (omega_1 + omega_2);
     const double beta_d = 2.0 * physics->zeta / (omega_1 + omega_2);
     const double perturbation =
-        optimizer_settings.cutDerivativeRelativeStep * level_set_scale;
+        settings.cutDerivativeRelativeStep * level_set_scale;
     const double inverse_perturbation = 0.5 / perturbation;
 
     pass_physical_gradient.SetSize(level_set_fes.GetVSize());

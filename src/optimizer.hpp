@@ -2,8 +2,6 @@
 
 #include <atomic>
 #include <complex>
-#include <condition_variable>
-#include <mutex>
 #include <vector>
 #include "global_types.hpp"
 #include "logging.hpp"
@@ -22,15 +20,11 @@ class Optimizer {
         Optimizer(const OptimizerSettings& settings,
                   Solver& solver,
                   LevelSet& geometry,
-                  const SolverResult& result,
                   const LogFunction& log);
 
         void prepare_run();
         void run();
         bool optimize();
-        void request_pause();
-        void resume();
-        bool is_pause_requested() const;
         void request_cancel();
         OptimizerStatus get_status() const;
         SolverStatus get_solver_status() const;
@@ -57,18 +51,14 @@ class Optimizer {
         };
 
         bool evaluateObjectives(ObjectiveEvaluation& objective) const;
-        void pause_at_boundary();
+        void check_cancelled() const;
         void clear_requests();
 
         const OptimizerSettings& settings;
         Solver& solver;
         LevelSet& geometry;
-        const SolverResult& result;
         const LogFunction& log;
         std::atomic_bool cancel_requested{false};
-        mutable std::mutex pause_mutex;
-        std::condition_variable pause_condition;
-        bool pause_requested = false;
         std::atomic_bool run_prepared{false};
         std::atomic<OptimizerStatus> status{OptimizerStatus::Idle};
         std::atomic<int> iteration{0};

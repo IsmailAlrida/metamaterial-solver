@@ -1,51 +1,12 @@
 #pragma once
-#include <memory>
-#include <vector>
-#include <array>
-#include <string>
-#include <vector>
 #include <stdexcept>
 #include "mfem.hpp"
-#include "settings.hpp"
 
 namespace App {
-
-// TODO: Make this a class that extends 
-
 
 class LevelSet {
 
     public:
-
-        // Apparenlty the member initilaizer constructs the members with the args passed to it as you see
-
-        LevelSet()
-        : phi(std::make_unique<mfem::GridFunction>())
-        {
-        }
-
-        explicit LevelSet(mfem::FiniteElementSpace& fes)
-        : LevelSet()
-        {
-            setSpace(fes);
-        }
-
-        void setSpace(mfem::FiniteElementSpace& fes)
-        {
-            const bool initialize_design = design.Size() != fes.GetTrueVSize();
-            design.SetSize(fes.GetTrueVSize());
-            if (initialize_design) {
-                design = 0.5;
-            }
-
-            activeDesignDofs.SetSize(fes.GetTrueVSize());
-            for (int dof = 0; dof < activeDesignDofs.Size(); dof++) {
-                activeDesignDofs[dof] = dof;
-            }
-
-            phi = std::make_unique<mfem::GridFunction>(&fes);
-            phi->SetFromTrueDofs(design);
-        }
 
         void setActiveDesignDofs(const mfem::Array<int>& active_dofs)
         {
@@ -64,68 +25,12 @@ class LevelSet {
             design.SetSubVectorComplement(activeDesignDofs, 0.0);
         }
 
-        void detach()
-        {
-            phi = std::make_unique<mfem::GridFunction>();
-            activeDesignDofs.SetSize(0);
-        }
-        
         mfem::Vector design;
+        mfem::Vector phi;
         mfem::Array<int> activeDesignDofs;
-        std::unique_ptr<mfem::GridFunction> phi;
 
 
 };
 
 
-}; // namespace App
-
-
-// struct LevelSet {
-//     int dim; 
-//     int nx, ny, nz;
-//     std::array<double, 3> origin;
-//     std::array<double, 3> spacing; 
-
-//     // the design variable is for the optimizer
-//     std::vector<double> design;
-//     std::vector<double> phi;
-
-//     LevelSet(int dimension, int x_size, int y_size = 1, int z_size = 1)
-//     : 
-//     dim(validate_dim(dimension)),
-//     nx(validate_extent(x_size)),
-//     ny(dim >= 2 ? validate_extent(y_size) : 1),
-//     nz(dim == 3 ? validate_extent(z_size) : 1),
-//     phi(static_cast<std::size_t>(nx) * ny * nz, double{1.0})
-//     {}
-
-
-//     std::size_t flat_index(int i, int j, int k) const {
-//         if (i < 0 || i >= nx || j < 0 || j >= ny || k < 0 || k >= nz) {
-//             throw std::out_of_range("LevelSet index out of range!");
-//         }
-
-//         return static_cast<std::size_t>(i)
-//                 + static_cast<std::size_t>(nx)
-//                     * (static_cast<std::size_t>(j)
-//                         + static_cast<std::size_t>(ny) * k);
-//     }
-
-
-//     private:
-//         static int validate_dim(int d) {
-//             if (d < 1 || d > 3) {
-//                 throw std::invalid_argument("LevelSet dimension must be 1, 2, or 3!");
-//             }
-//             return d;
-//         }
-
-//         static int validate_extent(int extent) {
-//             if (extent <= 0) {
-//                 throw std::invalid_argument("LevelSet extents must be positive!");
-//             }
-//             return extent;
-//         }
-
-// };
+} // namespace App
