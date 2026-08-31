@@ -645,6 +645,16 @@ target_include_directories(dispatcher_backend_check PRIVATE
 target_link_libraries(dispatcher_backend_check PRIVATE mfem)
 add_test(NAME dispatcher_backend COMMAND dispatcher_backend_check)
 
+add_executable(settings_persistence_check
+    tests/settings_persistence_check.cpp
+    src/settings.cpp
+)
+target_include_directories(settings_persistence_check PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+target_link_libraries(settings_persistence_check PRIVATE mfem)
+add_test(NAME settings_persistence COMMAND settings_persistence_check)
+
 add_executable(exporter_bundle_check
     tests/exporter_bundle_check.cpp
 )

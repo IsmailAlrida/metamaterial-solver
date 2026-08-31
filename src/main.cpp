@@ -4,6 +4,7 @@
 
 #include <csignal>
 #include <exception>
+#include <filesystem>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -94,6 +95,14 @@ int main(int argc, char** argv)
         // Construct the top-level data. Everyone below receives references to these.
         // TODO: Make App settings construct defaults
         App::AppSettings appSettings;
+        const std::filesystem::path settingsPath = App::defaultAppSettingsPath();
+        if (rank == 0) {
+            std::string settingsError;
+            if (!App::loadAppSettings(appSettings, settingsPath, &settingsError)) {
+                std::cerr << "Could not load application settings: "
+                          << settingsError << '\n';
+            }
+        }
         auto& solverSettings = appSettings.solverSettings;
         auto& optimizerSettings = appSettings.optSettings;
 
@@ -155,6 +164,11 @@ int main(int argc, char** argv)
 #if METAMATERIAL_USE_MPI
             solver.shutdownParallelWorkers();
 #endif
+            std::string settingsError;
+            if (!App::saveAppSettings(appSettings, settingsPath, &settingsError)) {
+                std::cerr << "Could not save application settings: "
+                          << settingsError << '\n';
+            }
         }
 
     } catch (const std::exception& error) {

@@ -1,4 +1,5 @@
 #pragma once
+#include <filesystem>
 #include <string>
 #include <variant>
 #include <vector>
@@ -147,6 +148,14 @@ struct AppSettings {
     OptimizerSettings optSettings{};
     ExporterSettings exporterSettings{};
 };
+
+std::filesystem::path defaultAppSettingsPath();
+bool loadAppSettings(AppSettings& settings,
+                     const std::filesystem::path& path,
+                     std::string* error = nullptr);
+bool saveAppSettings(const AppSettings& settings,
+                     const std::filesystem::path& path,
+                     std::string* error = nullptr);
 
 struct DesignSettings {
 
