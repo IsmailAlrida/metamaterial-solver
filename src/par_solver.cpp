@@ -1212,11 +1212,13 @@ bool App::Solver::assembleSolutionSpaceParallelLocal()
         inlet_form.AddBoundaryIntegrator(
             new BoundaryLFIntegrator(one), inlet_marker);
         inlet_form.Assemble();
+        state.inlet_load.SetSize(pressure_size);
         inlet_form.ParallelAssemble(state.inlet_load);
         ParLinearForm outlet_form(state.scalar_fes.get());
         outlet_form.AddBoundaryIntegrator(
             new BoundaryLFIntegrator(one), outlet_marker);
         outlet_form.Assemble();
+        state.outlet_functional.SetSize(pressure_size);
         outlet_form.ParallelAssemble(state.outlet_functional);
 
         state.system_inlet_load.SetSize(displacement_size + pressure_size);
