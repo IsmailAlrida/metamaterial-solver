@@ -136,6 +136,7 @@ namespace App {
         std::vector<double> outlet_pressure;
         std::vector<double> reference_outlet_pressure;
         std::vector<double> fft_window;
+        std::vector<std::complex<double>> reference_spectrum;
         std::vector<mfem::Vector> pass_adjoint_history;
         std::vector<mfem::Vector> stop_adjoint_history;
         FrequencyResponse frequency_response;
@@ -153,6 +154,8 @@ namespace App {
         bool assembly_is_ready = false;
         bool forward_is_ready = false;
         bool reference_ready = false;
+        SolverSettings cached_settings{};
+        bool settings_cache_ready = false;
         std::atomic<SolverStatus> status{SolverStatus::Idle};
 
 #if METAMATERIAL_USE_MPI
@@ -164,7 +167,10 @@ namespace App {
         bool smooth_level_set(
             const mfem::GridFunction& level_set,
             mfem::GridFunction& smoothed_level_set);
-        bool buildDesignMesh();
+        bool buildDesignMesh(bool prepare_design_data = true);
+        bool meshSettingsMatch() const;
+        bool matrixSettingsMatch() const;
+        bool sourceSettingsMatch() const;
 #if METAMATERIAL_USE_MPI
         bool setMeshParallelLocal();
         bool assembleSolutionSpaceParallelLocal();

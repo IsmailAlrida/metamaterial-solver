@@ -367,6 +367,7 @@ struct App::Solver::ParallelState {
     Array<int> true_to_serial_design_dofs;
     bool boundary_data_ready = false;
     bool reference_ready = false;
+    bool source_data_ready = false;
 };
 
 App::Solver::Solver(App::SolverSettings& settings,
@@ -519,6 +520,68 @@ bool App::Solver::setMeshParallelLocal()
     }
     write_mumps_diagnostic(rank, "event=stage_complete stage=settings_broadcast");
 
+    if (parallel_state && mesh_is_ready && meshSettingsMatch()) {
+        ParallelState& state = *parallel_state;
+        const bool matrices_match = matrixSettingsMatch();
+        const bool source_matches = sourceSettingsMatch();
+        const bool window_matches =
+            settings.useHannWindow == cached_settings.useHannWindow;
+        if (!matrices_match) {
+            state.Cpp.reset();
+            state.reference_M.reset();
+            state.reference_C.reset();
+            state.reference_K.reset();
+            state.reference_effective_matrix.reset();
+            state.reference_Muu.reset();
+            state.reference_Cuu.reset();
+            state.reference_Kuu.reset();
+            state.reference_Mpp.reset();
+            state.reference_Kpp.reset();
+            state.reference_effective_displacement.reset();
+            state.reference_effective_pressure.reset();
+            state.reference_ready = false;
+        }
+        if (!source_matches) {
+            source_pressure.clear();
+            source_pressure_derivative.clear();
+            state.source_data_ready = false;
+            state.reference_ready = false;
+        }
+        if (!matrices_match || !source_matches) {
+            reference_outlet_pressure.clear();
+            fft_window.clear();
+            reference_spectrum.clear();
+            frequency_response = {};
+            std::atomic_store(
+                &result.referenceOutletPressure,
+                std::shared_ptr<const SignalTD>{});
+            std::atomic_store(
+                &result.materialImpulseResponse,
+                std::shared_ptr<const SignalFFT>{});
+        }
+        else if (!window_matches) {
+            fft_window.clear();
+            reference_spectrum.clear();
+            frequency_response = {};
+            std::atomic_store(
+                &result.materialImpulseResponse,
+                std::shared_ptr<const SignalFFT>{});
+        }
+        if (settings.filterRadius != cached_settings.filterRadius) {
+            filter_matrix.reset();
+        }
+        cached_settings = settings;
+        assembly_is_ready = false;
+        forward_is_ready = false;
+        result.success = 0;
+        write_mumps_diagnostic(rank, "event=stage_complete stage=set_mesh_reused");
+        if (rank == 0) {
+            log(LogLevel::Message,
+                "Reused the unchanged distributed mesh and finite-element spaces.");
+        }
+        return true;
+    }
+
     if (parallel_state) {
         parallel_state->initial_mumps.reset();
         parallel_state->effective_mumps.reset();
@@ -528,7 +591,7 @@ bool App::Solver::setMeshParallelLocal()
     parallel_state->ranks = ranks;
     performance_data.mpiRanks = ranks;
     parallel_workers_shutdown = false;
-    const bool ready = buildDesignMesh();
+    const bool ready = buildDesignMesh(rank == 0);
     int all_ready = ready ? 1 : 0;
     MPI_Allreduce(MPI_IN_PLACE, &all_ready, 1, MPI_INT, MPI_MIN,
                   parallel_state->comm);
@@ -600,11 +663,15 @@ bool App::Solver::setMeshParallelLocal()
             all_ready = 0;
         }
 
-        Vector active_true_dofs(level_set_fes->GetTrueVSize());
-        active_true_dofs = 0.0;
-        for (int i = 0; i < lset.activeDesignDofs.Size(); ++i) {
-            active_true_dofs[lset.activeDesignDofs[i]] = 1.0;
+        Vector active_true_dofs;
+        if (rank == 0) {
+            active_true_dofs.SetSize(level_set_fes->GetTrueVSize());
+            active_true_dofs = 0.0;
+            for (int i = 0; i < lset.activeDesignDofs.Size(); ++i) {
+                active_true_dofs[lset.activeDesignDofs[i]] = 1.0;
+            }
         }
+        broadcast_vector(parallel_state->comm, rank, active_true_dofs);
         GridFunction global_active_design(level_set_fes.get());
         global_active_design.SetFromTrueDofs(active_true_dofs);
         ParGridFunction active_design(
@@ -617,6 +684,12 @@ bool App::Solver::setMeshParallelLocal()
         }
         write_mumps_diagnostic(
             rank, "event=stage_complete stage=parmesh");
+
+        if (rank != 0) {
+            level_set_fes.reset();
+            fec.reset();
+            mesh.reset();
+        }
     }
     if (all_ready && parallel_state->rank == 0) {
         log(LogLevel::Message,
@@ -627,6 +700,10 @@ bool App::Solver::setMeshParallelLocal()
         rank, all_ready
             ? "event=stage_complete stage=set_mesh"
             : "event=stage_error stage=set_mesh");
+    if (all_ready) {
+        cached_settings = settings;
+        settings_cache_ready = true;
+    }
     return all_ready != 0;
 }
 
@@ -648,7 +725,7 @@ bool App::Solver::assembleSolutionSpaceParallelLocal()
 {
     int rank = 0;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    const bool assembly_ready = parallel_state && mesh && mesh_is_ready
+    const bool assembly_ready = parallel_state && mesh_is_ready
         && parallel_state->mesh && parallel_state->collection
         && parallel_state->scalar_fes
         && parallel_state->displacement_fes;
@@ -706,26 +783,27 @@ bool App::Solver::assembleSolutionSpaceParallelLocal()
         return false;
     }
 
-    const int dim = mesh->Dimension();
+    const int dim = state.mesh->Dimension();
     Vector global_phi;
     if (state.rank == 0) {
         global_phi = lset.phi;
     }
-    broadcast_vector(state.comm, state.rank, lset.design);
     broadcast_vector(state.comm, state.rank, global_phi);
-    if (state.rank != 0) {
-        lset.phi = global_phi;
-    }
     MPI_Bcast(&level_set_scale, 1, MPI_DOUBLE, 0, state.comm);
-    broadcast_vector(state.comm, state.rank, source_pressure);
-    broadcast_vector(state.comm, state.rank, source_pressure_derivative);
+    if (!state.source_data_ready) {
+        broadcast_vector(state.comm, state.rank, source_pressure);
+        broadcast_vector(state.comm, state.rank, source_pressure_derivative);
+        state.source_data_ready = true;
+    }
 
     int time_steps = state.rank == 0 ? result.timeSteps : 0;
     MPI_Bcast(&time_steps, 1, MPI_INT, 0, state.comm);
-    GridFunction global_level_set(level_set_fes.get());
-    global_level_set.SetFromTrueDofs(global_phi);
-    state.phi = std::make_unique<ParGridFunction>(
-        state.mesh.get(), &global_level_set, state.partition.data());
+    Vector local_phi(state.scalar_fes->GetTrueVSize());
+    for (int dof = 0; dof < local_phi.Size(); ++dof) {
+        local_phi[dof] = global_phi[state.true_to_serial_design_dofs[dof]];
+    }
+    state.phi = std::make_unique<ParGridFunction>(state.scalar_fes.get());
+    state.phi->SetFromTrueDofs(local_phi);
     write_mumps_diagnostic(
         state.rank, "event=stage_complete stage=level_set_transfer");
 
@@ -1288,7 +1366,7 @@ bool App::Solver::solveParallelLocal()
 {
     int rank = 0;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    const bool solver_ready = parallel_state && mesh
+    const bool solver_ready = parallel_state
         && mesh_is_ready && assembly_is_ready;
     if (!all_succeeded(MPI_COMM_WORLD, solver_ready)) {
         if (rank == 0) {
@@ -1323,8 +1401,7 @@ bool App::Solver::solveParallelLocal()
         && state.reference_effective_pressure
         && state.reference_Muu && state.reference_Cuu
         && state.reference_Kuu && state.reference_Mpp
-        && state.reference_Kpp
-        && lset.design.Size() > 0;
+        && state.reference_Kpp;
     if (!all_succeeded(state.comm, designed_assembly_ready)) {
         if (state.rank == 0) {
             log(LogLevel::Error,

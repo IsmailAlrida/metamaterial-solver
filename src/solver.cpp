@@ -86,6 +86,53 @@ const App::SolverPerformance& App::Solver::performance() const
     return performance_data;
 }
 
+bool App::Solver::meshSettingsMatch() const
+{
+    return settings_cache_ready
+        && settings.nx == cached_settings.nx
+        && settings.ny == cached_settings.ny
+        && settings.nz == cached_settings.nz
+        && settings.inletLength == cached_settings.inletLength
+        && settings.designLength == cached_settings.designLength
+        && settings.outletLength == cached_settings.outletLength
+        && settings.sy == cached_settings.sy
+        && (settings.nz == 0 || settings.sz == cached_settings.sz);
+}
+
+bool App::Solver::matrixSettingsMatch() const
+{
+    if (!settings_cache_ready
+        || settings.dt != cached_settings.dt
+        || settings.newmarkBeta != cached_settings.newmarkBeta
+        || settings.newmarkGamma != cached_settings.newmarkGamma
+        || settings.physics.index() != cached_settings.physics.index()) {
+        return false;
+    }
+    const auto* current = std::get_if<VibroacousticSettings>(&settings.physics);
+    const auto* cached = std::get_if<VibroacousticSettings>(
+        &cached_settings.physics);
+    return current == nullptr || (
+        current->rho_s == cached->rho_s
+        && current->rho_a == cached->rho_a
+        && current->c_a == cached->c_a
+        && current->youngs_modulus == cached->youngs_modulus
+        && current->poisson_ratio == cached->poisson_ratio
+        && current->zeta == cached->zeta
+        && current->f1 == cached->f1
+        && current->f2 == cached->f2
+        && current->epsilon == cached->epsilon);
+}
+
+bool App::Solver::sourceSettingsMatch() const
+{
+    return settings_cache_ready
+        && settings.duration == cached_settings.duration
+        && settings.dt == cached_settings.dt
+        && settings.sourceAmplitude == cached_settings.sourceAmplitude
+        && settings.sourceSeed == cached_settings.sourceSeed
+        && settings.algo == cached_settings.algo;
+}
+
 bool App::Solver::bindToGlvis()
 {
     if (glvis_stream && glvis_stream->good()) {
@@ -135,7 +182,7 @@ void App::Solver::streamToGlvis()
 }
 
 // TODO: Do something about the mixed camelCase and snake_case. Choose one.
-bool App::Solver::buildDesignMesh()
+bool App::Solver::buildDesignMesh(bool prepare_design_data)
 {
     const auto started_at = std::chrono::steady_clock::now();
     performance_data = {};
@@ -234,6 +281,7 @@ bool App::Solver::buildDesignMesh()
     reference_ready = false;
     reference_outlet_pressure.clear();
     fft_window.clear();
+    reference_spectrum.clear();
     frequency_response = {};
     result.success = 0;
     result.solidInfillFraction.store(
@@ -251,17 +299,12 @@ bool App::Solver::buildDesignMesh()
     const int dim = mesh->Dimension();
     fec = std::make_unique<H1_FECollection>(fe_order, dim);
     level_set_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get());
-    scalar_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get());
-    displacement_fes = std::make_unique<FiniteElementSpace>(
-        mesh.get(), fec.get(), dim, Ordering::byVDIM);
-    phi_field = std::make_unique<GridFunction>(level_set_fes.get());
-    const bool initialize_design = initialize_design_on_next_mesh
-        || lset.design.Size() != level_set_fes->GetTrueVSize();
-    if (initialize_design) {
-        lset.design.SetSize(level_set_fes->GetTrueVSize());
-        lset.design = 0.5;
+    if (prepare_design_data) {
+        scalar_fes = std::make_unique<FiniteElementSpace>(mesh.get(), fec.get());
+        displacement_fes = std::make_unique<FiniteElementSpace>(
+            mesh.get(), fec.get(), dim, Ordering::byVDIM);
+        phi_field = std::make_unique<GridFunction>(level_set_fes.get());
     }
-    lset.phi.SetSize(level_set_fes->GetTrueVSize());
 
     // Domain regions along x
     const double design_start = settings.inletLength;
@@ -299,6 +342,22 @@ bool App::Solver::buildDesignMesh()
             "Each duct region must contain at least one mesh element center.");
         return false;
     }
+
+    // MFEM's ParMesh constructor needs this serial seed and its scalar DOF
+    // ordering on every rank. Worker ranks stop here and release both as soon
+    // as the distributed mesh and maps have been constructed.
+    if (!prepare_design_data) {
+        mesh_is_ready = true;
+        return true;
+    }
+
+    const bool initialize_design = initialize_design_on_next_mesh
+        || lset.design.Size() != level_set_fes->GetTrueVSize();
+    if (initialize_design) {
+        lset.design.SetSize(level_set_fes->GetTrueVSize());
+        lset.design = 0.5;
+    }
+    lset.phi.SetSize(level_set_fes->GetTrueVSize());
 
     // Only DOFs exclusively supported by design elements are editable.
     Array<int> design_incidence(level_set_fes->GetVSize());
@@ -392,7 +451,64 @@ bool App::Solver::buildDesignMesh()
 #if !METAMATERIAL_USE_MPI
 bool App::Solver::setMesh()
 {
-    return buildDesignMesh();
+    if (mesh && mesh_is_ready && meshSettingsMatch()) {
+        const bool matrices_match = matrixSettingsMatch();
+        const bool source_matches = sourceSettingsMatch();
+        const bool window_matches =
+            settings.useHannWindow == cached_settings.useHannWindow;
+        if (!matrices_match) {
+            Cpp_block.reset();
+            reference_M.reset();
+            reference_C.reset();
+            reference_K.reset();
+            reference_Muu_block.reset();
+            reference_Cuu_block.reset();
+            reference_Kuu_block.reset();
+            reference_Mpp_block.reset();
+            reference_Cpp_block.reset();
+            reference_Kpp_block.reset();
+            reference_ready = false;
+        }
+        if (!source_matches) {
+            source_pressure.clear();
+            source_pressure_derivative.clear();
+            reference_ready = false;
+        }
+        if (!matrices_match || !source_matches) {
+            reference_outlet_pressure.clear();
+            fft_window.clear();
+            reference_spectrum.clear();
+            frequency_response = {};
+            std::atomic_store(
+                &result.referenceOutletPressure,
+                std::shared_ptr<const SignalTD>{});
+            std::atomic_store(
+                &result.materialImpulseResponse,
+                std::shared_ptr<const SignalFFT>{});
+        }
+        else if (!window_matches) {
+            fft_window.clear();
+            reference_spectrum.clear();
+            frequency_response = {};
+            std::atomic_store(
+                &result.materialImpulseResponse,
+                std::shared_ptr<const SignalFFT>{});
+        }
+        if (settings.filterRadius != cached_settings.filterRadius) {
+            filter_matrix.reset();
+        }
+        cached_settings = settings;
+        assembly_is_ready = false;
+        forward_is_ready = false;
+        result.success = 0;
+        return true;
+    }
+    const bool ready = buildDesignMesh(true);
+    if (ready) {
+        cached_settings = settings;
+        settings_cache_ready = true;
+    }
+    return ready;
 }
 #endif
 
@@ -1240,21 +1356,26 @@ bool App::Solver::postprocessFourierResponse()
         return false;
     }
 
-    fft_window.resize(sample_count);
-    for (int sample = 0; sample < sample_count; ++sample) {
-        fft_window[sample] = settings.useHannWindow
-            ? 0.5 * (1.0 - std::cos(
-                2.0 * std::acos(-1.0) * sample / (sample_count - 1)))
-            : 1.0;
+    if (fft_window.size() != static_cast<std::size_t>(sample_count)) {
+        fft_window.resize(sample_count);
+        for (int sample = 0; sample < sample_count; ++sample) {
+            fft_window[sample] = settings.useHannWindow
+                ? 0.5 * (1.0 - std::cos(
+                    2.0 * std::acos(-1.0) * sample / (sample_count - 1)))
+                : 1.0;
+        }
     }
 
     std::vector<std::complex<double>> response_spectrum;
-    std::vector<std::complex<double>> reference_spectrum;
     if (!detail::forwardWindowedSignal(
-            outlet_pressure, fft_window, response_spectrum)
-        || !detail::forwardWindowedSignal(
-            reference_outlet_pressure, fft_window, reference_spectrum)) {
+            outlet_pressure, fft_window, response_spectrum)) {
         log(LogLevel::Error, "FFTW could not produce the frequency response.");
+        return false;
+    }
+    if (reference_spectrum.size() != response_spectrum.size()
+        && !detail::forwardWindowedSignal(
+            reference_outlet_pressure, fft_window, reference_spectrum)) {
+        log(LogLevel::Error, "FFTW could not produce the reference response.");
         return false;
     }
 
