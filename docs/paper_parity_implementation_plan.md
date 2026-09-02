@@ -77,8 +77,13 @@ Direct 3D optimization, Bloch-Floquet unit cells, export implementation, and GLV
 - [x] Share the Newmark recurrence, inverse-FFT/Newmark adjoint, and cut-element sensitivity between serial and MPI backends in `newmark.hpp`, `adjoint.hpp`, and `cut_sensitivity.hpp`.
 - [x] Add the true MPI forward/adjoint path in `par_solver.cpp`, including distributed outlet reduction, gradient reduction, block-preconditioned FGMRES, and runtime MUMPS forward/transpose solves.
 - [x] Keep ParOpt on rank zero with `MPI_COMM_SELF`; its callbacks invoke one collective Solver operation while nonzero ranks remain in `Solver::parallelWorkerLoop()`.
-- [x] Add source-complete 1/2/4-rank comparison and MUMPS forward/transpose checks. They remain unrun until the user's Ninja build.
-- [x] Register the existing smoke executables with CTest and add build-free
+- [x] Consolidate the real MFEM forward, slab-coupling, adjoint finite-difference,
+  FFT, and rank-invariance checks in `SolverTestSuite.cpp`; keep FGMRES and
+  MUMPS rank comparisons as CTest invocations of that one executable.
+- [x] Consolidate deterministic low/high/band-pass, freeform, scaling,
+  cancellation, and wall-escape cases in `OptimizerTestSuite.cpp`; every case
+  drives the real `App::Optimizer` against one curated `ForwardSolver` fake.
+- [x] Register the consolidated suites with CTest and keep the build-free
   `test.bat`/`test.sh` wrappers that merge serial/MPI outcomes into the ignored
   `test-results/tests.json` report.
 - [x] Make MPI worker ownership explicit on the one primary Solver per process;
@@ -106,9 +111,9 @@ Direct 3D optimization, Bloch-Floquet unit cells, export implementation, and GLV
 - [x] Retain the four designed block AMGs and reuse them for the transposed
   adjoint solve; the symmetric diagonal blocks are unchanged by transposition.
 - [ ] Confirm all of the above with the user's Ninja build; no application build has been run in this implementation pass.
-- [ ] Before running ParOpt, pass `mumps_smoke_check` on two ranks and
-  `parallel_solver_check` on one, two, and four ranks. Do not diagnose the
-  optimizer until this standalone MFEM Solver gate passes.
+- [ ] Run `solver_test_suite` through the registered one/two-rank FGMRES and
+  MUMPS CTests, then run `optimizer_test_suite`. Do not diagnose the paper
+  optimizer until these isolated Solver and deterministic Optimizer gates pass.
 - [ ] Run the miniapp's quick mode and inspect `quick.json` in `tests/paper_optimizer_report.html`.
 - [ ] After the coarse run passes, run `--paper` and compare the resulting topology and response with the paper.
 
@@ -121,10 +126,18 @@ Direct 3D optimization, Bloch-Floquet unit cells, export implementation, and GLV
 - [x] Reject undefined implicit-interface normals instead of silently dropping
   their quadrature contributions in forward assembly or cut sensitivity.
 - [x] Add cut-volume complementarity, uncut/full-element equivalence, and
-  empty-duct transmission checks to the existing coarse adjoint executable.
+  empty-duct transmission checks to the consolidated Solver suite.
 - [x] Exercise the actual shared FFTW forward transform with a known sinusoid
   and verify its one-sided amplitude and phase convention.
-- [ ] Run `solver_adjoint_check`, which now compares the complete MFEM cut derivative against a centered design finite difference on a coarse runtime case.
+- [ ] Run `solver_test_suite`, which compares the complete MFEM cut derivative
+  against a centered design finite difference on a coarse runtime case.
+- [x] Avoid ParOpt 2.1.5's swapped MMA convergence outputs with a small local
+  driver over the public `ParOptMMA`/`ParOptInteriorPoint` classes. Its KKT
+  call uses `(l1, linfty, infeasibility)` in the declared order.
+- [x] Preserve the exact epigraph formulation without patching ParOpt:
+  `EpigraphMMA` derives from `ParOptMMA`, reuses its geometry approximation,
+  and overrides the virtual subproblem evaluations/bounds so only `z` remains
+  exact-linear, unregularized, and free of geometry move limits.
 
 ## Implementation Order
 
@@ -134,12 +147,11 @@ Direct 3D optimization, Bloch-Floquet unit cells, export implementation, and GLV
 - [x] `py -B tests/test_paper_adjoint.py` passes all three objective,
   FFT-transpose, and scalar Newmark-adjoint regressions.
 - [ ] The user's Ninja build confirms the modified C++ targets compile.
-- [ ] `solver_adjoint_check` passes Algoim complementarity, uncut integration,
-  FFT amplitude/phase, empty-duct transmission, and serial finite differences.
-- [ ] `mumps_smoke_check` passes its forward/transpose solve; the MUMPS branch
-  of `parallel_solver_check` passes the empty/design sparse-graph transition.
-- [ ] `parallel_solver_check` agrees with serial on 1, 2, and 4 ranks for the
-  forward signal, complex spectrum, and design gradient.
+- [ ] `solver_test_suite` passes Algoim complementarity, uncut integration,
+  FFT amplitude/phase, empty-duct transmission, slab coupling, adjoint finite
+  differences, and one/two-rank FGMRES/MUMPS comparison.
+- [ ] `optimizer_test_suite` passes its deterministic real-Optimizer cases,
+  including scale invariance and escaping a curated wall with an exact gradient.
 - [ ] The quick MUMPS miniapp finishes an optimization and writes a valid JSON
   geometry/report before the exact `--paper --mumps` run is attempted.
 
@@ -277,3 +289,13 @@ Gate: the complete Start/Cancel/Export state flow remains responsive while a rea
   reference matrices, one MPI command per stage, one Dispatcher future, and
   explicit collective MUMPS teardown. This was a source-only pass; the
   multi-rank verification ladder remains open.
+- 2026-09-02: Added a six-call `ForwardSolver` contract at the existing
+  Solver/Optimizer seam so one deterministic fake can exercise the production
+  Optimizer and ParOpt workflow without MFEM cost. Replaced four overlapping
+  solver/optimizer smoke sources with one `SolverTestSuite.cpp` and one
+  `OptimizerTestSuite.cpp`; no fetched MFEM or ParOpt source is patched.
+- 2026-09-02: Applied the public-API ParOpt conditioning pass from the optimizer
+  repair plan: raw/normalized epigraph reporting, nonzero MMA convergence
+  tolerances, and the recommended interior-point settings. A local
+  `EpigraphMMA` subclass keeps `z` exact-linear, while a short public-API MMA
+  driver corrects KKT output ordering; fetched ParOpt remains unmodified.

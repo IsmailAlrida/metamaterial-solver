@@ -492,6 +492,38 @@ void Renderer::scientificInput(const char* label,
     ImGui::PopID();
 }
 
+void Renderer::integerInput(const char* label, int& value)
+{
+    ImGui::PushID(label);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine();
+    constexpr float fieldWidth = 165.0f;
+    ImGui::SetCursorPosX(std::max(
+        ImGui::GetCursorPosX(),
+        ImGui::GetWindowWidth() - fieldWidth
+            - ImGui::GetStyle().WindowPadding.x));
+    ImGui::SetNextItemWidth(fieldWidth);
+    ImGui::InputInt("##value", &value, 0, 0);
+    ImGui::PopID();
+}
+
+void Renderer::integerInput(const char* label, unsigned int& value)
+{
+    ImGui::PushID(label);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine();
+    constexpr float fieldWidth = 165.0f;
+    ImGui::SetCursorPosX(std::max(
+        ImGui::GetCursorPosX(),
+        ImGui::GetWindowWidth() - fieldWidth
+            - ImGui::GetStyle().WindowPadding.x));
+    ImGui::SetNextItemWidth(fieldWidth);
+    ImGui::InputScalar("##value", ImGuiDataType_U32, &value);
+    ImGui::PopID();
+}
+
 void Renderer::SimulationSettingsPanel(const dispatcher_t& dispatcher)
 {
     if (!ImGui::Begin("Simulation Settings")) {
@@ -541,19 +573,13 @@ void Renderer::SimulationSettingsPanel(const dispatcher_t& dispatcher)
 
         ImGui::SeparatorText("Mesh resolution");
         ImGui::Checkbox("Isotropic grid", &solver.isotropicGrid);
-        ImGui::SetNextItemWidth(110.0f);
-        ImGui::InputInt("nx", &solver.nx);
+        integerInput("nx", solver.nx);
 
         if (!solver.isotropicGrid) {
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(110.0f);
-            ImGui::InputInt("ny", &solver.ny);
+            integerInput("ny", solver.ny);
             if (is3D) {
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(110.0f);
-                ImGui::InputInt("nz", &solver.nz);
+                integerInput("nz", solver.nz);
             }
-
         }
 
         const double heightMinimum = 0.02;
@@ -671,7 +697,7 @@ void Renderer::SimulationSettingsPanel(const dispatcher_t& dispatcher)
                         1.0e-9, 1.0, "%.4f");
         scientificInput("Source amplitude (Pa)", solver.sourceAmplitude,
                         0.0, 1.0e9, "%.3f");
-        ImGui::InputScalar("Source seed", ImGuiDataType_U32, &solver.sourceSeed);
+        integerInput("Source seed", solver.sourceSeed);
     }
 
     ImGui::Spacing();
@@ -679,7 +705,7 @@ void Renderer::SimulationSettingsPanel(const dispatcher_t& dispatcher)
     if (ImGui::CollapsingHeader("Optimizer Settings")) {
         scientificInput("Smoothing radius (m)", solver.filterRadius,
                         0.0f, 1.0e3f, "%.5f");
-        ImGui::InputInt("Maximum iterations", &optimizer.maxIterations);
+        integerInput("Maximum iterations", optimizer.maxIterations);
         scientificInput("Initial asymptote", optimizer.mmaInitialAsymptote,
                         0.0, 1.0, "%.3f");
         scientificInput("Asymptote decrease", optimizer.mmaDecreaseAsymptote,
@@ -698,8 +724,8 @@ void Renderer::SimulationSettingsPanel(const dispatcher_t& dispatcher)
     ImGui::Spacing();
 
     if (ImGui::CollapsingHeader("Initial level-set design")) {
-        ImGui::InputInt("Cosine count x", &solver.initialPatternX);
-        ImGui::InputInt("Cosine count y", &solver.initialPatternY);
+        integerInput("Cosine count x", solver.initialPatternX);
+        integerInput("Cosine count y", solver.initialPatternY);
         scientificInput("Pattern length x (m)", solver.initialPatternLx,
                         1.0e-9, 1.0e3, "%.4f");
         scientificInput("Pattern length y (m)", solver.initialPatternLy,
@@ -1241,8 +1267,6 @@ void Renderer::FilterDesignerPanel(const dispatcher_t& dispatcher)
         }
 
         if (!locked && optimizer.objectiveMode == ObjectiveMode::band) {
-            const double binWidth = std::max(
-                1.0, 1.0 / std::max(settings.solverSettings.duration, 1.0e-12));
             std::vector<std::size_t> stops;
             for (std::size_t i = 0; i < optimizer.frequencyBands.size(); ++i) {
                 if (optimizer.frequencyBands[i].type == FrequencyBandType::stop) {
@@ -1287,20 +1311,6 @@ void Renderer::FilterDesignerPanel(const dispatcher_t& dispatcher)
                 if (targetClicked) {
                     selectedBand = static_cast<int>(stopNumber);
                 }
-                const double lower = stopNumber == 0
-                    ? optimizer.frequencyMin
-                    : optimizer.frequencyBands[stops[stopNumber - 1]].endHz;
-                const double upper = stopNumber + 1 == stops.size()
-                    ? optimizer.frequencyMax
-                    : optimizer.frequencyBands[stops[stopNumber + 1]].startHz;
-                band.startHz = std::clamp(
-                    std::round(band.startHz / binWidth) * binWidth,
-                    lower,
-                    upper - binWidth);
-                band.endHz = std::clamp(
-                    std::round(band.endHz / binWidth) * binWidth,
-                    band.startHz + binWidth,
-                    upper);
             }
         }
 
@@ -1411,14 +1421,17 @@ void Renderer::FilterDesignerPanel(const dispatcher_t& dispatcher)
         int removeIndex = -1;
         if (ImGui::BeginTable(
                 "##stop-band-rows", 5,
-                ImGuiTableFlags_SizingStretchProp
+                ImGuiTableFlags_SizingStretchSame
                     | ImGuiTableFlags_RowBg
                     | ImGuiTableFlags_Borders)) {
             ImGui::TableSetupColumn(
                 "Band", ImGuiTableColumnFlags_WidthFixed, 72.0f);
-            ImGui::TableSetupColumn("Start", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("End", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("Target", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn(
+                "Start", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableSetupColumn(
+                "End", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableSetupColumn(
+                "Target", ImGuiTableColumnFlags_WidthStretch, 1.0f);
             ImGui::TableSetupColumn(
                 "##remove", ImGuiTableColumnFlags_WidthFixed,
                 ImGui::GetFrameHeight());
@@ -1446,6 +1459,7 @@ void Renderer::FilterDesignerPanel(const dispatcher_t& dispatcher)
                 optimizer.frequencyBands.begin() + removeIndex);
             rebuildImplicitPassBands();
         }
+        ImGui::Dummy(ImVec2(0.0f, ImGui::GetFrameHeight() * 1.5f));
     }
     else {
         ImGui::TextDisabled(

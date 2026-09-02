@@ -44,7 +44,25 @@ namespace App {
         int differentiatedDofs = 0;
     };
 
-    class Solver {
+    // The optimizer needs only the forward/adjoint contract. Keeping this
+    // seam here lets its CTest suite use deterministic curated physics while
+    // the application continues to pass the real Solver by reference.
+    class ForwardSolver {
+    public:
+        virtual ~ForwardSolver() = default;
+        virtual bool setMesh() = 0;
+        virtual bool assembleSolutionSpace() = 0;
+        virtual bool solve() = 0;
+        virtual SolverStatus get_status() const = 0;
+        virtual const FrequencyResponse& frequencyResponse() const = 0;
+        virtual bool differentiateFrequencyResponses(
+            const std::vector<std::complex<double>>& pass_spectrum_derivative,
+            const std::vector<std::complex<double>>& stop_spectrum_derivative,
+            mfem::Vector& pass_design_gradient,
+            mfem::Vector& stop_design_gradient) = 0;
+    };
+
+    class Solver : public ForwardSolver {
 
     public:
 
@@ -53,21 +71,21 @@ namespace App {
                SolverResult& result,
                const LogFunction& log);
 
-        ~Solver();
+        ~Solver() override;
 
-        bool setMesh();
-        bool assembleSolutionSpace();
-        bool solve();
+        bool setMesh() override;
+        bool assembleSolutionSpace() override;
+        bool solve() override;
         void parallelWorkerLoop();
         void shutdownParallelWorkers();
-        SolverStatus get_status() const;
-        const FrequencyResponse& frequencyResponse() const;
+        SolverStatus get_status() const override;
+        const FrequencyResponse& frequencyResponse() const override;
         const SolverPerformance& performance() const;
         bool differentiateFrequencyResponses(
             const std::vector<std::complex<double>>& pass_spectrum_derivative,
             const std::vector<std::complex<double>>& stop_spectrum_derivative,
             mfem::Vector& pass_design_gradient,
-            mfem::Vector& stop_design_gradient);
+            mfem::Vector& stop_design_gradient) override;
 
 
 
@@ -133,6 +151,8 @@ namespace App {
         mfem::Array<int> displacement_essential_tdofs;
         std::vector<double> source_pressure;
         std::vector<double> source_pressure_derivative;
+        std::vector<double> inlet_pressure;
+        std::vector<double> reference_inlet_pressure;
         std::vector<double> outlet_pressure;
         std::vector<double> reference_outlet_pressure;
         std::vector<double> fft_window;

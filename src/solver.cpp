@@ -271,6 +271,8 @@ bool App::Solver::buildDesignMesh(bool prepare_design_data)
     displacement_essential_tdofs.SetSize(0);
     source_pressure.clear();
     source_pressure_derivative.clear();
+    inlet_pressure.clear();
+    reference_inlet_pressure.clear();
     outlet_pressure.clear();
     result.U.clear();
     result.residualNorms.clear();
@@ -475,6 +477,7 @@ bool App::Solver::setMesh()
             reference_ready = false;
         }
         if (!matrices_match || !source_matches) {
+            reference_inlet_pressure.clear();
             reference_outlet_pressure.clear();
             fft_window.clear();
             reference_spectrum.clear();
@@ -608,6 +611,7 @@ bool App::Solver::assembleSolutionSpace()
     result.residualNorms.clear();
     pass_adjoint_history.clear();
     stop_adjoint_history.clear();
+    inlet_pressure.clear();
     outlet_pressure.clear();
     M.reset();
     C.reset();
@@ -1121,6 +1125,9 @@ bool App::Solver::solve()
         M_solver.SetAbsTol(1.0e-12);
         M_solver.SetMaxIter(1500);
         M_solver.SetPrintLevel(-1);
+        std::vector<double>& measured_inlet = reference_analysis
+            ? reference_inlet_pressure
+            : inlet_pressure;
         std::vector<double>& measured_outlet = reference_analysis
             ? reference_outlet_pressure
             : outlet_pressure;
@@ -1161,6 +1168,7 @@ bool App::Solver::solve()
                 !reference_analysis,
                 result.U,
                 result.residualNorms,
+                measured_inlet,
                 measured_outlet,
                 performance_data,
                 log,
@@ -1347,8 +1355,19 @@ bool App::Solver::smooth_level_set(
 
 bool App::Solver::postprocessFourierResponse()
 {
+    const auto* physics =
+        std::get_if<VibroacousticSettings>(&settings.physics);
+    if (physics == nullptr) {
+        log(LogLevel::Error,
+            "The Fourier response requires vibroacoustic settings.");
+        return false;
+    }
+
     const int sample_count = static_cast<int>(outlet_pressure.size());
     if (sample_count == 0
+        || source_pressure.size() < static_cast<std::size_t>(sample_count)
+        || inlet_pressure.size() != outlet_pressure.size()
+        || reference_inlet_pressure.size() != outlet_pressure.size()
         || reference_outlet_pressure.size() != outlet_pressure.size()) {
         return false;
     }
@@ -1375,6 +1394,20 @@ bool App::Solver::postprocessFourierResponse()
         log(LogLevel::Error, "FFTW could not produce the reference response.");
         return false;
     }
+    std::vector<std::complex<double>> inlet_spectrum;
+    std::vector<std::complex<double>> reference_inlet_spectrum;
+    std::vector<std::complex<double>> incident_spectrum;
+    std::vector<double> incident_pressure(
+        source_pressure.begin(), source_pressure.begin() + sample_count);
+    if (!detail::forwardWindowedSignal(
+            inlet_pressure, fft_window, inlet_spectrum)
+        || !detail::forwardWindowedSignal(
+            reference_inlet_pressure, fft_window, reference_inlet_spectrum)
+        || !detail::forwardWindowedSignal(
+            incident_pressure, fft_window, incident_spectrum)) {
+        log(LogLevel::Error, "FFTW could not produce the port power balance.");
+        return false;
+    }
 
     auto response = std::make_shared<SignalFFT>();
     response->size = static_cast<int>(response_spectrum.size());
@@ -1385,6 +1418,10 @@ bool App::Solver::postprocessFourierResponse()
     response->attenuationDB.resize(response->size);
     response->phase.resize(response->size);
     response->valid.resize(response->size);
+    response->reflectedPower.resize(response->size);
+    response->transmittedPower.resize(response->size);
+    response->unaccountedPower.resize(response->size);
+    response->powerBalanceValid.resize(response->size);
 
     double maximum_reference = 0.0;
     for (const std::complex<double>& value : reference_spectrum) {
@@ -1404,6 +1441,31 @@ bool App::Solver::postprocessFourierResponse()
 
     const bool has_nyquist_bin = sample_count % 2 == 0;
     const float invalid_value = std::numeric_limits<float>::quiet_NaN();
+    const double port_measure = settings.nz > 0
+        ? settings.sy * settings.sz
+        : settings.sy;
+    double maximum_incident = 0.0;
+    for (const std::complex<double>& value : incident_spectrum) {
+        maximum_incident = std::max(maximum_incident, std::abs(value));
+    }
+    const double incident_floor = std::max(
+        std::numeric_limits<double>::min(),
+        std::sqrt(std::numeric_limits<double>::epsilon()) * maximum_incident);
+    const double transverse_size = settings.nz > 0
+        ? std::max(settings.sy, settings.sz)
+        : settings.sy;
+    const double plane_wave_cutoff = physics->c_a
+        / (2.0 * transverse_size);
+    double reflected_sum = 0.0;
+    double transmitted_sum = 0.0;
+    double unaccounted_sum = 0.0;
+    double reference_reflected_sum = 0.0;
+    double reference_transmitted_sum = 0.0;
+    double reference_unaccounted_sum = 0.0;
+    double minimum_unaccounted = std::numeric_limits<double>::infinity();
+    double minimum_reference_unaccounted =
+        std::numeric_limits<double>::infinity();
+    int power_bin_count = 0;
     frequency_response.frequency.resize(response->size);
     frequency_response.outlet = response_spectrum;
     frequency_response.reference = reference_spectrum;
@@ -1426,6 +1488,53 @@ bool App::Solver::postprocessFourierResponse()
         response->amplitude[bin] = static_cast<float>(
             amplitude * one_sided_scale);
         response->valid[bin] = valid ? 1 : 0;
+
+        const bool power_valid = bin > 0
+            && frequency < plane_wave_cutoff
+            && port_measure > 0.0
+            && std::abs(incident_spectrum[bin]) > incident_floor;
+        response->powerBalanceValid[bin] = power_valid ? 1 : 0;
+        if (power_valid) {
+            const std::complex<double> incident = incident_spectrum[bin];
+            const std::complex<double> reflected =
+                inlet_spectrum[bin] / port_measure - incident;
+            const std::complex<double> transmitted =
+                response_spectrum[bin] / port_measure;
+            const std::complex<double> reference_reflected =
+                reference_inlet_spectrum[bin] / port_measure - incident;
+            const std::complex<double> reference_transmitted =
+                reference_spectrum[bin] / port_measure;
+            const double reflected_power = std::norm(reflected / incident);
+            const double transmitted_power = std::norm(transmitted / incident);
+            const double unaccounted_power =
+                1.0 - reflected_power - transmitted_power;
+            const double reference_reflected_power =
+                std::norm(reference_reflected / incident);
+            const double reference_transmitted_power =
+                std::norm(reference_transmitted / incident);
+            const double reference_unaccounted_power = 1.0
+                - reference_reflected_power - reference_transmitted_power;
+            response->reflectedPower[bin] = static_cast<float>(reflected_power);
+            response->transmittedPower[bin] = static_cast<float>(transmitted_power);
+            response->unaccountedPower[bin] = static_cast<float>(unaccounted_power);
+            reflected_sum += reflected_power;
+            transmitted_sum += transmitted_power;
+            unaccounted_sum += unaccounted_power;
+            reference_reflected_sum += reference_reflected_power;
+            reference_transmitted_sum += reference_transmitted_power;
+            reference_unaccounted_sum += reference_unaccounted_power;
+            minimum_unaccounted = std::min(
+                minimum_unaccounted, unaccounted_power);
+            minimum_reference_unaccounted = std::min(
+                minimum_reference_unaccounted,
+                reference_unaccounted_power);
+            ++power_bin_count;
+        }
+        else {
+            response->reflectedPower[bin] = invalid_value;
+            response->transmittedPower[bin] = invalid_value;
+            response->unaccountedPower[bin] = invalid_value;
+        }
         if (!valid) {
             response->transmission[bin] = invalid_value;
             response->attenuationDB[bin] = invalid_value;
@@ -1439,6 +1548,32 @@ bool App::Solver::postprocessFourierResponse()
             20.0 * std::log10(std::max(transmission, 1.0e-12)));
         response->phase[bin] = static_cast<float>(
             std::arg(response_spectrum[bin] / reference_spectrum[bin]));
+    }
+
+    if (power_bin_count > 0) {
+        std::ostringstream message;
+        message << "Plane-wave port power balance below "
+                << std::fixed << std::setprecision(1) << plane_wave_cutoff
+                << " Hz over " << power_bin_count
+                << " excited bins: mean reflected/transmitted/unaccounted = "
+                << std::setprecision(6)
+                << reflected_sum / power_bin_count << " / "
+                << transmitted_sum / power_bin_count << " / "
+                << unaccounted_sum / power_bin_count
+                << "; empty reference = "
+                << reference_reflected_sum / power_bin_count << " / "
+                << reference_transmitted_sum / power_bin_count << " / "
+                << reference_unaccounted_sum / power_bin_count
+                << "; minima = " << minimum_unaccounted << " / "
+                << minimum_reference_unaccounted << ".";
+        const bool suspicious = minimum_unaccounted < -0.05
+            || minimum_reference_unaccounted < -0.05
+            || reference_reflected_sum / power_bin_count > 0.05
+            || std::abs(reference_transmitted_sum / power_bin_count - 1.0)
+                > 0.05;
+        log(suspicious
+                ? LogLevel::Warning : LogLevel::Message,
+            message.str());
     }
 
     auto make_signal = [this, sample_count](

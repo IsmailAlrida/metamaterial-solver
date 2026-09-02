@@ -18,7 +18,7 @@ struct OptimizerPerformance {
 class Optimizer {
     public:
         Optimizer(const OptimizerSettings& settings,
-                  Solver& solver,
+                  ForwardSolver& solver,
                   LevelSet& geometry,
                   const LogFunction& log);
 
@@ -55,7 +55,7 @@ class Optimizer {
         void clear_requests();
 
         const OptimizerSettings& settings;
-        Solver& solver;
+        ForwardSolver& solver;
         LevelSet& geometry;
         const LogFunction& log;
         std::atomic_bool cancel_requested{false};

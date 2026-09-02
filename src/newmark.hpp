@@ -43,6 +43,7 @@ inline bool runNewmark(
     bool retain_history,
     std::vector<mfem::Vector>& history,
     std::vector<NewmarkResidualNorms>& residual_norms,
+    std::vector<double>& measured_inlet,
     std::vector<double>& measured_outlet,
     SolverPerformance& performance,
     const LogFunction& log,
@@ -112,9 +113,12 @@ inline bool runNewmark(
         residual_norms[0] = {initial_residual, 0.0, 0.0};
     }
 
+    measured_inlet.clear();
+    measured_inlet.reserve(time_steps);
     measured_outlet.clear();
     measured_outlet.reserve(time_steps);
     // Paper Eq. (29) transforms U^0, ..., U^(N-1).
+    measured_inlet.push_back(dot(inlet_load, v));
     measured_outlet.push_back(dot(outlet_functional, v));
     mfem::Vector h_hat(state_size);
     mfem::Vector x_M(state_size);
@@ -193,6 +197,7 @@ inline bool runNewmark(
         v_ddot_n.SetSubVector(essential_dofs, 0.0);
 
         if (n < time_steps) {
+            measured_inlet.push_back(dot(inlet_load, v_n));
             measured_outlet.push_back(dot(outlet_functional, v_n));
         }
 

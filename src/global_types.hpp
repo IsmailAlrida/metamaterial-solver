@@ -53,6 +53,12 @@ struct SignalFFT {
     std::vector<float> phase;
     std::vector<float> frequency;
     std::vector<unsigned char> valid;
+    // Plane-wave port powers relative to the prescribed incident wave.
+    std::vector<float> reflectedPower;
+    std::vector<float> transmittedPower;
+    // Positive values contain damping, unresolved/storage, and window leakage.
+    std::vector<float> unaccountedPower;
+    std::vector<unsigned char> powerBalanceValid;
 };
 
 struct SignalTD {

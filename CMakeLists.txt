@@ -665,19 +665,12 @@ add_executable(exporter_bundle_check
 target_link_libraries(exporter_bundle_check PRIVATE metamaterial_core)
 add_test(NAME exporter_bundle COMMAND exporter_bundle_check)
 
-add_executable(paropt_smoke_check
-    tests/paropt_smoke_check.cpp
-)
-target_link_libraries(paropt_smoke_check PRIVATE ParOpt::paropt)
-add_test(NAME paropt_smoke COMMAND paropt_smoke_check)
+add_executable(optimizer_test_suite tests/OptimizerTestSuite.cpp)
+target_link_libraries(optimizer_test_suite PRIVATE metamaterial_core)
+add_test(NAME optimizer_suite COMMAND optimizer_test_suite)
 
-if(NOT METAMATERIAL_USE_MPI)
-  add_executable(solver_adjoint_check
-      tests/solver_adjoint_check.cpp
-  )
-  target_link_libraries(solver_adjoint_check PRIVATE metamaterial_core)
-  add_test(NAME solver_adjoint COMMAND solver_adjoint_check)
-endif()
+add_executable(solver_test_suite tests/SolverTestSuite.cpp)
+target_link_libraries(solver_test_suite PRIVATE metamaterial_core)
 
 add_executable(paper_optimizer_miniapp
     tests/paper_optimizer_miniapp.cpp
@@ -686,30 +679,38 @@ target_link_libraries(paper_optimizer_miniapp PRIVATE
     metamaterial_core
 )
 if(METAMATERIAL_USE_MPI)
-  add_executable(mumps_smoke_check tests/mumps_smoke_check.cpp)
-  target_link_libraries(mumps_smoke_check PRIVATE mfem)
-
-  add_test(NAME mumps_2_ranks
-      COMMAND "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}" 2
-              ${MPIEXEC_PREFLAGS} $<TARGET_FILE:mumps_smoke_check>
+  set(_solver_rank_reference
+      "${CMAKE_CURRENT_BINARY_DIR}/solver-suite-rank-reference.txt")
+  add_test(NAME solver_suite_fgmres_1_rank
+      COMMAND "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}" 1
+              ${MPIEXEC_PREFLAGS} $<TARGET_FILE:solver_test_suite>
+              --write-rank-reference "${_solver_rank_reference}"
               ${MPIEXEC_POSTFLAGS})
-  set_tests_properties(mumps_2_ranks PROPERTIES
-      PROCESSORS 2)
+  set_tests_properties(solver_suite_fgmres_1_rank PROPERTIES
+      PROCESSORS 1 FIXTURES_SETUP solver_rank_reference)
 
-  add_executable(parallel_solver_check
-      tests/parallel_solver_check.cpp
-  )
-  target_link_libraries(parallel_solver_check PRIVATE
-      metamaterial_core
-  )
-
-  foreach(_ranks 1 2 4)
-    add_test(NAME parallel_solver_${_ranks}_ranks
-        COMMAND "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}" ${_ranks}
-                ${MPIEXEC_PREFLAGS} $<TARGET_FILE:parallel_solver_check>
+  foreach(_solver_case IN ITEMS fgmres_2_rank mumps_1_rank mumps_2_rank)
+    if(_solver_case MATCHES "_2_rank$")
+      set(_solver_ranks 2)
+    else()
+      set(_solver_ranks 1)
+    endif()
+    if(_solver_case MATCHES "^mumps_")
+      set(_solver_method --mumps)
+    else()
+      set(_solver_method)
+    endif()
+    add_test(NAME solver_suite_${_solver_case}
+        COMMAND "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}"
+                ${_solver_ranks} ${MPIEXEC_PREFLAGS}
+                $<TARGET_FILE:solver_test_suite> ${_solver_method}
+                --compare-rank-reference "${_solver_rank_reference}"
                 ${MPIEXEC_POSTFLAGS})
-    set_tests_properties(parallel_solver_${_ranks}_ranks PROPERTIES
-        PROCESSORS ${_ranks})
+    set_tests_properties(solver_suite_${_solver_case} PROPERTIES
+        PROCESSORS ${_solver_ranks}
+        FIXTURES_REQUIRED solver_rank_reference)
   endforeach()
+else()
+  add_test(NAME solver_suite COMMAND solver_test_suite)
 endif()
 endif()
