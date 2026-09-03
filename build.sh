@@ -130,6 +130,7 @@ cmake_args=(
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5
     -DMETAMATERIAL_DEMO_MODE=OFF
     -DMETAMATERIAL_BUILD_TESTS="$build_tests"
+    -DMETAMATERIAL_DEPENDENCY_JOBS="$jobs"
     -DMETAMATERIAL_MFEM_BACKEND="$backend"
     -DMETAMATERIAL_DEPS_SOURCE_DIR="$deps_source_dir"
     -DGLVIS_SOURCE_DIR="$glvis_source_dir"
@@ -140,7 +141,8 @@ cmake "${cmake_args[@]}"
 cp "$build_dir/compile_commands.json" compile_commands.json
 
 if [[ $mode == deps ]]; then
-    echo "LSP configuration completed for $backend. The app was not built."
+    cmake --build "$build_dir" --target optimizer_dependencies --parallel "$jobs"
+    echo "Dependency build completed for $backend. The app was not built."
     exit 0
 fi
 

@@ -68,10 +68,8 @@ if not "%BACKEND%"=="serial" if not "%BACKEND%"=="parallel-cpu" (
 
 call :activate_msvc
 if errorlevel 1 exit /b 1
-if /I "%BACKEND%"=="parallel-cpu" (
-    call :activate_oneapi
-    if errorlevel 1 exit /b 1
-)
+call :activate_oneapi
+if errorlevel 1 exit /b 1
 
 set "BUILD_ROOT=build"
 set "BUILD_DIR=%BUILD_ROOT%\%BACKEND%"
@@ -99,13 +97,15 @@ if "%MODE%"=="deps" (
 call :patch_glvis
 if errorlevel 1 exit /b 1
 
-cmake --preset "%PRESET%" -DMETAMATERIAL_BUILD_TESTS=%BUILD_TESTS%
+cmake --preset "%PRESET%" -DMETAMATERIAL_BUILD_TESTS=%BUILD_TESTS% -DMETAMATERIAL_DEPENDENCY_JOBS=%JOBS%
 if errorlevel 1 exit /b %errorlevel%
 copy /Y "%BUILD_DIR%\compile_commands.json" "%~dp0compile_commands.json" >nul
 if errorlevel 1 exit /b %errorlevel%
 
 if "%MODE%"=="deps" (
-    echo LSP configuration completed for %BACKEND%. The app was not built.
+    cmake --build "%BUILD_DIR%" --target optimizer_dependencies --parallel %JOBS%
+    if errorlevel 1 exit /b 1
+    echo Dependency build completed for %BACKEND%. The app was not built.
     exit /b 0
 )
 
@@ -154,6 +154,7 @@ if errorlevel 1 exit /b %errorlevel%
 set "MSMPI_INC=%ProgramFiles(x86)%\Microsoft SDKs\MPI\Include"
 set "MSMPI_LIB64=%ProgramFiles(x86)%\Microsoft SDKs\MPI\Lib\x64"
 set "PATH=%ProgramFiles%\Microsoft MPI\Bin;%PATH%"
+if /I not "%BACKEND%"=="parallel-cpu" exit /b 0
 where ifx.exe >nul 2>nul
 if errorlevel 1 (
     echo Intel Fortran Compiler is missing. Run setup.bat first.

@@ -29,6 +29,8 @@ call :ensure_tool cmake.exe Kitware.CMake CMake "%VS_INSTALL%\Common7\IDE\Common
 if errorlevel 1 goto failed
 call :ensure_tool ninja.exe Ninja-build.Ninja Ninja "%VS_INSTALL%\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"
 if errorlevel 1 goto failed
+call :ensure_msys2
+if errorlevel 1 goto failed
 if exist "%ProgramFiles%\Microsoft MPI\Bin\mpiexec.exe" (
     echo Microsoft MPI runtime is already available.
 ) else (
@@ -76,6 +78,26 @@ echo Installing %~2...
 winget.exe install --exact --id %~1 --source winget --accept-package-agreements --accept-source-agreements --silent --disable-interactivity
 if errorlevel 1 (
     echo Failed to install %~2.
+    exit /b 1
+)
+exit /b 0
+
+:ensure_msys2
+set "MSYS2_ROOT=C:\msys64"
+set "MSYS2_BASH=%MSYS2_ROOT%\usr\bin\bash.exe"
+if exist "%MSYS2_BASH%" goto install_msys2_packages
+call :ensure_package MSYS2.MSYS2 "MSYS2"
+if errorlevel 1 exit /b 1
+if not exist "%MSYS2_BASH%" (
+    echo MSYS2 installed, but %MSYS2_BASH% was not found.
+    exit /b 1
+)
+
+:install_msys2_packages
+echo Ensuring the Ipopt MSYS2 build tools are available...
+"%MSYS2_BASH%" -lc "pacman -S --needed --noconfirm binutils diffutils git grep make patch pkgconf"
+if errorlevel 1 (
+    echo Failed to install the Ipopt MSYS2 build tools.
     exit /b 1
 )
 exit /b 0
@@ -195,6 +217,18 @@ call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\include\mkl.h" "In
 call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\lib\mkl_core.lib" "Intel oneMKL libraries"
 call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\bin\mkl_sequential.3.dll" "Intel oneMKL runtime"
 call :check_file "%ProgramFiles(x86)%\Intel\oneAPI\compiler\latest\bin\ifx.exe" "Intel Fortran Compiler"
+call :check_file "C:\msys64\usr\bin\bash.exe" "MSYS2 bash"
+call :check_file "C:\msys64\usr\bin\cygpath.exe" "MSYS2 cygpath"
+call :check_file "C:\msys64\usr\bin\make.exe" "MSYS2 make"
+call :check_file "C:\msys64\usr\bin\patch.exe" "MSYS2 patch"
+if exist "C:\msys64\usr\bin\pkg-config.exe" (
+    echo [ok] MSYS2 pkg-config
+) else if exist "C:\msys64\usr\bin\pkgconf.exe" (
+    echo [ok] MSYS2 pkg-config
+) else (
+    echo [missing] MSYS2 pkg-config
+    set /a MISSING+=1
+)
 
 if not "!MISSING!"=="0" (
     echo.
@@ -240,6 +274,6 @@ exit /b 0
 :usage
 echo Usage: setup.bat [install^|check^|help]
 echo.
-echo   install  Install the Windows C++/Fortran toolchain, MS-MPI, and oneMKL.
+echo   install  Install the Windows C++/Fortran toolchain, MSYS2, MS-MPI, and oneMKL.
 echo   check    Check prerequisites without changing the machine.
 exit /b 1

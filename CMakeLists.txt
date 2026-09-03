@@ -18,7 +18,7 @@ endif()
 
 project(metamaterial_solver LANGUAGES C CXX)
 
-if(METAMATERIAL_USE_MPI)
+if(METAMATERIAL_USE_MPI OR UNIX)
   enable_language(Fortran)
 endif()
 
@@ -193,16 +193,14 @@ endif()
 find_package(BLAS REQUIRED)
 find_package(LAPACK REQUIRED)
 
-# MUMPS is a normal compiled dependency of the true MPI backend. The upstream
-# superbuild builds the complete double-precision parallel library and exposes
-# MUMPS::MUMPS; MFEM and every parallel-cpu executable link it at build time.
-# The runtime setting only chooses between already-linked MUMPS and FGMRES.
-if(METAMATERIAL_USE_MPI)
+# MUMPS is a normal compiled dependency of the true MPI backend. Linux also
+# reuses this source build for Ipopt instead of linking a second MUMPS copy.
+if(METAMATERIAL_USE_MPI OR UNIX)
   set(BUILD_SINGLE OFF CACHE BOOL "" FORCE)
   set(BUILD_DOUBLE ON CACHE BOOL "" FORCE)
   set(BUILD_COMPLEX OFF CACHE BOOL "" FORCE)
   set(BUILD_COMPLEX16 OFF CACHE BOOL "" FORCE)
-  set(MUMPS_parallel ON CACHE BOOL "" FORCE)
+  set(MUMPS_parallel ${METAMATERIAL_USE_MPI} CACHE BOOL "" FORCE)
   # Keep MUMPS on the same sequential oneMKL threading layer selected above.
   # A separate build preset can opt into threaded MKL once that stack is proven.
   set(MUMPS_openmp OFF CACHE BOOL "" FORCE)
@@ -227,6 +225,17 @@ if(METAMATERIAL_USE_MPI)
   if(NOT TARGET MUMPS::MUMPS)
     message(FATAL_ERROR "The pinned MUMPS superbuild did not expose MUMPS::MUMPS.")
   endif()
+  if(UNIX)
+    # Ipopt links this same static MUMPS build into libipopt.so.
+    foreach(_target dmumps mumps_common mumps_common_C mumps_common_Fortran pord)
+      set_property(TARGET ${_target} PROPERTY POSITION_INDEPENDENT_CODE ON)
+    endforeach()
+    if(TARGET mpiseq)
+      foreach(_target mpiseq mpiseq_c mpiseq_fortran)
+        set_property(TARGET ${_target} PROPERTY POSITION_INDEPENDENT_CODE ON)
+      endforeach()
+    endif()
+  endif()
   # MFEM exports its build-tree target and therefore requires every linked
   # non-imported dependency to belong to a build-tree export as well.
   export(EXPORT MUMPS-targets
@@ -240,6 +249,10 @@ if(METAMATERIAL_USE_MPI)
   set(MUMPS_INCLUDE_DIRS "${_mumps_include_dirs}" CACHE STRING "" FORCE)
   set(MUMPS_LIBRARIES MUMPS::MUMPS CACHE STRING "" FORCE)
 endif()
+
+# Ipopt and IFOPT are fetched and compiled from their official source trees.
+# ParOpt remains the active optimizer until the TNLP migration is complete.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/optimizer_dependencies.cmake")
 
 FetchContent_Declare(
   gklib

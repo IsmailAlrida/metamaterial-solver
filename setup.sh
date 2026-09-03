@@ -9,6 +9,8 @@ packages=(
     cmake
     ninja-build
     pkg-config
+    diffutils
+    patch
     gfortran
     openmpi-bin
     libopenmpi-dev
