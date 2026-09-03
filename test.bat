@@ -28,6 +28,8 @@ exit /b %errorlevel%
 set "TEST_BACKEND=%~1"
 set "BUILD_DIR=build\%TEST_BACKEND%"
 if /I "%BUILD_TYPE%"=="Debug" set "BUILD_DIR=%BUILD_DIR%-debug"
+call :activate_mkl_runtime
+if errorlevel 1 exit /b 1
 if /I "%TEST_BACKEND%"=="parallel-cpu" (
     call :activate_parallel_runtime
     if errorlevel 1 exit /b 1
@@ -39,13 +41,15 @@ exit /b %errorlevel%
 
 :activate_parallel_runtime
 if not exist "%ProgramFiles(x86)%\Intel\oneAPI\compiler\latest\env\vars.bat" exit /b 1
-if not exist "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\env\vars.bat" exit /b 1
 call "%ProgramFiles(x86)%\Intel\oneAPI\compiler\latest\env\vars.bat" >nul
-if errorlevel 1 exit /b 1
-call "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\env\vars.bat" >nul
 if errorlevel 1 exit /b 1
 set "PATH=%ProgramFiles%\Microsoft MPI\Bin;%PATH%"
 exit /b 0
+
+:activate_mkl_runtime
+if not exist "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\env\vars.bat" exit /b 1
+call "%ProgramFiles(x86)%\Intel\oneAPI\mkl\latest\env\vars.bat" >nul
+exit /b %errorlevel%
 
 :find_cmake
 set "CMAKE_EXE=cmake.exe"

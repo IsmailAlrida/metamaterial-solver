@@ -706,14 +706,12 @@ void Renderer::SimulationSettingsPanel(const dispatcher_t& dispatcher)
         scientificInput("Smoothing radius (m)", solver.filterRadius,
                         0.0f, 1.0e3f, "%.5f");
         integerInput("Maximum iterations", optimizer.maxIterations);
-        scientificInput("Initial asymptote", optimizer.mmaInitialAsymptote,
-                        0.0, 1.0, "%.3f");
-        scientificInput("Asymptote decrease", optimizer.mmaDecreaseAsymptote,
-                        0.0, 1.0, "%.3f");
-        scientificInput("Asymptote increase", optimizer.mmaIncreaseAsymptote,
-                        1.0, 100.0, "%.3f");
-        scientificInput("Constraint penalty", optimizer.mmaConstraintPenalty,
-                        0.0, 1.0e12, "%.1f");
+        scientificInput("Convergence tolerance",
+                        optimizer.convergenceTolerance,
+                        1.0e-12, 1.0, "%.2e");
+        scientificInput("Acceptable tolerance",
+                        optimizer.acceptableTolerance,
+                        optimizer.convergenceTolerance, 1.0, "%.2e");
         scientificInput("Cut derivative / h", solver.cutDerivativeRelativeStep,
                         1.0e-12, 1.0, "%.2e");
         if (!locked) {
@@ -808,9 +806,9 @@ void Renderer::SimulationInfoPanel(const dispatcher_t& dispatcher)
         ImGui::SameLine(145.0f);
         ImGui::Text("%.6g", dispatcher.get_stop_objective());
     }
-    ImGui::TextDisabled("MMA bound");
+    ImGui::TextDisabled("Worst objective bound");
     ImGui::SameLine(145.0f);
-    ImGui::Text("%.6g", dispatcher.get_mma_bound());
+    ImGui::Text("%.6g", dispatcher.get_epigraph_bound());
     ImGui::End();
 }
 

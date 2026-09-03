@@ -20,7 +20,7 @@ class Exporter {
                            int iteration,
                            double pass,
                            double stop,
-                           double mmaBound);
+                           double epigraphBound);
 
         // This stays as the single public mesh-export action. The implementation
         // can choose the 2D, extruded-2D, or direct-3D path from the level-set

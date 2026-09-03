@@ -144,6 +144,8 @@ int main()
                     "response.json"},
                 "The bundle does not contain exactly the expected files.");
         require(json.find("\"frequency_bands\"") != std::string::npos
+                && json.find("\"epigraph_bound\":2.5") != std::string::npos
+                && json.find("\"convergence_tolerance\"") != std::string::npos
                 && json.find("\"frequency_hz\":1000") != std::string::npos
                 && json.find("\"attenuation_db\":-20") != std::string::npos
                 && json.find("\"reference_outlet\"") != std::string::npos

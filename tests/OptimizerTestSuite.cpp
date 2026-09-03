@@ -6,13 +6,17 @@
 #include <array>
 #include <cmath>
 #include <complex>
+#include <functional>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
 
+#if METAMATERIAL_USE_MPI
 #include <mpi.h>
+#endif
 
 #include "optimizer.hpp"
 
@@ -26,6 +30,12 @@ constexpr double transmission_span = 0.95;
 enum class Group {
     pass,
     stop
+};
+
+enum class FakeFailure {
+    none,
+    response,
+    gradient
 };
 
 struct CaseSpec {
@@ -50,6 +60,8 @@ struct CaseResult {
     int iterations = 0;
     int solve_calls = 0;
     int gradient_calls = 0;
+    int forward_callbacks = 0;
+    int gradient_callbacks = 0;
     bool exportable = false;
     bool logged_error = false;
     std::string error;
@@ -57,8 +69,13 @@ struct CaseResult {
 
 class FakeSolver final : public App::ForwardSolver {
 public:
-    FakeSolver(App::LevelSet& geometry, double spectrum_scale)
-        : geometry(geometry), spectrum_scale(spectrum_scale)
+    FakeSolver(App::LevelSet& geometry, double spectrum_scale,
+               FakeFailure failure = FakeFailure::none,
+               std::function<void()> on_first_gradient = {})
+        : geometry(geometry),
+          spectrum_scale(spectrum_scale),
+          failure(failure),
+          on_first_gradient(std::move(on_first_gradient))
     {
         response.frequency.assign(frequencies.begin(), frequencies.end());
         response.outlet.resize(frequencies.size());
@@ -101,6 +118,10 @@ public:
                 * std::polar(1.0, -0.09 * static_cast<double>(bin + 1));
             response.outlet[bin] = spectrum_scale * transmission * direction;
         }
+        if (failure == FakeFailure::response) {
+            response.outlet.front() = {
+                std::numeric_limits<double>::quiet_NaN(), 0.0};
+        }
         status = App::SolverStatus::Converged;
         return true;
     }
@@ -122,6 +143,9 @@ public:
         mfem::Vector& stop_gradient) override
     {
         ++gradient_calls;
+        if (gradient_calls == 1 && on_first_gradient) {
+            on_first_gradient();
+        }
         if ((!pass_derivative.empty()
                 && pass_derivative.size() != frequencies.size())
             || (!stop_derivative.empty()
@@ -147,6 +171,9 @@ public:
                     std::conj(stop_derivative[bin]) * response_derivative);
             }
         }
+        if (failure == FakeFailure::gradient) {
+            pass_gradient[0] = std::numeric_limits<double>::quiet_NaN();
+        }
         return true;
     }
 
@@ -158,6 +185,8 @@ public:
 private:
     App::LevelSet& geometry;
     double spectrum_scale;
+    FakeFailure failure;
+    std::function<void()> on_first_gradient;
     App::FrequencyResponse response;
     App::SolverStatus status = App::SolverStatus::Idle;
 };
@@ -269,7 +298,8 @@ CaseResult run_case(
     CaseSpec test,
     const std::vector<double>& initial_design,
     double spectrum_scale,
-    int iterations)
+    int iterations,
+    FakeFailure failure = FakeFailure::none)
 {
     test.settings.maxIterations = iterations;
     App::LevelSet geometry;
@@ -290,7 +320,7 @@ CaseResult run_case(
             error = std::move(message);
         }
     };
-    FakeSolver solver(geometry, spectrum_scale);
+    FakeSolver solver(geometry, spectrum_scale, failure);
     App::Optimizer optimizer(test.settings, solver, geometry, log);
     optimizer.run();
 
@@ -304,10 +334,12 @@ CaseResult run_case(
     result.solver_status = optimizer.get_solver_status();
     result.pass = optimizer.get_pass_objective();
     result.stop = optimizer.get_stop_objective();
-    result.bound = optimizer.get_mma_bound();
+    result.bound = optimizer.get_epigraph_bound();
     result.iterations = optimizer.get_iteration();
     result.solve_calls = solver.solve_calls;
     result.gradient_calls = solver.gradient_calls;
+    result.forward_callbacks = optimizer.performance().forwardCallbacks;
+    result.gradient_callbacks = optimizer.performance().gradientCallbacks;
     result.exportable = optimizer.is_exportable();
     result.logged_error = logged_error;
     result.error = std::move(error);
@@ -352,6 +384,8 @@ void print_result(const char* name, const CaseResult& result,
               << ", iterations=" << result.iterations
               << ", solves=" << result.solve_calls
               << ", gradients=" << result.gradient_calls
+              << ", optimizer callbacks=" << result.forward_callbacks
+              << "/" << result.gradient_callbacks
               << ", pass/stop/bound=" << result.pass << "/"
               << result.stop << "/" << result.bound;
     if (!result.error.empty()) {
@@ -398,6 +432,13 @@ std::string unsuccessful_reason(const CaseResult& result)
         reason << "callback counts were solves=" << result.solve_calls
                << ", gradients=" << result.gradient_calls
                << "; expected at least 2/1";
+    }
+    else if (result.forward_callbacks != result.solve_calls - 1
+             || result.gradient_callbacks != result.gradient_calls) {
+        reason << "optimizer forward/gradient callback counts were "
+               << result.forward_callbacks << "/"
+               << result.gradient_callbacks << ", solver observed "
+               << result.solve_calls - 1 << "/" << result.gradient_calls;
     }
     else if (!std::isfinite(result.pass) || !std::isfinite(result.stop)
              || !std::isfinite(result.bound)) {
@@ -596,16 +637,119 @@ bool check_wall_trap_escape()
     return passed;
 }
 
+bool check_nonfinite_callback_failure(FakeFailure failure)
+{
+    const CaseSpec test = low_pass_case();
+    const std::vector<double> initial(frequencies.size(), 0.5);
+    const CaseResult result = run_case(test, initial, 1.0, 6, failure);
+    const bool passed = result.status == App::OptimizerStatus::Error
+        && result.logged_error
+        && !result.exportable;
+    if (!passed) {
+        print_result(failure == FakeFailure::response
+                ? "nonfinite response" : "nonfinite gradient",
+            result,
+            "a non-finite callback must produce an explicit non-exportable Error");
+    }
+    return passed;
+}
+
+bool check_iteration_cancellation()
+{
+    CaseSpec test = low_pass_case();
+    test.settings.maxIterations = 30;
+    App::LevelSet geometry;
+    geometry.design.SetSize(static_cast<int>(frequencies.size()));
+    geometry.design = 0.5;
+    mfem::Array<int> active(geometry.design.Size());
+    for (int i = 0; i < active.Size(); ++i) {
+        active[i] = i;
+    }
+    geometry.setActiveDesignDofs(active);
+
+    const App::LogFunction log = [](App::LogLevel, std::string) {};
+    App::Optimizer* optimizer = nullptr;
+    FakeSolver solver(geometry, 1.0, FakeFailure::none,
+        [&] { optimizer->request_cancel(); });
+    App::Optimizer optimizer_instance(test.settings, solver, geometry, log);
+    optimizer = &optimizer_instance;
+    optimizer->run();
+
+    const bool passed = optimizer->get_status() == App::OptimizerStatus::Cancelled
+        && optimizer->get_iteration() >= 0
+        && solver.gradient_calls >= 1
+        && optimizer->is_exportable();
+    if (!passed) {
+        std::cerr << "[DIAGNOSTIC] in-run cancellation: optimizer="
+                  << status_name(optimizer->get_status())
+                  << ", iterations=" << optimizer->get_iteration()
+                  << ", solves/gradients=" << solver.solve_calls << "/"
+                  << solver.gradient_calls
+                  << "; expected a complete exportable Cancelled design\n";
+    }
+    return passed;
+}
+
+bool check_tnlp_derivatives_and_cache()
+{
+    const CaseSpec test = band_pass_case();
+    App::LevelSet geometry;
+    geometry.design.SetSize(static_cast<int>(frequencies.size()) + 1);
+    geometry.design = 0.5;
+    mfem::Array<int> active(static_cast<int>(frequencies.size()));
+    for (int i = 0; i < active.Size(); ++i) {
+        active[i] = i;
+    }
+    geometry.setActiveDesignDofs(active);
+
+    bool logged_error = false;
+    const App::LogFunction log = [&](App::LogLevel level, std::string) {
+        logged_error |= level == App::LogLevel::Error;
+    };
+    FakeSolver solver(geometry, 1.0);
+    App::Optimizer optimizer(test.settings, solver, geometry, log);
+    const bool checked = optimizer.check_derivatives();
+    const App::OptimizerPerformance& performance = optimizer.performance();
+    const int expected_forward_callbacks = 2 * active.Size() + 1;
+    const bool passed = checked
+        && !logged_error
+        && solver.set_mesh_calls == 1
+        && solver.solve_calls == expected_forward_callbacks + 1
+        && solver.assembly_calls == solver.solve_calls
+        && solver.gradient_calls == 1
+        && performance.forwardCallbacks == expected_forward_callbacks
+        && performance.gradientCallbacks == 1;
+    if (!passed) {
+        std::cerr << "[DIAGNOSTIC] TNLP derivatives/cache: checked="
+                  << checked << ", logged_error=" << logged_error
+                  << ", setMesh/assemble/solve/gradient="
+                  << solver.set_mesh_calls << "/" << solver.assembly_calls
+                  << "/" << solver.solve_calls << "/"
+                  << solver.gradient_calls << ", optimizer callbacks="
+                  << performance.forwardCallbacks << "/"
+                  << performance.gradientCallbacks << "; expected 1/"
+                  << expected_forward_callbacks + 1 << "/"
+                  << expected_forward_callbacks + 1 << "/1 and "
+                  << expected_forward_callbacks << "/1\n";
+    }
+    return passed;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
 {
+#if METAMATERIAL_USE_MPI
     int provided = 0;
     if (MPI_Init_thread(&argc, &argv, MPI_THREAD_SERIALIZED, &provided)
             != MPI_SUCCESS) {
         std::cerr << "Optimizer test suite could not initialize MPI.\n";
         return 1;
     }
+#else
+    (void)argc;
+    (void)argv;
+#endif
 
     int failures = 0;
     const auto check = [&](bool passed, const char* message) {
@@ -614,10 +758,12 @@ int main(int argc, char** argv)
             std::cerr << message << '\n';
         }
     };
+#if METAMATERIAL_USE_MPI
     if (provided < MPI_THREAD_SERIALIZED) {
         check(false, "Optimizer test suite needs MPI_THREAD_SERIALIZED.");
     }
     else {
+#endif
         check(check_filter_case("low-pass", low_pass_case()),
             "The real Optimizer failed the curated low-pass objective.");
         check(check_filter_case("high-pass", high_pass_case()),
@@ -636,9 +782,19 @@ int main(int argc, char** argv)
             "Prepared cancellation did not stop before the forward solve.");
         check(check_wall_trap_escape(),
             "The optimizer stayed in a wall despite an exact opening gradient.");
+        check(check_nonfinite_callback_failure(FakeFailure::response),
+            "A non-finite objective response was not rejected safely.");
+        check(check_nonfinite_callback_failure(FakeFailure::gradient),
+            "A non-finite adjoint gradient was not rejected safely.");
+        check(check_iteration_cancellation(),
+            "Cancellation from an active Ipopt callback was not handled safely.");
+        check(check_tnlp_derivatives_and_cache(),
+            "The production TNLP Jacobian or callback cache is incorrect.");
+#if METAMATERIAL_USE_MPI
     }
 
     MPI_Finalize();
+#endif
     if (failures != 0) {
         return 1;
     }

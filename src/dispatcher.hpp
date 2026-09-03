@@ -92,7 +92,7 @@ public:
                             optimizer.get_iteration(),
                             optimizer.get_pass_objective(),
                             optimizer.get_stop_objective(),
-                            optimizer.get_mma_bound())) {
+                            optimizer.get_epigraph_bound())) {
                         throw std::runtime_error("Run-data export failed.");
                     }
                 });
@@ -155,7 +155,10 @@ public:
     {
         return optimizer.get_stop_objective();
     }
-    double get_mma_bound() const { return optimizer.get_mma_bound(); }
+    double get_epigraph_bound() const
+    {
+        return optimizer.get_epigraph_bound();
+    }
 
 private:
     optimizer_t& optimizer;

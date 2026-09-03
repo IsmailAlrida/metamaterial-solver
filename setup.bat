@@ -83,7 +83,8 @@ if errorlevel 1 (
 exit /b 0
 
 :ensure_msys2
-set "MSYS2_ROOT=C:\msys64"
+if not defined METAMATERIAL_MSYS2_ROOT set "METAMATERIAL_MSYS2_ROOT=C:\msys64"
+set "MSYS2_ROOT=%METAMATERIAL_MSYS2_ROOT%"
 set "MSYS2_BASH=%MSYS2_ROOT%\usr\bin\bash.exe"
 if exist "%MSYS2_BASH%" goto install_msys2_packages
 call :ensure_package MSYS2.MSYS2 "MSYS2"
@@ -95,12 +96,16 @@ if not exist "%MSYS2_BASH%" (
 
 :install_msys2_packages
 echo Ensuring the Ipopt MSYS2 build tools are available...
-"%MSYS2_BASH%" -lc "pacman -S --needed --noconfirm binutils diffutils git grep make patch pkgconf"
-if errorlevel 1 (
-    echo Failed to install the Ipopt MSYS2 build tools.
-    exit /b 1
+for /L %%A in (1,1,3) do (
+    "%MSYS2_BASH%" -lc "pacman -S --needed --noconfirm binutils diffutils git grep make patch pkgconf"
+    if not errorlevel 1 exit /b 0
+    if %%A LSS 3 (
+        echo MSYS2 mirror download failed; retrying %%A of 3...
+        timeout.exe /t 3 /nobreak >nul
+    )
 )
-exit /b 0
+echo Failed to install the Ipopt MSYS2 build tools after 3 attempts.
+exit /b 1
 
 :ensure_visual_studio
 call :find_visual_studio

@@ -1,5 +1,9 @@
 # Paper-Parity Implementation Plan
 
+> Historical implementation log. The active optimizer contract is
+> [ipopt_transition_plan.md](ipopt_transition_plan.md); its Ipopt decisions
+> supersede the ParOpt sections below.
+
 Last updated: 2026-08-29
 
 This is the rolling implementation plan for the 2D paper-parity milestone. Update this document as decisions, blockers, and verification results change.

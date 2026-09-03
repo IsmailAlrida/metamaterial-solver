@@ -66,7 +66,7 @@ struct TestOptimizer {
     }
     double get_pass_objective() const { return 1.0; }
     double get_stop_objective() const { return 2.0; }
-    double get_mma_bound() const { return 2.0; }
+    double get_epigraph_bound() const { return 2.0; }
 
     std::atomic_bool cancel{false};
     std::atomic_bool release{false};

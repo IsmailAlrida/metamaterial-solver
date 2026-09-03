@@ -103,10 +103,8 @@ struct OptimizerSettings {
     float attenuationMaxDb = 0.0f;
     int frequencySamples = 256;
     int maxIterations = 400;
-    double mmaInitialAsymptote = 0.5;
-    double mmaDecreaseAsymptote = 0.7;
-    double mmaIncreaseAsymptote = 1.2;
-    double mmaConstraintPenalty = 1000.0;
+    double convergenceTolerance = 1.0e-7;
+    double acceptableTolerance = 1.0e-5;
     bool displayTargetInDb = true;
     std::vector<FrequencyBand> frequencyBands{
         {FrequencyBandType::pass, 1000.0, 2500.0, 1.0},

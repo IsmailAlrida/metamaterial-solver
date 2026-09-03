@@ -8,12 +8,16 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
-#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
-#include "ParOptOptimizer.h"
+#include "IpIpoptApplication.hpp"
+#include "IpTNLP.hpp"
+#if METAMATERIAL_USE_MPI && !defined(_WIN32)
+#include <mpi.h>
+#endif
 
 namespace App {
 
@@ -22,217 +26,34 @@ namespace {
 struct OptimizationCancelled {
 };
 
-// ParOpt's MMA implementation exposes its subproblem through ParOptProblem's
-// virtual methods. Preserve the base MMA approximation for geometry while the
-// epigraph variable remains exactly linear and free of geometry move limits.
-class EpigraphMMA final : public ::ParOptMMA {
-public:
-    EpigraphMMA(
-        ::ParOptProblem* problem,
-        ::ParOptOptions* options,
-        int epigraph_index)
-        : ::ParOptMMA(problem, options),
-          epigraph_index(epigraph_index)
-    {
-        int variables = 0;
-        int constraints = 0;
-        int sparse_constraints = 0;
-        problem->getProblemSizes(
-            &variables, &constraints, &sparse_constraints);
-        if (epigraph_index < 0 || epigraph_index >= variables) {
-            throw std::out_of_range("The MMA epigraph index is invalid.");
-        }
-        centered_constraints.resize(constraints);
-        centered = createDesignVec();
-        centered->incref();
-    }
-
-    ~EpigraphMMA() override
-    {
-        centered->decref();
-    }
-
-    void getVarsAndBounds(
-        ::ParOptVec* variables,
-        ::ParOptVec* lower_bounds,
-        ::ParOptVec* upper_bounds) override
-    {
-        ::ParOptMMA::getVarsAndBounds(
-            variables, lower_bounds, upper_bounds);
-        ::ParOptScalar* lower;
-        ::ParOptScalar* upper;
-        lower_bounds->getArray(&lower);
-        upper_bounds->getArray(&upper);
-        lower[epigraph_index] = -1.0e20;
-        upper[epigraph_index] = 1.0e20;
-    }
-
-    int evalObjCon(
-        ::ParOptVec* variables,
-        ::ParOptScalar* objective,
-        ::ParOptScalar* constraints) override
-    {
-        ::ParOptVec* center = nullptr;
-        getOptimizedPoint(&center);
-        ::ParOptScalar* candidate_values;
-        ::ParOptScalar* center_values;
-        variables->getArray(&candidate_values);
-        center->getArray(&center_values);
-        const ::ParOptScalar epigraph_step =
-            candidate_values[epigraph_index]
-            - center_values[epigraph_index];
-
-        freezeEpigraph(variables, center_values[epigraph_index]);
-        ::ParOptScalar centered_objective = 0.0;
-        const int failed = ::ParOptMMA::evalObjCon(
-            centered, &centered_objective,
-            centered_constraints.data());
-        *objective = centered_objective + epigraph_step;
-        for (std::size_t constraint = 0;
-             constraint < centered_constraints.size(); ++constraint) {
-            constraints[constraint] =
-                centered_constraints[constraint] + epigraph_step;
-        }
-        return failed;
-    }
-
-    int evalObjConGradient(
-        ::ParOptVec* variables,
-        ::ParOptVec* objective_gradient,
-        ::ParOptVec** constraint_gradients) override
-    {
-        const int failed = ::ParOptMMA::evalObjConGradient(
-            frozenAtCenter(variables),
-            objective_gradient,
-            constraint_gradients);
-        ::ParOptScalar* gradient;
-        objective_gradient->getArray(&gradient);
-        gradient[epigraph_index] = 1.0;
-        for (std::size_t constraint = 0;
-             constraint < centered_constraints.size(); ++constraint) {
-            constraint_gradients[constraint]->getArray(&gradient);
-            gradient[epigraph_index] = 1.0;
-        }
-        return failed;
-    }
-
-    int evalHvecProduct(
-        ::ParOptVec* variables,
-        ::ParOptScalar* multipliers,
-        ::ParOptVec* sparse_multipliers,
-        ::ParOptVec* direction,
-        ::ParOptVec* product) override
-    {
-        const int failed = ::ParOptMMA::evalHvecProduct(
-            frozenAtCenter(variables), multipliers,
-            sparse_multipliers, direction, product);
-        ::ParOptScalar* values;
-        product->getArray(&values);
-        values[epigraph_index] = 0.0;
-        return failed;
-    }
-
-    int evalHessianDiag(
-        ::ParOptVec* variables,
-        ::ParOptScalar* multipliers,
-        ::ParOptVec* sparse_multipliers,
-        ::ParOptVec* diagonal) override
-    {
-        const int failed = ::ParOptMMA::evalHessianDiag(
-            frozenAtCenter(variables), multipliers,
-            sparse_multipliers, diagonal);
-        ::ParOptScalar* values;
-        diagonal->getArray(&values);
-        values[epigraph_index] = 0.0;
-        return failed;
-    }
-
-private:
-    void freezeEpigraph(
-        ::ParOptVec* variables,
-        ::ParOptScalar center_value)
-    {
-        centered->copyValues(variables);
-        ::ParOptScalar* values;
-        centered->getArray(&values);
-        values[epigraph_index] = center_value;
-    }
-
-    ::ParOptVec* frozenAtCenter(::ParOptVec* variables)
-    {
-        ::ParOptVec* center = nullptr;
-        getOptimizedPoint(&center);
-        ::ParOptScalar* center_values;
-        center->getArray(&center_values);
-        freezeEpigraph(variables, center_values[epigraph_index]);
-        return centered;
-    }
-
-    int epigraph_index;
-    ::ParOptVec* centered = nullptr;
-    std::vector<::ParOptScalar> centered_constraints;
-};
-
-struct MMAResult {
-    bool converged = false;
-    int iterations = 0;
-    double l1 = std::numeric_limits<double>::infinity();
-    double linfinity = std::numeric_limits<double>::infinity();
-    double infeasibility = std::numeric_limits<double>::infinity();
-};
-
-MMAResult runMMA(
-    ::ParOptMMA& mma,
-    ::ParOptInteriorPoint& interior_point,
-    ::ParOptOptions& options)
+const char* ipopt_status_name(Ipopt::ApplicationReturnStatus status)
 {
-    MMAResult result;
-    const int maximum_iterations =
-        options.getIntOption("mma_max_iterations");
-    const double l1_tolerance =
-        options.getFloatOption("mma_l1_tol");
-    const double linfinity_tolerance =
-        options.getFloatOption("mma_linfty_tol");
-    const double infeasibility_tolerance =
-        options.getFloatOption("mma_infeas_tol");
-
-    if (mma.initializeSubProblem(nullptr) != 0) {
-        throw std::runtime_error(
-            "ParOpt could not initialize the first MMA subproblem.");
+    switch (status) {
+        case Ipopt::Solve_Succeeded: return "solve succeeded";
+        case Ipopt::Solved_To_Acceptable_Level: return "acceptable solution";
+        case Ipopt::Infeasible_Problem_Detected: return "infeasible problem";
+        case Ipopt::Search_Direction_Becomes_Too_Small:
+            return "search direction became too small";
+        case Ipopt::Diverging_Iterates: return "diverging iterates";
+        case Ipopt::User_Requested_Stop: return "user requested stop";
+        case Ipopt::Feasible_Point_Found: return "feasible point found";
+        case Ipopt::Maximum_Iterations_Exceeded: return "maximum iterations";
+        case Ipopt::Restoration_Failed: return "restoration failed";
+        case Ipopt::Error_In_Step_Computation: return "step computation failed";
+        case Ipopt::Maximum_CpuTime_Exceeded: return "maximum CPU time";
+        case Ipopt::Maximum_WallTime_Exceeded: return "maximum wall time";
+        case Ipopt::Not_Enough_Degrees_Of_Freedom:
+            return "not enough degrees of freedom";
+        case Ipopt::Invalid_Problem_Definition:
+            return "invalid problem definition";
+        case Ipopt::Invalid_Option: return "invalid option";
+        case Ipopt::Invalid_Number_Detected: return "invalid number detected";
+        case Ipopt::Unrecoverable_Exception: return "unrecoverable exception";
+        case Ipopt::NonIpopt_Exception_Thrown: return "non-Ipopt exception";
+        case Ipopt::Insufficient_Memory: return "insufficient memory";
+        case Ipopt::Internal_Error: return "internal error";
     }
-    interior_point.resetDesignAndBounds();
-    for (int iteration = 0;
-         iteration < maximum_iterations; ++iteration) {
-        if (interior_point.optimize() != 0) {
-            throw std::runtime_error(
-                "ParOpt's interior-point MMA subproblem failed.");
-        }
-
-        ::ParOptVec* variables = nullptr;
-        ::ParOptVec* sparse_lower = nullptr;
-        ::ParOptVec* lower = nullptr;
-        ::ParOptVec* upper = nullptr;
-        ::ParOptScalar* dense = nullptr;
-        interior_point.getOptimizedPoint(
-            &variables, &dense, &sparse_lower, &lower, &upper);
-        mma.setMultipliers(dense, sparse_lower, lower, upper);
-        if (mma.initializeSubProblem(variables) != 0) {
-            throw std::runtime_error(
-                "ParOpt could not update the MMA subproblem.");
-        }
-        interior_point.resetDesignAndBounds();
-
-        result.iterations = iteration + 1;
-        mma.computeKKTError(
-            &result.l1, &result.linfinity, &result.infeasibility);
-        if (result.infeasibility < infeasibility_tolerance
-            && (result.l1 < l1_tolerance
-                || result.linfinity < linfinity_tolerance)) {
-            result.converged = true;
-            break;
-        }
-    }
-    return result;
+    return "unknown status";
 }
 
 } // namespace
@@ -248,267 +69,675 @@ Optimizer::Optimizer(const OptimizerSettings& settings,
 {
 }
 
-class Optimizer::Problem final : public ::ParOptProblem {
+// Ipopt requires a TNLP callback object. Keep it private to App::Optimizer so
+// the application still has one optimizer type and one ownership path.
+class Optimizer::Problem final : public Ipopt::TNLP {
 public:
     Problem(Optimizer& optimizer, ObjectiveEvaluation initial_objective)
-        : ::ParOptProblem(MPI_COMM_SELF),
-          optimizer(optimizer),
-          objective(std::move(initial_objective))
+        : optimizer(optimizer),
+          evaluated_objective(std::move(initial_objective))
     {
         active_design_size = optimizer.geometry.activeDesignDofs.Size();
-        constraint_size = (objective.has_pass ? 1 : 0)
-            + (objective.has_stop ? 1 : 0);
+        constraint_size = (evaluated_objective.has_pass ? 1 : 0)
+            + (evaluated_objective.has_stop ? 1 : 0);
         if (active_design_size == 0 || constraint_size == 0) {
             throw std::runtime_error(
-                "ParOpt requires active design variables and at least one objective group.");
+                "Ipopt requires active design variables and at least one objective group.");
         }
 
-        setProblemSizes(active_design_size + 1, constraint_size, 0);
-        setNumInequalities(constraint_size, 0);
+        std::vector<unsigned char> active_dofs_seen(
+            optimizer.geometry.design.Size(), 0);
+        for (int design = 0; design < active_design_size; ++design) {
+            const int dof = optimizer.geometry.activeDesignDofs[design];
+            if (dof < 0 || dof >= optimizer.geometry.design.Size()
+                || active_dofs_seen[dof] != 0) {
+                throw std::runtime_error(
+                    "The active design DOFs must be unique valid LevelSet entries.");
+            }
+            const double value = optimizer.geometry.design[dof];
+            if (!std::isfinite(value) || value < 0.0 || value > 1.0) {
+                throw std::runtime_error(
+                    "Every active design value must be finite and lie in [0,1].");
+            }
+            active_dofs_seen[dof] = 1;
+        }
 
         const double initial_worst = std::max(
-            objective.has_pass ? objective.pass : 0.0,
-            objective.has_stop ? objective.stop : 0.0);
-        objective_scale = std::max(
-            initial_worst, std::numeric_limits<double>::epsilon());
-        initial_bound = initial_worst / objective_scale;
+            evaluated_objective.has_pass ? evaluated_objective.pass : 0.0,
+            evaluated_objective.has_stop ? evaluated_objective.stop : 0.0);
+        objective_scale = std::max(1.0, initial_worst);
+        const double scaled_worst = initial_worst / objective_scale;
+        initial_bound = scaled_worst
+            + std::max(1.0e-8, 1.0e-4 * (1.0 + scaled_worst));
+
         evaluated_design.resize(active_design_size);
+        current_iterate.resize(active_design_size + 1);
+        final_design.resize(active_design_size + 1);
         for (int design = 0; design < active_design_size; ++design) {
             evaluated_design[design] = optimizer.geometry.design[
                 optimizer.geometry.activeDesignDofs[design]];
         }
+        accepted_design = evaluated_design;
+        accepted_objective = evaluated_objective;
+        accepted_bound = initial_worst;
     }
 
-    ParOptQuasiDefMat* createQuasiDefMat() override
+    bool get_nlp_info(
+        Ipopt::Index& n,
+        Ipopt::Index& m,
+        Ipopt::Index& nnz_jac_g,
+        Ipopt::Index& nnz_h_lag,
+        IndexStyleEnum& index_style) override
     {
-        return new ParOptQuasiDefBlockMat(this, 0);
+        n = active_design_size + 1;
+        m = constraint_size;
+        nnz_jac_g = n * m;
+        nnz_h_lag = 0;
+        index_style = C_STYLE;
+        return true;
     }
 
-    void getVarsAndBounds(
-        ParOptVec* variables,
-        ParOptVec* lower_bounds,
-        ParOptVec* upper_bounds) override
+    bool get_bounds_info(
+        Ipopt::Index n,
+        Ipopt::Number* x_l,
+        Ipopt::Number* x_u,
+        Ipopt::Index m,
+        Ipopt::Number* g_l,
+        Ipopt::Number* g_u) override
     {
-        ParOptScalar* x;
-        ParOptScalar* lower;
-        ParOptScalar* upper;
-        variables->getArray(&x);
-        lower_bounds->getArray(&lower);
-        upper_bounds->getArray(&upper);
+        if (n != active_design_size + 1 || m != constraint_size) {
+            return fail("Ipopt requested inconsistent problem bounds.");
+        }
         for (int design = 0; design < active_design_size; ++design) {
-            x[design] = evaluated_design[design];
-            lower[design] = 0.0;
-            upper[design] = 1.0;
+            x_l[design] = 0.0;
+            x_u[design] = 1.0;
         }
-
-        // The constraints bound z from below. Keep its box effectively open,
-        // matching the paper instead of imposing an extra optimization rule.
-        x[active_design_size] = initial_bound;
-        lower[active_design_size] = -1.0e20;
-        upper[active_design_size] = 1.0e20;
-    }
-
-    int evalObjCon(
-        ParOptVec* variables,
-        ParOptScalar* objective_value,
-        ParOptScalar* constraints) override
-    {
-        evaluate(variables);
-        int completed_iteration = 0;
-        if (initial_mma_evaluation) {
-            initial_mma_evaluation = false;
-        }
-        else {
-            completed_iteration = optimizer.iteration.fetch_add(1) + 1;
-        }
-
-        ParOptScalar* x;
-        variables->getArray(&x);
-        const double bound = ParOptRealPart(x[active_design_size]);
-        *objective_value = bound;
-        optimizer.mma_bound.store(bound * objective_scale);
-        if (completed_iteration != 0) {
-            optimizer.log(LogLevel::Message,
-                "Completed MMA iteration "
-                    + std::to_string(completed_iteration)
-                    + ": pass/stop = " + std::to_string(objective.pass)
-                    + " / " + std::to_string(objective.stop)
-                    + ", raw/normalized bound = "
-                    + std::to_string(bound * objective_scale)
-                    + " / " + std::to_string(bound) + ".");
-        }
-
-        int constraint = 0;
-        if (objective.has_pass) {
-            constraints[constraint++] =
-                bound - objective.pass / objective_scale;
-        }
-        if (objective.has_stop) {
-            constraints[constraint++] =
-                bound - objective.stop / objective_scale;
-        }
-        optimizer.check_cancelled();
-        return 0;
-    }
-
-    int evalObjConGradient(
-        ParOptVec* variables,
-        ParOptVec* objective_gradient,
-        ParOptVec** constraint_gradients) override
-    {
-        if (!matches(variables)) {
-            throw std::runtime_error(
-                "ParOpt requested a gradient before evaluating this design.");
-        }
-        differentiate();
-
-        objective_gradient->zeroEntries();
-        ParOptScalar* gradient;
-        objective_gradient->getArray(&gradient);
-        gradient[active_design_size] = 1.0;
-
-        int constraint = 0;
-        if (objective.has_pass) {
-            fillConstraintGradient(
-                pass_gradient, constraint_gradients[constraint++]);
-        }
-        if (objective.has_stop) {
-            fillConstraintGradient(
-                stop_gradient, constraint_gradients[constraint++]);
-        }
-        optimizer.check_cancelled();
-        return 0;
-    }
-
-    bool matches(ParOptVec* variables) const
-    {
-        ParOptScalar* x;
-        variables->getArray(&x);
-        for (int design = 0; design < active_design_size; ++design) {
-            if (ParOptRealPart(x[design]) != evaluated_design[design]) {
-                return false;
-            }
+        x_l[active_design_size] = 0.0;
+        x_u[active_design_size] = 2.0e19;
+        for (int constraint = 0; constraint < constraint_size; ++constraint) {
+            g_l[constraint] = 0.0;
+            g_u[constraint] = 2.0e19;
         }
         return true;
     }
 
-private:
-    void evaluate(ParOptVec* variables)
+    bool get_starting_point(
+        Ipopt::Index n,
+        bool init_x,
+        Ipopt::Number* x,
+        bool init_z,
+        Ipopt::Number*,
+        Ipopt::Number*,
+        Ipopt::Index m,
+        bool init_lambda,
+        Ipopt::Number*) override
     {
-        optimizer.check_cancelled();
-        if (matches(variables)) {
-            return;
+        if (n != active_design_size + 1 || m != constraint_size
+            || !init_x || init_z || init_lambda) {
+            return fail("Ipopt requested an unsupported starting point.");
         }
+        std::copy(evaluated_design.begin(), evaluated_design.end(), x);
+        x[active_design_size] = initial_bound;
+        return true;
+    }
+
+    bool eval_f(
+        Ipopt::Index,
+        const Ipopt::Number* x,
+        bool,
+        Ipopt::Number& objective_value) override
+    {
+        objective_value = x[active_design_size];
+        return std::isfinite(objective_value)
+            || fail("Ipopt proposed a non-finite epigraph value.");
+    }
+
+    bool eval_grad_f(
+        Ipopt::Index n,
+        const Ipopt::Number*,
+        bool,
+        Ipopt::Number* gradient) override
+    {
+        std::fill_n(gradient, n, 0.0);
+        gradient[active_design_size] = 1.0;
+        return true;
+    }
+
+    bool eval_g(
+        Ipopt::Index,
+        const Ipopt::Number* x,
+        bool,
+        Ipopt::Index,
+        Ipopt::Number* constraints) override
+    {
+        if (!ensure_values(x)) {
+            return false;
+        }
+
+        int constraint = 0;
+        const double bound = x[active_design_size];
+        if (evaluated_objective.has_pass) {
+            constraints[constraint++] = bound
+                - evaluated_objective.pass / objective_scale;
+        }
+        if (evaluated_objective.has_stop) {
+            constraints[constraint++] = bound
+                - evaluated_objective.stop / objective_scale;
+        }
+        return true;
+    }
+
+    bool eval_jac_g(
+        Ipopt::Index n,
+        const Ipopt::Number* x,
+        bool,
+        Ipopt::Index m,
+        Ipopt::Index,
+        Ipopt::Index* rows,
+        Ipopt::Index* columns,
+        Ipopt::Number* values) override
+    {
+        if (values == nullptr) {
+            int entry = 0;
+            for (int constraint = 0; constraint < m; ++constraint) {
+                for (int variable = 0; variable < n; ++variable) {
+                    rows[entry] = constraint;
+                    columns[entry] = variable;
+                    ++entry;
+                }
+            }
+            return true;
+        }
+
+        if (!ensure_values(x) || !ensure_gradients()) {
+            return false;
+        }
+        int entry = 0;
+        if (evaluated_objective.has_pass) {
+            fill_constraint_gradient(pass_gradient, values, entry);
+        }
+        if (evaluated_objective.has_stop) {
+            fill_constraint_gradient(stop_gradient, values, entry);
+        }
+        return true;
+    }
+
+    bool eval_h(
+        Ipopt::Index,
+        const Ipopt::Number*,
+        bool,
+        Ipopt::Number,
+        Ipopt::Index,
+        const Ipopt::Number*,
+        bool,
+        Ipopt::Index nonzeros,
+        Ipopt::Index*,
+        Ipopt::Index*,
+        Ipopt::Number*) override
+    {
+        return nonzeros == 0;
+    }
+
+    Ipopt::Index get_number_of_nonlinear_variables() override
+    {
+        return active_design_size;
+    }
+
+    bool get_list_of_nonlinear_variables(
+        Ipopt::Index nonlinear_variables,
+        Ipopt::Index* positions) override
+    {
+        if (nonlinear_variables != active_design_size) {
+            return fail("Ipopt requested an inconsistent nonlinear variable list.");
+        }
+        for (int design = 0; design < active_design_size; ++design) {
+            positions[design] = design;
+        }
+        return true;
+    }
+
+    bool intermediate_callback(
+        Ipopt::AlgorithmMode,
+        Ipopt::Index current_iteration,
+        Ipopt::Number,
+        Ipopt::Number,
+        Ipopt::Number,
+        Ipopt::Number,
+        Ipopt::Number,
+        Ipopt::Number,
+        Ipopt::Number,
+        Ipopt::Number,
+        Ipopt::Index,
+        const Ipopt::IpoptData* data,
+        Ipopt::IpoptCalculatedQuantities* quantities) override
+    {
         if (optimizer.cancel_requested.load()) {
-            throw OptimizationCancelled{};
+            cancellation_observed = true;
+            return false;
         }
+
+        if (!get_curr_iterate(
+                data, quantities, false,
+                static_cast<Ipopt::Index>(current_iterate.size()),
+                current_iterate.data(),
+                nullptr, nullptr, 0, nullptr, nullptr)) {
+            return fail("Ipopt could not expose its accepted iterate.");
+        }
+        return accept(
+            current_iterate.data(), static_cast<int>(current_iteration));
+    }
+
+    void finalize_solution(
+        Ipopt::SolverReturn,
+        Ipopt::Index n,
+        const Ipopt::Number* x,
+        const Ipopt::Number*,
+        const Ipopt::Number*,
+        Ipopt::Index,
+        const Ipopt::Number*,
+        const Ipopt::Number*,
+        Ipopt::Number,
+        const Ipopt::IpoptData*,
+        Ipopt::IpoptCalculatedQuantities*) override
+    {
+        if (x != nullptr && n == active_design_size + 1) {
+            std::copy_n(x, n, final_design.begin());
+            final_design_ready = true;
+        }
+    }
+
+    bool accept_final()
+    {
+        if (!final_design_ready) {
+            return false;
+        }
+        const bool final_design_changed = !matches(final_design.data());
+        if (!accept(final_design.data(), optimizer.iteration.load())) {
+            return false;
+        }
+        if (final_design_changed) {
+            optimizer.log(LogLevel::Message,
+                "Completed optimizer iteration "
+                    + std::to_string(optimizer.iteration.load())
+                    + ": pass/stop/bound = "
+                    + std::to_string(accepted_objective.pass) + " / "
+                    + std::to_string(accepted_objective.stop) + " / "
+                    + std::to_string(accepted_bound) + ".");
+        }
+        return true;
+    }
+
+    bool check_derivatives(double relative_step, double tolerance)
+    {
+        if (!std::isfinite(relative_step) || relative_step <= 0.0
+            || !std::isfinite(tolerance) || tolerance <= 0.0) {
+            return fail("The derivative-check step and tolerance must be positive.");
+        }
+
+        const int variables = active_design_size + 1;
+        std::vector<Ipopt::Number> point(variables);
+        if (!get_starting_point(
+                variables, true, point.data(), false, nullptr, nullptr,
+                constraint_size, false, nullptr)) {
+            return false;
+        }
+        const std::vector<Ipopt::Number> original = point;
+        std::vector<Ipopt::Number> constraints(constraint_size);
+        std::vector<Ipopt::Number> upper_constraints(constraint_size);
+        std::vector<Ipopt::Number> lower_constraints(constraint_size);
+        std::vector<Ipopt::Number> jacobian(
+            static_cast<std::size_t>(variables) * constraint_size);
+
+        if (!eval_g(variables, point.data(), true, constraint_size,
+                    constraints.data())
+            || !eval_jac_g(
+                variables, point.data(), false, constraint_size,
+                static_cast<Ipopt::Index>(jacobian.size()),
+                nullptr, nullptr, jacobian.data())) {
+            return false;
+        }
+
+        const int cached_forwards = optimizer.performance_data.forwardCallbacks;
+        const int cached_gradients = optimizer.performance_data.gradientCallbacks;
+        if (!eval_g(variables, point.data(), false, constraint_size,
+                    constraints.data())
+            || !eval_jac_g(
+                variables, point.data(), false, constraint_size,
+                static_cast<Ipopt::Index>(jacobian.size()),
+                nullptr, nullptr, jacobian.data())
+            || optimizer.performance_data.forwardCallbacks != cached_forwards
+            || optimizer.performance_data.gradientCallbacks != cached_gradients) {
+            return fail(
+                "Repeated TNLP callbacks recomputed unchanged physics.");
+        }
+
+        const double original_bound = point[active_design_size];
+        const double bound_step = relative_step
+            * std::max(1.0, std::abs(original_bound));
+        point[active_design_size] = original_bound + bound_step;
+        if (!eval_g(variables, point.data(), true, constraint_size,
+                    upper_constraints.data())) {
+            return false;
+        }
+        point[active_design_size] = std::max(0.0, original_bound - bound_step);
+        if (!eval_g(variables, point.data(), true, constraint_size,
+                    lower_constraints.data())) {
+            return false;
+        }
+        const double bound_denominator = original_bound + bound_step
+            - point[active_design_size];
+        for (int constraint = 0; constraint < constraint_size; ++constraint) {
+            const double finite_difference =
+                (upper_constraints[constraint] - lower_constraints[constraint])
+                / bound_denominator;
+            const double analytic = jacobian[
+                constraint * variables + active_design_size];
+            if (std::abs(finite_difference - analytic)
+                > tolerance * std::max({1.0, std::abs(finite_difference),
+                                        std::abs(analytic)})) {
+                return fail(
+                    "The epigraph-column derivative check failed for constraint "
+                    + std::to_string(constraint) + ": analytic="
+                    + std::to_string(analytic) + ", finite difference="
+                    + std::to_string(finite_difference) + ".");
+            }
+        }
+        if (optimizer.performance_data.forwardCallbacks != cached_forwards
+            || optimizer.performance_data.gradientCallbacks != cached_gradients) {
+            return fail("Changing only the epigraph variable recomputed physics.");
+        }
+        point[active_design_size] = original_bound;
+
+        bool derivatives_match = true;
+        for (int design = 0; design < active_design_size && derivatives_match;
+             ++design) {
+            const double value = original[design];
+            const double step = relative_step * std::max(1.0, std::abs(value));
+            const double upper = std::min(1.0, value + step);
+            const double lower = std::max(0.0, value - step);
+            if (upper == lower) {
+                derivatives_match = false;
+                fail("A design variable has no finite-difference interval.");
+                break;
+            }
+
+            point[design] = upper;
+            if (!eval_g(variables, point.data(), true, constraint_size,
+                        upper_constraints.data())) {
+                derivatives_match = false;
+                break;
+            }
+            point[design] = lower;
+            if (!eval_g(variables, point.data(), true, constraint_size,
+                        lower_constraints.data())) {
+                derivatives_match = false;
+                break;
+            }
+            point[design] = value;
+
+            for (int constraint = 0;
+                 constraint < constraint_size; ++constraint) {
+                const double finite_difference =
+                    (upper_constraints[constraint]
+                     - lower_constraints[constraint]) / (upper - lower);
+                const double analytic = jacobian[
+                    constraint * variables + design];
+                if (std::abs(finite_difference - analytic)
+                    > tolerance * std::max({1.0, std::abs(finite_difference),
+                                            std::abs(analytic)})) {
+                    derivatives_match = false;
+                    fail(
+                        "The design-column derivative check failed for variable "
+                        + std::to_string(design) + ", constraint "
+                        + std::to_string(constraint) + ": analytic="
+                        + std::to_string(analytic) + ", finite difference="
+                        + std::to_string(finite_difference) + ".");
+                    break;
+                }
+            }
+        }
+
+        if (!ensure_values(original.data())) {
+            return false;
+        }
+        return derivatives_match;
+    }
+
+    bool restore_accepted()
+    {
+        if (accepted_design.empty()) {
+            return false;
+        }
+        if (evaluated_design != accepted_design) {
+            apply_design(accepted_design.data());
+            try {
+                if (!optimizer.solver.assembleSolutionSpace()
+                    || !optimizer.solver.solve()) {
+                    return fail("Could not restore the last accepted design.");
+                }
+            }
+            catch (const std::exception& error) {
+                return fail(std::string("Could not restore the last accepted design: ")
+                    + error.what());
+            }
+            catch (...) {
+                return fail("Could not restore the last accepted design.");
+            }
+            evaluated_design = accepted_design;
+            evaluated_objective = accepted_objective;
+            gradients_ready = false;
+        }
+        publish(accepted_bound, optimizer.iteration.load(), false);
+        return true;
+    }
+
+    bool cancelled() const { return cancellation_observed; }
+    const std::string& error() const { return callback_error; }
+
+private:
+    bool ensure_values(const Ipopt::Number* variables)
+    {
+        if (matches(variables)) {
+            return true;
+        }
+        for (int design = 0; design < active_design_size; ++design) {
+            if (!std::isfinite(variables[design])) {
+                return fail("Ipopt proposed a non-finite design variable.");
+            }
+        }
+
         const auto started_at = std::chrono::steady_clock::now();
-
-        ParOptScalar* x;
-        variables->getArray(&x);
-        const mfem::Vector previous_design(optimizer.geometry.design);
-        const auto restore_previous_design = [&]() {
-            optimizer.geometry.design = previous_design;
-            optimizer.geometry.enforceDesignConstraints();
-            if (!optimizer.solver.assembleSolutionSpace()
-                || !optimizer.solver.solve()) {
-                optimizer.log(LogLevel::Error,
-                    "Could not restore the last completed design after a failed candidate.");
-            }
-        };
-        for (int design = 0; design < active_design_size; ++design) {
-            const double value = ParOptRealPart(x[design]);
-            if (!std::isfinite(value)) {
-                throw std::runtime_error(
-                    "ParOpt proposed a non-finite design variable.");
-            }
-        }
-        for (int design = 0; design < active_design_size; ++design) {
-            const double value = ParOptRealPart(x[design]);
-            optimizer.geometry.design[
-                optimizer.geometry.activeDesignDofs[design]] =
-                    std::clamp(value, 0.0, 1.0);
-        }
-        optimizer.geometry.enforceDesignConstraints();
-
         ObjectiveEvaluation next_objective;
         try {
+            apply_design(variables);
+            ++optimizer.performance_data.forwardCallbacks;
             if (!optimizer.solver.assembleSolutionSpace()
                 || !optimizer.solver.solve()) {
                 throw std::runtime_error(
-                    "The forward analysis failed inside ParOpt.");
+                    "The forward analysis failed inside Ipopt.");
             }
             if (!optimizer.evaluateObjectives(next_objective)) {
                 throw std::runtime_error(
                     "The FFT objective could not be evaluated.");
             }
         }
+        catch (const std::exception& error) {
+            callback_error = error.what();
+            return restore_after_callback_failure();
+        }
         catch (...) {
-            restore_previous_design();
-            throw;
+            callback_error = "The Ipopt forward callback failed with an unknown error.";
+            return restore_after_callback_failure();
         }
 
-        objective = std::move(next_objective);
+        evaluated_objective = std::move(next_objective);
         for (int design = 0; design < active_design_size; ++design) {
             evaluated_design[design] = optimizer.geometry.design[
                 optimizer.geometry.activeDesignDofs[design]];
         }
         gradients_ready = false;
-        optimizer.pass_objective.store(objective.pass);
-        optimizer.stop_objective.store(objective.stop);
         optimizer.performance_data.forwardCallbackSeconds +=
             std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - started_at).count();
+        return true;
     }
 
-    void differentiate()
+    bool ensure_gradients()
     {
         if (gradients_ready) {
-            return;
+            return true;
         }
         const auto started_at = std::chrono::steady_clock::now();
         static const std::vector<std::complex<double>> no_derivative;
-        if (!optimizer.solver.differentiateFrequencyResponses(
-                objective.has_pass
-                    ? objective.pass_spectrum_derivative : no_derivative,
-                objective.has_stop
-                    ? objective.stop_spectrum_derivative : no_derivative,
-                pass_gradient,
-                stop_gradient)) {
-            throw std::runtime_error(
-                "The pass/stop discrete adjoint failed.");
+        try {
+            ++optimizer.performance_data.gradientCallbacks;
+            if (!optimizer.solver.differentiateFrequencyResponses(
+                    evaluated_objective.has_pass
+                        ? evaluated_objective.pass_spectrum_derivative : no_derivative,
+                    evaluated_objective.has_stop
+                        ? evaluated_objective.stop_spectrum_derivative : no_derivative,
+                    pass_gradient,
+                    stop_gradient)) {
+                return fail("The pass/stop discrete adjoint failed.");
+            }
+        }
+        catch (const std::exception& error) {
+            return fail(std::string("The pass/stop discrete adjoint failed: ")
+                + error.what());
+        }
+        catch (...) {
+            return fail("The pass/stop discrete adjoint failed.");
+        }
+
+        for (int design = 0; design < active_design_size; ++design) {
+            const int dof = optimizer.geometry.activeDesignDofs[design];
+            if ((evaluated_objective.has_pass
+                    && (dof >= pass_gradient.Size()
+                        || !std::isfinite(pass_gradient[dof])))
+                || (evaluated_objective.has_stop
+                    && (dof >= stop_gradient.Size()
+                        || !std::isfinite(stop_gradient[dof])))) {
+                return fail(
+                    "The discrete adjoint produced a non-finite design gradient.");
+            }
         }
         optimizer.performance_data.gradientCallbackSeconds +=
             std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - started_at).count();
         gradients_ready = true;
+        return true;
     }
 
-    void fillConstraintGradient(
-        const mfem::Vector& design_gradient,
-        ParOptVec* constraint_gradient) const
+    bool restore_after_callback_failure()
     {
-        constraint_gradient->zeroEntries();
-        ParOptScalar* gradient;
-        constraint_gradient->getArray(&gradient);
+        try {
+            apply_design(accepted_design.data());
+            if (!optimizer.solver.assembleSolutionSpace()
+                || !optimizer.solver.solve()) {
+                callback_error +=
+                    " The last completed design could not be restored.";
+                return false;
+            }
+        }
+        catch (...) {
+            callback_error += " The last completed design could not be restored.";
+            return false;
+        }
+        evaluated_design = accepted_design;
+        evaluated_objective = accepted_objective;
+        gradients_ready = false;
+        return false;
+    }
+
+    bool accept(const Ipopt::Number* variables, int current_iteration)
+    {
+        if (!ensure_values(variables)) {
+            return false;
+        }
+        accepted_design = evaluated_design;
+        accepted_objective = evaluated_objective;
+        accepted_bound = variables[active_design_size] * objective_scale;
+        publish(accepted_bound, current_iteration, true);
+        return true;
+    }
+
+    void publish(double bound, int current_iteration, bool write_log)
+    {
+        optimizer.iteration.store(current_iteration);
+        optimizer.pass_objective.store(accepted_objective.pass);
+        optimizer.stop_objective.store(accepted_objective.stop);
+        optimizer.epigraph_bound.store(bound);
+        if (write_log && current_iteration > published_iteration) {
+            published_iteration = current_iteration;
+            optimizer.log(LogLevel::Message,
+                "Completed optimizer iteration "
+                    + std::to_string(current_iteration)
+                    + ": pass/stop/bound = "
+                    + std::to_string(accepted_objective.pass) + " / "
+                    + std::to_string(accepted_objective.stop) + " / "
+                    + std::to_string(bound) + ".");
+        }
+    }
+
+    void fill_constraint_gradient(
+        const mfem::Vector& design_gradient,
+        Ipopt::Number* values,
+        int& entry) const
+    {
         for (int design = 0; design < active_design_size; ++design) {
-            gradient[design] = -design_gradient[
+            values[entry++] = -design_gradient[
                 optimizer.geometry.activeDesignDofs[design]] / objective_scale;
         }
-        gradient[active_design_size] = 1.0;
+        values[entry++] = 1.0;
+    }
+
+    bool matches(const Ipopt::Number* variables) const
+    {
+        for (int design = 0; design < active_design_size; ++design) {
+            if (variables[design] != evaluated_design[design]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void apply_design(const Ipopt::Number* variables)
+    {
+        for (int design = 0; design < active_design_size; ++design) {
+            optimizer.geometry.design[
+                optimizer.geometry.activeDesignDofs[design]] =
+                    std::clamp(static_cast<double>(variables[design]), 0.0, 1.0);
+        }
+        optimizer.geometry.enforceDesignConstraints();
+    }
+
+    bool fail(std::string message)
+    {
+        if (callback_error.empty()) {
+            callback_error = std::move(message);
+        }
+        return false;
     }
 
     Optimizer& optimizer;
-    ObjectiveEvaluation objective;
+    ObjectiveEvaluation evaluated_objective;
+    ObjectiveEvaluation accepted_objective;
     mfem::Vector pass_gradient;
     mfem::Vector stop_gradient;
     std::vector<double> evaluated_design;
+    std::vector<double> accepted_design;
+    std::vector<Ipopt::Number> current_iterate;
+    std::vector<double> final_design;
+    std::string callback_error;
     double objective_scale = 1.0;
     double initial_bound = 1.0;
+    double accepted_bound = 0.0;
     int active_design_size = 0;
     int constraint_size = 0;
-    bool initial_mma_evaluation = true;
+    int published_iteration = 0;
     bool gradients_ready = false;
+    bool cancellation_observed = false;
+    bool final_design_ready = false;
 };
 
 void Optimizer::prepare_run()
@@ -526,7 +755,7 @@ void Optimizer::run()
     iteration.store(0);
     pass_objective.store(0.0);
     stop_objective.store(0.0);
-    mma_bound.store(0.0);
+    epigraph_bound.store(0.0);
     status.store(OptimizerStatus::Working);
 
     try {
@@ -575,6 +804,15 @@ bool Optimizer::evaluateObjectives(ObjectiveEvaluation& objective) const
             "The solver has not produced a complete frequency response.");
         return false;
     }
+    for (std::size_t bin = 0; bin < bin_count; ++bin) {
+        if (!std::isfinite(response.frequency[bin])
+            || (bin > 0
+                && response.frequency[bin] <= response.frequency[bin - 1])) {
+            log(LogLevel::Error,
+                "The solver frequency bins must be finite and increasing.");
+            return false;
+        }
+    }
 
     objective.pass_spectrum_derivative.assign(bin_count, {0.0, 0.0});
     objective.stop_spectrum_derivative.assign(bin_count, {0.0, 0.0});
@@ -585,6 +823,19 @@ bool Optimizer::evaluateObjectives(ObjectiveEvaluation& objective) const
                 "The freeform objective frequency and target arrays must match.");
             return false;
         }
+        for (std::size_t sample = 0;
+             sample < freeform.frequencyHz.size(); ++sample) {
+            if (!std::isfinite(freeform.frequencyHz[sample])
+                || !std::isfinite(freeform.targetTransmission[sample])
+                || freeform.targetTransmission[sample] <= 0.0
+                || (sample > 0
+                    && freeform.frequencyHz[sample]
+                        <= freeform.frequencyHz[sample - 1])) {
+                log(LogLevel::Error,
+                    "Freeform objective samples must be finite, positive, and increasing.");
+                return false;
+            }
+        }
 
         constexpr double target_floor = 1.0e-6;
         int objective_bins = 0;
@@ -593,15 +844,16 @@ bool Optimizer::evaluateObjectives(ObjectiveEvaluation& objective) const
                 continue;
             }
             const auto found = std::lower_bound(
-                freeform.frequencyHz.begin(),
-                freeform.frequencyHz.end(),
+                freeform.frequencyHz.begin(), freeform.frequencyHz.end(),
                 response.frequency[bin]);
             std::size_t sample = found == freeform.frequencyHz.end()
                 ? freeform.frequencyHz.size() - 1
                 : static_cast<std::size_t>(found - freeform.frequencyHz.begin());
             if (sample > 0
-                && std::abs(freeform.frequencyHz[sample - 1] - response.frequency[bin])
-                    < std::abs(freeform.frequencyHz[sample] - response.frequency[bin])) {
+                && std::abs(freeform.frequencyHz[sample - 1]
+                            - response.frequency[bin])
+                    < std::abs(freeform.frequencyHz[sample]
+                               - response.frequency[bin])) {
                 --sample;
             }
             const double bin_width = bin_count > 1
@@ -639,6 +891,15 @@ bool Optimizer::evaluateObjectives(ObjectiveEvaluation& objective) const
                 : 0.0;
             objective.pass_spectrum_derivative[bin]
                 = derivative_scale * response.outlet[bin];
+            if (!std::isfinite(objective.pass)
+                || !std::isfinite(
+                    objective.pass_spectrum_derivative[bin].real())
+                || !std::isfinite(
+                    objective.pass_spectrum_derivative[bin].imag())) {
+                log(LogLevel::Error,
+                    "A freeform objective bin overflowed its value or derivative.");
+                return false;
+            }
             ++objective_bins;
         }
         if (objective_bins == 0) {
@@ -734,6 +995,13 @@ bool Optimizer::evaluateObjectives(ObjectiveEvaluation& objective) const
             : 0.0;
         const std::complex<double> derivative =
             derivative_scale * response.outlet[bin];
+        if (!std::isfinite(error)
+            || !std::isfinite(derivative.real())
+            || !std::isfinite(derivative.imag())) {
+            log(LogLevel::Error,
+                "A frequency-band objective bin overflowed its value or derivative.");
+            return false;
+        }
 
         if (selected->type == FrequencyBandType::pass) {
             objective.pass += error;
@@ -746,6 +1014,12 @@ bool Optimizer::evaluateObjectives(ObjectiveEvaluation& objective) const
             objective.has_stop = true;
             objective.stop_spectrum_derivative[bin] = derivative;
             ++stop_bins;
+        }
+        if (!std::isfinite(objective.pass)
+            || !std::isfinite(objective.stop)) {
+            log(LogLevel::Error,
+                "The frequency-band objective overflowed while accumulating bins.");
+            return false;
         }
     }
 
@@ -763,24 +1037,11 @@ bool Optimizer::optimize()
 {
     performance_data = {};
     if (settings.maxIterations <= 0
-        || settings.mmaInitialAsymptote < 0.0
-        || settings.mmaInitialAsymptote > 1.0
-        || settings.mmaDecreaseAsymptote < 0.0
-        || settings.mmaDecreaseAsymptote > 1.0
-        || settings.mmaIncreaseAsymptote < 1.0
-        || settings.mmaConstraintPenalty < 0.0) {
-        log(LogLevel::Error, "The MMA settings are invalid.");
-        status.store(OptimizerStatus::Error);
-        return false;
-    }
-
-    int mpi_initialized = 0;
-    int mpi_finalized = 0;
-    MPI_Initialized(&mpi_initialized);
-    MPI_Finalized(&mpi_finalized);
-    if (mpi_initialized == 0 || mpi_finalized != 0) {
-        log(LogLevel::Error,
-            "ParOpt requires an active MPI runtime for the optimization worker.");
+        || !std::isfinite(settings.convergenceTolerance)
+        || !std::isfinite(settings.acceptableTolerance)
+        || settings.convergenceTolerance <= 0.0
+        || settings.acceptableTolerance < settings.convergenceTolerance) {
+        log(LogLevel::Error, "The optimizer settings are invalid.");
         status.store(OptimizerStatus::Error);
         return false;
     }
@@ -792,7 +1053,7 @@ bool Optimizer::optimize()
     }
     pass_objective.store(objective.pass);
     stop_objective.store(objective.stop);
-    mma_bound.store(std::max(objective.pass, objective.stop));
+    epigraph_bound.store(std::max(objective.pass, objective.stop));
     log(LogLevel::Message,
         "Initial pass/stop objectives: "
             + std::to_string(objective.pass) + " / "
@@ -800,101 +1061,102 @@ bool Optimizer::optimize()
 
     try {
         check_cancelled();
-        auto release = [](auto* object) {
-            if (object != nullptr) {
-                object->decref();
-            }
-        };
-
-        std::unique_ptr<Problem, decltype(release)> problem(
-            new Problem(*this, std::move(objective)), release);
-        problem->incref();
-
-        std::unique_ptr<ParOptOptions, decltype(release)> options(
-            new ParOptOptions(MPI_COMM_SELF), release);
-        options->incref();
-        ParOptOptimizer::addDefaultOptions(options.get());
-        int option_error = 0;
-        option_error |= options->setOption("algorithm", "mma");
-        option_error |= options->setOption("output_file", "");
-        option_error |= options->setOption("mma_output_file", "");
-        option_error |= options->setOption(
-            "mma_max_iterations", settings.maxIterations);
-        option_error |= options->setOption(
-            "mma_init_asymptote_offset", settings.mmaInitialAsymptote);
-        option_error |= options->setOption(
-            "mma_asymptote_contract", settings.mmaDecreaseAsymptote);
-        option_error |= options->setOption(
-            "mma_asymptote_relax", settings.mmaIncreaseAsymptote);
-        option_error |= options->setOption(
-            "penalty_gamma", settings.mmaConstraintPenalty);
-        option_error |= options->setOption(
-            "mma_use_constraint_linearization", 0);
-        option_error |= options->setOption("mma_l1_tol", 1.0e-5);
-        option_error |= options->setOption("mma_linfty_tol", 1.0e-5);
-        option_error |= options->setOption("mma_infeas_tol", 1.0e-6);
-        option_error |= options->setOption("max_major_iters", 100);
-        option_error |= options->setOption("abs_res_tol", 1.0e-10);
-        option_error |= options->setOption("use_diag_hessian", 1);
-        option_error |= options->setOption(
-            "starting_point_strategy", "affine_step");
-        option_error |= options->setOption(
-            "barrier_strategy", "mehrotra");
-        option_error |= options->setOption("use_line_search", 0);
-        if (option_error != 0) {
-            throw std::runtime_error(
-                "ParOpt rejected one or more MMA settings.");
+        Ipopt::SmartPtr<Problem> problem =
+            new Problem(*this, std::move(objective));
+        Ipopt::SmartPtr<Ipopt::IpoptApplication> application =
+            IpoptApplicationFactory();
+        if (!Ipopt::IsValid(application)) {
+            throw std::runtime_error("Could not create the Ipopt application.");
         }
 
-        std::unique_ptr<EpigraphMMA, decltype(release)> mma(
-            new EpigraphMMA(
-                problem.get(), options.get(),
-                geometry.activeDesignDofs.Size()),
-            release);
-        mma->incref();
-        std::unique_ptr<ParOptInteriorPoint, decltype(release)> interior_point(
-            new ParOptInteriorPoint(mma.get(), options.get()), release);
-        interior_point->incref();
+        bool options_valid = true;
+        options_valid &= application->Options()->SetStringValue(
+            "hessian_approximation", "limited-memory");
+        options_valid &= application->Options()->SetStringValue(
+            "grad_f_constant", "yes");
+        options_valid &= application->Options()->SetNumericValue(
+            "bound_relax_factor", 0.0);
+        options_valid &= application->Options()->SetStringValue(
+            "honor_original_bounds", "yes");
+        options_valid &= application->Options()->SetIntegerValue(
+            "max_iter", settings.maxIterations);
+        options_valid &= application->Options()->SetNumericValue(
+            "tol", settings.convergenceTolerance);
+        options_valid &= application->Options()->SetNumericValue(
+            "acceptable_tol", settings.acceptableTolerance);
+        options_valid &= application->Options()->SetIntegerValue(
+            "print_level", 0);
+        options_valid &= application->Options()->SetStringValue("sb", "yes");
+#if METAMATERIAL_USE_MPI && !defined(_WIN32)
+        options_valid &= application->Options()->SetIntegerValue(
+            "mumps_mpi_communicator",
+            static_cast<Ipopt::Index>(MPI_Comm_c2f(MPI_COMM_SELF)));
+#endif
+        if (!options_valid) {
+            throw std::runtime_error("Ipopt rejected an optimizer option.");
+        }
+
+        const Ipopt::ApplicationReturnStatus initialize_status =
+            application->Initialize("");
+        if (initialize_status != Ipopt::Solve_Succeeded) {
+            throw std::runtime_error(
+                std::string("Ipopt initialization failed: ")
+                + ipopt_status_name(initialize_status) + ".");
+        }
+
         log(LogLevel::Message,
-            "Starting ParOpt MMA with "
+            "Starting Ipopt with "
                 + std::to_string(geometry.activeDesignDofs.Size())
                 + " active design variables and "
                 + std::to_string(settings.maxIterations)
                 + " requested iterations.");
-        const auto paropt_started_at = std::chrono::steady_clock::now();
-        const MMAResult mma_result = runMMA(
-            *mma, *interior_point, *options);
-        performance_data.paroptSeconds = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - paropt_started_at).count();
-        check_cancelled();
+        const auto started_at = std::chrono::steady_clock::now();
+        Ipopt::SmartPtr<Ipopt::TNLP> nlp = problem;
+        const Ipopt::ApplicationReturnStatus solve_status =
+            application->OptimizeTNLP(nlp);
+        performance_data.optimizerSeconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started_at).count();
 
-        if (cancel_requested.load()) {
+        if (cancel_requested.load() || problem->cancelled()) {
+            if (!problem->restore_accepted()) {
+                status.store(OptimizerStatus::Error);
+                log(LogLevel::Error,
+                    problem->error().empty()
+                        ? "Could not restore the last accepted design after cancellation."
+                        : problem->error());
+                return false;
+            }
             status.store(OptimizerStatus::Cancelled);
             log(LogLevel::Warning,
-                "Optimization cancelled after the latest completed design.");
+                "Optimization cancelled after the latest accepted design.");
             return false;
         }
-        ParOptVec* optimized_design = nullptr;
-        mma->getOptimizedPoint(&optimized_design);
-        if (optimized_design == nullptr || !problem->matches(optimized_design)) {
-            throw std::runtime_error(
-                "ParOpt returned a design that has not completed its forward analysis.");
+
+        const bool completed = solve_status == Ipopt::Solve_Succeeded
+            || solve_status == Ipopt::Solved_To_Acceptable_Level
+            || solve_status == Ipopt::Maximum_Iterations_Exceeded;
+        if (completed && problem->accept_final()) {
+            status.store(solve_status == Ipopt::Maximum_Iterations_Exceeded
+                ? OptimizerStatus::MaximumIterations
+                : OptimizerStatus::Converged);
+            log(LogLevel::Message,
+                std::string("Ipopt finished with ")
+                    + ipopt_status_name(solve_status) + " after "
+                    + std::to_string(iteration.load()) + " iterations.");
+            return true;
         }
 
-        iteration.store(mma_result.iterations);
-        status.store(mma_result.converged
-            ? OptimizerStatus::Converged
-            : OptimizerStatus::MaximumIterations);
-        log(LogLevel::Message,
-            std::string(mma_result.converged
-                ? "ParOpt converged after "
-                : "ParOpt reached the requested limit of ")
-                + std::to_string(mma_result.iterations)
-                + " MMA iterations; KKT l1/linfinity/infeasibility = "
-                + std::to_string(mma_result.l1) + " / "
-                + std::to_string(mma_result.linfinity) + " / "
-                + std::to_string(mma_result.infeasibility) + ".");
-        return true;
+        problem->restore_accepted();
+        status.store(solve_status == Ipopt::Diverging_Iterates
+            ? OptimizerStatus::Diverged
+            : OptimizerStatus::Error);
+        std::string message = std::string("Ipopt optimization failed: ")
+            + ipopt_status_name(solve_status) + ".";
+        if (!problem->error().empty()) {
+            message += " " + problem->error();
+        }
+        log(LogLevel::Error, std::move(message));
+        return false;
     }
     catch (const OptimizationCancelled&) {
         status.store(OptimizerStatus::Cancelled);
@@ -907,18 +1169,62 @@ bool Optimizer::optimize()
             ? OptimizerStatus::Diverged
             : OptimizerStatus::Error);
         log(LogLevel::Error,
-            "ParOpt optimization failed: " + std::string(error.what()));
+            "Ipopt optimization failed: " + std::string(error.what()));
+        return false;
+    }
+}
+
+bool Optimizer::check_derivatives(double relative_step, double tolerance)
+{
+    if (status.load() == OptimizerStatus::Working) {
+        log(LogLevel::Error,
+            "The optimizer derivative check cannot run during optimization.");
+        return false;
+    }
+    performance_data = {};
+    try {
+        if (!solver.setMesh()
+            || !solver.assembleSolutionSpace()
+            || !solver.solve()) {
+            log(LogLevel::Error,
+                "The derivative check could not complete its initial forward solve.");
+            return false;
+        }
+
+        ObjectiveEvaluation objective;
+        if (!evaluateObjectives(objective)) {
+            return false;
+        }
+        Ipopt::SmartPtr<Problem> problem =
+            new Problem(*this, std::move(objective));
+        if (!problem->check_derivatives(relative_step, tolerance)) {
+            log(LogLevel::Error,
+                problem->error().empty()
+                    ? "The optimizer derivative check failed."
+                    : problem->error());
+            return false;
+        }
+        log(LogLevel::Message, "The optimizer derivative check passed.");
+        return true;
+    }
+    catch (const std::exception& error) {
+        log(LogLevel::Error,
+            "The optimizer derivative check failed: "
+                + std::string(error.what()));
+        return false;
+    }
+    catch (...) {
+        log(LogLevel::Error,
+            "The optimizer derivative check failed with an unknown error.");
         return false;
     }
 }
 
 void Optimizer::request_cancel()
 {
-    const OptimizerStatus current_status = status.load();
-    if (current_status != OptimizerStatus::Working) {
-        return;
+    if (status.load() == OptimizerStatus::Working) {
+        cancel_requested.store(true);
     }
-    cancel_requested.store(true);
 }
 
 void Optimizer::check_cancelled() const
@@ -967,9 +1273,9 @@ double Optimizer::get_stop_objective() const
     return stop_objective.load();
 }
 
-double Optimizer::get_mma_bound() const
+double Optimizer::get_epigraph_bound() const
 {
-    return mma_bound.load();
+    return epigraph_bound.load();
 }
 
 const OptimizerPerformance& Optimizer::performance() const

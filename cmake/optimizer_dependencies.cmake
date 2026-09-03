@@ -25,12 +25,26 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(ifopt)
 
 if(WIN32)
-  set(IPOPT_BASH "C:/msys64/usr/bin/bash.exe")
-  set(IPOPT_CYGPATH "C:/msys64/usr/bin/cygpath.exe")
-  if(NOT EXISTS "${IPOPT_BASH}" OR
-     NOT EXISTS "${IPOPT_CYGPATH}" OR
-     NOT EXISTS "C:/msys64/usr/bin/make.exe")
-    message(FATAL_ERROR "Ipopt requires the MSYS2 tools installed by setup.bat.")
+  set(METAMATERIAL_MSYS2_ROOT "C:/msys64" CACHE PATH
+    "MSYS2 installation used to build Ipopt")
+  set(IPOPT_BASH "${METAMATERIAL_MSYS2_ROOT}/usr/bin/bash.exe")
+  set(IPOPT_CYGPATH "${METAMATERIAL_MSYS2_ROOT}/usr/bin/cygpath.exe")
+  set(IPOPT_MAKE "${METAMATERIAL_MSYS2_ROOT}/usr/bin/make.exe")
+  set(_missing_ipopt_tools)
+  foreach(_tool IN ITEMS IPOPT_BASH IPOPT_CYGPATH IPOPT_MAKE)
+    if(NOT EXISTS "${${_tool}}")
+      list(APPEND _missing_ipopt_tools "${${_tool}}")
+    endif()
+  endforeach()
+  if(_missing_ipopt_tools)
+    list(JOIN _missing_ipopt_tools "\n  " _missing_ipopt_tools)
+    message(FATAL_ERROR
+      "Ipopt's native Windows build is missing these base MSYS2 tools:\n"
+      "  ${_missing_ipopt_tools}\n"
+      "Run setup.bat again, or install them with:\n"
+      "  ${IPOPT_BASH} -lc \"pacman -S --needed make\"\n"
+      "UCRT64 on PATH is not a substitute for MSYS2 /usr/bin tools. "
+      "For a non-default installation, set -DMETAMATERIAL_MSYS2_ROOT=<path>.")
   endif()
 else()
   find_program(IPOPT_BASH bash REQUIRED)
@@ -40,7 +54,7 @@ set(_ipopt_build "${CMAKE_BINARY_DIR}/deps/ipopt-build")
 set(_ipopt_install "${CMAKE_BINARY_DIR}/deps/ipopt-install")
 set(_ifopt_build "${CMAKE_BINARY_DIR}/deps/ifopt-build")
 file(MAKE_DIRECTORY
-  "${_ipopt_install}/include/coin"
+  "${_ipopt_install}/include/coin/coin-or"
   "${_ifopt_build}/ifopt_core"
   "${_ifopt_build}/ifopt_ipopt"
 )
@@ -87,8 +101,13 @@ set(_ipopt_configure
 
 set(_ipopt_dependencies)
 if(WIN32)
-  list(APPEND _ipopt_configure "-DIPOPT_WINDOWS=ON")
-  set(_ipopt_library "${_ipopt_install}/lib/libipopt.lib")
+  list(APPEND _ipopt_configure
+    "-DIPOPT_WINDOWS=ON"
+    "-DIPOPT_CYGPATH=${IPOPT_CYGPATH}"
+  )
+  set(_ipopt_library "${_ipopt_install}/lib/ipopt.dll.lib")
+  set(_ipopt_runtime "${_ipopt_install}/bin/ipopt-3.dll")
+  set(_ipopt_byproducts "${_ipopt_library}" "${_ipopt_runtime}")
 else()
   if(NOT TARGET dmumps OR NOT TARGET mumps_common OR NOT TARGET pord)
     message(FATAL_ERROR "The Linux Ipopt source build requires the pinned MUMPS targets.")
@@ -136,9 +155,40 @@ else()
     "-DIPOPT_MUMPS_LFLAGS=${_mumps_lflags}"
   )
   set(_ipopt_library "${_ipopt_install}/lib/libipopt.so")
+  set(_ipopt_runtime "${_ipopt_install}/lib/libipopt.so.3")
+  set(_ipopt_byproducts "${_ipopt_library}" "${_ipopt_runtime}")
 endif()
+file(SHA256 "${CMAKE_CURRENT_LIST_DIR}/configure_ipopt.cmake"
+  _ipopt_configure_revision)
 list(APPEND _ipopt_configure
+  "-DIPOPT_DRIVER_REVISION=${_ipopt_configure_revision}"
   -P "${CMAKE_CURRENT_LIST_DIR}/configure_ipopt.cmake")
+
+set(_ipopt_shell_build "${_ipopt_tool_build}")
+if(WIN32)
+  execute_process(
+    COMMAND "${IPOPT_CYGPATH}" -u "${_ipopt_tool_build}"
+    OUTPUT_VARIABLE _ipopt_shell_build
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    COMMAND_ERROR_IS_FATAL ANY
+  )
+endif()
+
+if(WIN32)
+  set(_ipopt_build_command
+    "${IPOPT_BASH}" -c
+    "export PATH=/usr/bin:$PATH && cd ${_ipopt_shell_build} && exec /usr/bin/make -j${METAMATERIAL_DEPENDENCY_JOBS}")
+  set(_ipopt_install_command
+    "${IPOPT_BASH}" -c
+    "export PATH=/usr/bin:$PATH && cd ${_ipopt_shell_build} && exec /usr/bin/make install")
+else()
+  set(_ipopt_build_command
+    "${IPOPT_BASH}" -lc "cd \"$1\" && exec make -j${METAMATERIAL_DEPENDENCY_JOBS}"
+    _ "${_ipopt_shell_build}")
+  set(_ipopt_install_command
+    "${IPOPT_BASH}" -lc "cd \"$1\" && exec make install"
+    _ "${_ipopt_shell_build}")
+endif()
 
 ExternalProject_Add(ipopt_external
   SOURCE_DIR "${ipopt_SOURCE_DIR}"
@@ -147,28 +197,26 @@ ExternalProject_Add(ipopt_external
   UPDATE_COMMAND ""
   PATCH_COMMAND ""
   CONFIGURE_COMMAND ${_ipopt_configure}
-  BUILD_COMMAND
-    "${CMAKE_COMMAND}" -E chdir "${_ipopt_tool_build}"
-    "${IPOPT_BASH}" -lc "exec make -j${METAMATERIAL_DEPENDENCY_JOBS}"
-  INSTALL_COMMAND
-    "${CMAKE_COMMAND}" -E chdir "${_ipopt_tool_build}"
-    "${IPOPT_BASH}" -lc "exec make install"
-  BUILD_BYPRODUCTS "${_ipopt_library}"
+  BUILD_COMMAND ${_ipopt_build_command}
+  INSTALL_COMMAND ${_ipopt_install_command}
+  BUILD_BYPRODUCTS ${_ipopt_byproducts}
   DEPENDS ${_ipopt_dependencies}
 )
 
 add_library(ipopt_imported SHARED IMPORTED GLOBAL)
 add_library(Ipopt::ipopt ALIAS ipopt_imported)
 set_target_properties(ipopt_imported PROPERTIES
-  INTERFACE_INCLUDE_DIRECTORIES "${_ipopt_install}/include/coin"
+  INTERFACE_INCLUDE_DIRECTORIES "${_ipopt_install}/include/coin/coin-or"
 )
 if(WIN32)
   set_target_properties(ipopt_imported PROPERTIES
     IMPORTED_IMPLIB "${_ipopt_library}"
+    IMPORTED_LOCATION "${_ipopt_runtime}"
   )
 else()
   set_target_properties(ipopt_imported PROPERTIES
-    IMPORTED_LOCATION "${_ipopt_library}"
+    IMPORTED_LOCATION "${_ipopt_runtime}"
+    IMPORTED_SONAME "libipopt.so.3"
   )
 endif()
 add_dependencies(ipopt_imported ipopt_external)
@@ -185,6 +233,14 @@ file(WRITE "${_eigen_package}/Eigen3Config.cmake"
 "endif()\n"
 "set(Eigen3_FOUND TRUE)\n")
 
+set(_ifopt_ipopt_compatibility)
+if(WIN32)
+  list(APPEND _ifopt_ipopt_compatibility
+    "-DIPOPT_IPOPT_LIBRARY_RELEASE=${_ipopt_library}"
+    "-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /W3 /GR /EHsc /FIcassert /FIiostream /I${_ipopt_tool_install}/include/coin/coin-or"
+  )
+endif()
+
 ExternalProject_Add(ifopt_external
   SOURCE_DIR "${ifopt_SOURCE_DIR}"
   BINARY_DIR "${_ifopt_build}"
@@ -198,11 +254,13 @@ ExternalProject_Add(ifopt_external
       -B "${_ifopt_build}"
       -G "${CMAKE_GENERATOR}"
       "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
+      -DCMAKE_POLICY_VERSION_MINIMUM=3.5
       "-DCMAKE_PREFIX_PATH=${_eigen_package}"
       -DCMAKE_DISABLE_FIND_PACKAGE_GTest=ON
       -DBUILD_SHARED_LIBS=OFF
       -DBUILD_IPOPT=ON
       -DBUILD_SNOPT=OFF
+      ${_ifopt_ipopt_compatibility}
   BUILD_COMMAND
     "${CMAKE_COMMAND}" --build "${_ifopt_build}"
       --config "$<CONFIG>" --target ifopt_ipopt
@@ -222,6 +280,8 @@ set_target_properties(ifopt_core_imported PROPERTIES
   INTERFACE_INCLUDE_DIRECTORIES "${ifopt_SOURCE_DIR}/ifopt_core/include"
   INTERFACE_LINK_LIBRARIES Eigen3::Eigen
 )
+target_compile_options(ifopt_core_imported INTERFACE
+  "$<$<CXX_COMPILER_ID:MSVC>:/FIcassert>")
 add_dependencies(ifopt_core_imported ifopt_external)
 
 add_library(ifopt_ipopt_imported STATIC IMPORTED GLOBAL)

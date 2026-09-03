@@ -18,7 +18,9 @@
 #include <vector>
 
 #include <Eigen/Dense>
+#if METAMATERIAL_USE_MPI
 #include "mpi.h"
+#endif
 #include "zip.h"
 
 #include "optimizer.hpp"
@@ -352,15 +354,19 @@ bool write_report_data(
            << solver_performance.differentiatedDofs << "\n"
            << "    },\n"
            << "    \"optimizer_phases\": {\n"
-           << "      \"paropt_seconds\": "
-           << optimizer_performance.paroptSeconds << ",\n"
+           << "      \"optimizer_seconds\": "
+           << optimizer_performance.optimizerSeconds << ",\n"
            << "      \"forward_callback_seconds\": "
            << optimizer_performance.forwardCallbackSeconds << ",\n"
            << "      \"gradient_callback_seconds\": "
            << optimizer_performance.gradientCallbackSeconds << ",\n"
-           << "      \"paropt_bookkeeping_seconds\": "
+           << "      \"forward_callbacks\": "
+           << optimizer_performance.forwardCallbacks << ",\n"
+           << "      \"gradient_callbacks\": "
+           << optimizer_performance.gradientCallbacks << ",\n"
+           << "      \"optimizer_bookkeeping_seconds\": "
            << std::max(0.0,
-                optimizer_performance.paroptSeconds
+                optimizer_performance.optimizerSeconds
                     - optimizer_performance.forwardCallbackSeconds
                     - optimizer_performance.gradientCallbackSeconds)
            << "\n"
@@ -596,26 +602,17 @@ int main(int argc, char** argv)
     }
 #endif
 
-    int provided = 0;
+    int rank = 0;
 #if METAMATERIAL_USE_MPI
+    int provided = 0;
     mfem::Mpi::Init(argc, argv, MPI_THREAD_SERIALIZED, &provided);
     mfem::Hypre::Init();
-#else
-    if (MPI_Init_thread(&argc, &argv, MPI_THREAD_SERIALIZED, &provided)
-            != MPI_SUCCESS) {
-        std::cerr << "The miniapp could not initialize MPI.\n";
-        return 1;
-    }
-#endif
     if (provided < MPI_THREAD_SERIALIZED) {
         std::cerr << "The miniapp needs MPI_THREAD_SERIALIZED.\n";
-#if !METAMATERIAL_USE_MPI
-        MPI_Finalize();
-#endif
         return 1;
     }
-    int rank = 0;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+#endif
     std::signal(SIGINT, handle_interrupt);
 
     int exit_code = 0;
@@ -696,7 +693,7 @@ int main(int argc, char** argv)
             }
             if (optimizer != nullptr
                 && (message.rfind("Initial pass/stop objectives:", 0) == 0
-                    || message.rfind("Completed optimization iteration ", 0) == 0)) {
+                    || message.rfind("Completed optimizer iteration ", 0) == 0)) {
                 const ObjectivePoint point{
                     optimizer->get_iteration(),
                     optimizer->get_pass_objective(),
@@ -760,9 +757,14 @@ int main(int argc, char** argv)
                 : std::max(history.front().pass, history.front().stop);
             const double final_worst = std::max(
                 optimizer->get_pass_objective(), optimizer->get_stop_objective());
+            const bool optimization_completed =
+                optimizer->get_status() == App::OptimizerStatus::Converged
+                || (optimizer->get_status()
+                        == App::OptimizerStatus::MaximumIterations
+                    && optimizer->get_iteration()
+                        == optimizer_settings.maxIterations);
             const bool gate_passed =
-                optimizer->get_status() == App::OptimizerStatus::MaximumIterations
-                && optimizer->get_iteration() == optimizer_settings.maxIterations
+                optimization_completed
                 && optimizer->is_exportable()
                 && bounds_hold
                 && std::isfinite(initial_worst)
@@ -833,8 +835,5 @@ int main(int argc, char** argv)
         }
     }
 
-#if !METAMATERIAL_USE_MPI
-    MPI_Finalize();
-#endif
     return exit_code;
 }

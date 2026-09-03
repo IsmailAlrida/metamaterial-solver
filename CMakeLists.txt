@@ -150,9 +150,8 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(fftw)
 
-# 7. Fetch ParOpt and its METIS dependency. ParOpt requires a system MPI SDK
-# even when MFEM itself is serial; setup.bat installs MS-MPI and oneMKL.
-if(WIN32)
+# 7. Configure the numerical dependencies used by MFEM and Ipopt.
+if(METAMATERIAL_USE_MPI AND WIN32)
   set(_msmpi_sdk "$ENV{SystemDrive}/Program Files (x86)/Microsoft SDKs/MPI")
   if(NOT EXISTS "$ENV{MSMPI_INC}/mpi.h" AND
      EXISTS "${_msmpi_sdk}/Include/mpi.h")
@@ -164,7 +163,8 @@ if(WIN32)
   endif()
   unset(_msmpi_sdk)
 endif()
-if(WIN32 AND EXISTS "$ENV{ProgramFiles}/Microsoft MPI/Bin/mpiexec.exe")
+if(METAMATERIAL_USE_MPI AND WIN32 AND
+   EXISTS "$ENV{ProgramFiles}/Microsoft MPI/Bin/mpiexec.exe")
   set(MPIEXEC_EXECUTABLE
       "$ENV{ProgramFiles}/Microsoft MPI/Bin/mpiexec.exe"
       CACHE FILEPATH "Microsoft MPI launcher" FORCE)
@@ -184,8 +184,6 @@ if(WIN32 AND EXISTS "$ENV{ProgramFiles}/Microsoft MPI/Bin/mpiexec.exe")
 endif()
 if(METAMATERIAL_USE_MPI)
   find_package(MPI REQUIRED COMPONENTS C CXX Fortran)
-else()
-  find_package(MPI REQUIRED COMPONENTS CXX)
 endif()
 if(WIN32 AND NOT DEFINED BLA_VENDOR)
   set(BLA_VENDOR Intel10_64lp_seq CACHE STRING "BLAS/LAPACK implementation" FORCE)
@@ -251,122 +249,9 @@ if(METAMATERIAL_USE_MPI OR UNIX)
 endif()
 
 # Ipopt and IFOPT are fetched and compiled from their official source trees.
-# ParOpt remains the active optimizer until the TNLP migration is complete.
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/optimizer_dependencies.cmake")
 
-FetchContent_Declare(
-  gklib
-  GIT_REPOSITORY https://github.com/KarypisLab/GKlib.git
-  GIT_TAG        8bd6bad750b2b0d90800c632cf18e8ee93ad72d7
-  SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/gklib-src"
-  SOURCE_SUBDIR  _source-only
-)
-FetchContent_MakeAvailable(gklib)
-
-FetchContent_Declare(
-  metis
-  GIT_REPOSITORY https://github.com/KarypisLab/METIS.git
-  GIT_TAG        v5.2.1
-  SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/metis-src"
-  BINARY_DIR     "${CMAKE_BINARY_DIR}/deps/metis-build"
-  SOURCE_SUBDIR  _source-only
-)
-FetchContent_MakeAvailable(metis)
-
-# METIS 5.2.1's CMake assumes it is the top-level project and that its
-# Makefile has already generated build/xinclude/metis.h. Build the two small
-# static libraries directly instead of patching fetched dependency sources.
-file(GLOB _gklib_sources CONFIGURE_DEPENDS "${gklib_SOURCE_DIR}/*.c")
-if(WIN32)
-  list(APPEND _gklib_sources "${gklib_SOURCE_DIR}/win32/adapt.c")
-endif()
-add_library(GKlib STATIC ${_gklib_sources})
-target_include_directories(GKlib PUBLIC "${gklib_SOURCE_DIR}")
-set_target_properties(GKlib PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON)
-if(MSVC)
-  set(_gklib_msvc_definitions
-    WIN32
-    MSC
-    _CRT_SECURE_NO_DEPRECATE
-    USE_GKREGEX
-    NDEBUG
-    NDEBUG2
-    "__thread=__declspec(thread)"
-  )
-  target_compile_definitions(GKlib PRIVATE ${_gklib_msvc_definitions})
-endif()
-if(UNIX)
-  target_link_libraries(GKlib PUBLIC m)
-endif()
-
-set(_metis_include_dir "${metis_BINARY_DIR}/include")
-file(MAKE_DIRECTORY "${_metis_include_dir}")
-file(READ "${metis_SOURCE_DIR}/include/metis.h" _metis_header)
-file(WRITE "${_metis_include_dir}/metis.h"
-  "#define IDXTYPEWIDTH 32\n#define REALTYPEWIDTH 32\n${_metis_header}")
-file(GLOB _metis_sources CONFIGURE_DEPENDS
-  "${metis_SOURCE_DIR}/libmetis/*.c"
-)
-add_library(metis STATIC ${_metis_sources})
-target_include_directories(metis
-  PUBLIC "${_metis_include_dir}"
-  PRIVATE "${metis_SOURCE_DIR}/libmetis"
-)
-target_link_libraries(metis PUBLIC GKlib)
-if(MSVC)
-  target_compile_definitions(metis PRIVATE ${_gklib_msvc_definitions})
-endif()
-set_target_properties(metis PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON)
-
-# ParOpt is source-only upstream, so expose only its C++ core as a static target.
-FetchContent_Declare(
-  paropt
-  GIT_REPOSITORY https://github.com/smdogroup/paropt.git
-  GIT_TAG        v2.1.5
-  SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/paropt-src"
-  SOURCE_SUBDIR  _source-only
-)
-FetchContent_MakeAvailable(paropt)
-
-add_library(paropt STATIC
-  "${paropt_SOURCE_DIR}/src/ParOptOptions.cpp"
-  "${paropt_SOURCE_DIR}/src/ParOptInteriorPoint.cpp"
-  "${paropt_SOURCE_DIR}/src/ParOptVec.cpp"
-  "${paropt_SOURCE_DIR}/src/ParOptQuasiNewton.cpp"
-  "${paropt_SOURCE_DIR}/src/ParOptMMA.cpp"
-  "${paropt_SOURCE_DIR}/src/ParOptTrustRegion.cpp"
-  "${paropt_SOURCE_DIR}/src/ParOptProblem.cpp"
-  "${paropt_SOURCE_DIR}/src/ParOptOptimizer.cpp"
-  "${paropt_SOURCE_DIR}/src/ParOptSparseMat.cpp"
-  "${paropt_SOURCE_DIR}/src/ParOptCompactEigenvalueApprox.cpp"
-  "${paropt_SOURCE_DIR}/src/ParOptAMD.cpp"
-  "${paropt_SOURCE_DIR}/src/ParOptSparseCholesky.cpp"
-  "${paropt_SOURCE_DIR}/src/ParOptSparseUtils.cpp"
-)
-add_library(ParOpt::paropt ALIAS paropt)
-target_include_directories(paropt PUBLIC
-  "${paropt_SOURCE_DIR}/src"
-  "${_metis_include_dir}"
-)
-target_link_libraries(paropt PUBLIC
-  MPI::MPI_CXX
-  LAPACK::LAPACK
-  BLAS::BLAS
-  metis
-)
-if(MSVC)
-  target_compile_definitions(paropt PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
-  # ParOptInteriorPoint.cpp gives min2/max2 external linkage while three
-  # other translation units define the same inline helpers. Keep the fetched
-  # source untouched and give only the strong MSVC definitions local names.
-  set_source_files_properties(
-    "${paropt_SOURCE_DIR}/src/ParOptInteriorPoint.cpp"
-    PROPERTIES COMPILE_DEFINITIONS
-      "min2=paropt_interior_min2;max2=paropt_interior_max2"
-  )
-endif()
-
-# 9. Fetch MFEM's CutFEM dependencies
+# 8. Fetch MFEM's CutFEM dependencies
 FetchContent_Declare(
   blitz
   GIT_REPOSITORY https://github.com/blitzpp/blitz.git
@@ -446,7 +331,7 @@ if(METAMATERIAL_USE_MPI)
   set(HYPRE_LIBRARIES HYPRE CACHE STRING "" FORCE)
 endif()
 
-# 10. Fetch MFEM (Finite Element Method Library)
+# 9. Fetch MFEM (Finite Element Method Library)
 set(MFEM_USE_MPI ${METAMATERIAL_USE_MPI} CACHE BOOL "" FORCE)
 set(MFEM_FETCH_TPLS OFF CACHE BOOL "" FORCE)
 set(MFEM_USE_METIS OFF CACHE BOOL "" FORCE)
@@ -629,7 +514,7 @@ target_link_libraries(metamaterial_core PUBLIC
     assimp
     Eigen3::Eigen
     fftw3
-    ParOpt::paropt
+    Ipopt::ipopt
     mfem         # Enforces direct linkage to the compiled MFEM static library
     glvis
 )
@@ -727,3 +612,23 @@ else()
   add_test(NAME solver_suite COMMAND solver_test_suite)
 endif()
 endif()
+
+set(_ipopt_runtime_targets metamaterial_app)
+if(METAMATERIAL_BUILD_TESTS)
+  list(APPEND _ipopt_runtime_targets
+    exporter_bundle_check
+    optimizer_test_suite
+    solver_test_suite
+    paper_optimizer_miniapp)
+endif()
+foreach(_target IN LISTS _ipopt_runtime_targets)
+  add_custom_command(TARGET ${_target} POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "$<TARGET_FILE:Ipopt::ipopt>"
+            "$<TARGET_FILE_DIR:${_target}>"
+    VERBATIM)
+  if(UNIX)
+    set_property(TARGET ${_target} APPEND PROPERTY BUILD_RPATH "$ORIGIN")
+    set_property(TARGET ${_target} APPEND PROPERTY INSTALL_RPATH "$ORIGIN")
+  endif()
+endforeach()

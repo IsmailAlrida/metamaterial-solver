@@ -1,6 +1,6 @@
 # Ipopt Transition Plan
 
-Last updated: 2026-09-02
+Last updated: 2026-09-03
 
 This is the rolling implementation contract for replacing the custom ParOpt
 MMA path with COIN-OR Ipopt. It is deliberately backend-first: the solver and
@@ -9,20 +9,26 @@ optimizer define the data contract; the renderer adapts to that contract later.
 ## Status
 
 - Branch: `ipopt-optimizer`.
-- Current code still executes ParOpt 2.1.5.
+- `App::Optimizer` now executes a private direct Ipopt `TNLP`; there is no
+  second application optimizer type or backend factory.
 - Official source pins selected for evaluation:
   - Ipopt `releases/3.14.20`.
   - IFOPT `2.1.4`.
 - The sources live under the shared ignored dependency tree:
   `build/deps/src/ipopt-src` and `build/deps/src/ifopt-src`.
-- Phase A source integration is present but intentionally unbuilt in this
-  review pass. `build.* deps <backend>` builds the pinned Ipopt and IFOPT
+- The source transition through Phase C is present but intentionally unbuilt
+  by Codex. `build.* deps <backend>` builds the pinned Ipopt and IFOPT
   libraries without building their examples/tests or the application.
 - No fetched dependency will be edited in place.
-- The deterministic optimizer suite currently reaches a valid forward solve
-  and adjoint gradient, then the custom ParOpt MMA path proposes a non-finite
-  design before accepting iteration one. That is the migration's immediate
-  reproducible failure seam.
+- ParOpt, GKlib, and the ParOpt-only METIS target have been removed from the
+  application build. Serial optimization no longer initializes MPI.
+- The deterministic optimizer suite now exercises the production Ipopt path,
+  including curated filter objectives, wall escape, epigraph publication,
+  prepared and in-callback cancellation, common FFT scaling, and non-finite
+  callback rejection. It also finite-differences the exact production TNLP
+  Jacobian and proves that repeated callbacks and `z`-only changes reuse the
+  cached physics. Its first user-run build and runtime results remain the next
+  gate.
 
 ## Non-goals
 
@@ -734,3 +740,51 @@ possible.
 - 2026-09-02: Kept dependency examples and tests out of the default build.
   `optimizer_dependencies` builds only the libraries, while ParOpt remains the
   active application backend until the TNLP contract tests exist.
+- 2026-09-03: Replaced the custom ParOpt MMA subclass and copied outer loop
+  with one private `Optimizer::Problem : Ipopt::TNLP`. The production NLP is
+  the normalized reduced-space epigraph with active design bounds, exact dense
+  first derivatives, and Ipopt limited-memory curvature.
+- 2026-09-03: Removed ParOpt, GKlib, and its private METIS build from CMake;
+  linked `metamaterial_core` directly to `Ipopt::ipopt`; kept IFOPT available
+  only as an optional source-built comparison library.
+- 2026-09-03: Removed ParOpt-only settings and publication names, made serial
+  mode independent of MPI, and added Windows Ipopt DLL deployment beside the
+  application and optimizer-bearing test executables.
+- 2026-09-03: Preserved rank-zero nonlinear optimization for the parallel
+  app. Distributed MFEM forward/adjoint callbacks still use all ranks, while
+  Ipopt's own Linux MUMPS KKT solve is confined to `MPI_COMM_SELF`.
+- 2026-09-03: Added explicit forward/gradient callback counts beside their
+  timings in the miniapp JSON and HTML report. This separates Ipopt line-search
+  trial growth from slower MFEM solves without adding another diagnostics path.
+- 2026-09-03: Made the Windows test wrapper activate oneMKL for serial tests as
+  well as parallel tests because the serial Ipopt DLL uses PardisoMKL.
+- 2026-09-03: Added an explicit production-TNLP derivative/cache diagnostic to
+  the deterministic fake-solver suite. It checks every design column, the
+  epigraph column, repeated callback reuse, and `z`-only reuse without exposing
+  another optimizer implementation.
+- 2026-09-03: Staged the Ipopt shared library beside optimizer-bearing Linux
+  and Windows executables; Linux uses an application-relative `$ORIGIN` RPATH.
+- 2026-09-03: Made the Windows MSYS2 root overridable and changed dependency
+  validation to report the exact missing base tool. UCRT64 on `PATH` does not
+  replace the `/usr/bin/make` package required by Ipopt's MSVC build.
+- 2026-09-03: Converted Ipopt's shell-facing Windows paths with `cygpath` so
+  Autotools does not parse the drive-letter colon as a source-path separator.
+  Added bounded Pacman retries for transient MSYS2 mirror resets.
+- 2026-09-03: Made every Ipopt Autotools phase explicitly enter its requested
+  build directory and inherit the MSVC environment. This prevents MSYS2 login
+  Bash from building under its home directory or losing `cl.exe` between the
+  configure and build ExternalProject steps.
+- 2026-09-03: Removed Windows positional-argument quoting from the Ipopt build
+  driver after `cmd.exe` swallowed Bash's `$1`. Windows now follows Ipopt's
+  documented out-of-tree sequence with an explicit non-login MSYS2 shell,
+  `/usr/bin/make`, and a configure-driver content hash that invalidates stale
+  ExternalProject configure stamps when the driver changes.
+- 2026-09-03: Adapted IFOPT 2.1.4 to CMake 4's policy floor and modern Ipopt's
+  MSVC install names/layout entirely from the parent build. Neither fetched
+  dependency is patched.
+- 2026-09-03: Scoped MSVC's forced `<cassert>` include to IFOPT's isolated
+  build and imported target. IFOPT 2.1.4 and current upstream use `assert`
+  without including its standard header; the dependency source remains clean.
+- 2026-09-03: Restored IFOPT's normal MSVC exception/RTTI platform flags after
+  the first compatibility argument accidentally replaced `CMAKE_CXX_FLAGS`;
+  added the independently missing `<iostream>` include for its Ipopt adapter.

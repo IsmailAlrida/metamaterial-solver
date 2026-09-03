@@ -134,7 +134,7 @@ std::string make_json(const AppSettings& settings,
                       int iteration,
                       double pass,
                       double stop,
-                      double mma_bound)
+                      double epigraph_bound)
 {
     if (geometry.design.Size() == 0
         || geometry.phi.Size() != geometry.design.Size()) {
@@ -194,8 +194,8 @@ std::string make_json(const AppSettings& settings,
     write_number(output, pass);
     output << ",\"stop_objective\":";
     write_number(output, stop);
-    output << ",\"mma_bound\":";
-    write_number(output, mma_bound);
+    output << ",\"epigraph_bound\":";
+    write_number(output, epigraph_bound);
     output << "},\n  \"settings\":{\n    \"solver\":{";
 
     output << "\"nx\":" << solver.nx
@@ -256,10 +256,10 @@ std::string make_json(const AppSettings& settings,
            << ",\"attenuation_max_db\":" << optimizer.attenuationMaxDb
            << ",\"frequency_samples\":" << optimizer.frequencySamples
            << ",\"maximum_iterations\":" << optimizer.maxIterations
-           << ",\"mma_initial_asymptote\":" << optimizer.mmaInitialAsymptote
-           << ",\"mma_decrease_asymptote\":" << optimizer.mmaDecreaseAsymptote
-           << ",\"mma_increase_asymptote\":" << optimizer.mmaIncreaseAsymptote
-           << ",\"mma_constraint_penalty\":" << optimizer.mmaConstraintPenalty
+           << ",\"convergence_tolerance\":"
+           << optimizer.convergenceTolerance
+           << ",\"acceptable_tolerance\":"
+           << optimizer.acceptableTolerance
            << ",\"display_target_in_db\":"
            << (optimizer.displayTargetInDb ? "true" : "false")
            << ",\"frequency_bands\":[";
@@ -441,7 +441,7 @@ bool Exporter::exportRunData(const std::filesystem::path& directory,
                              int iteration,
                              double pass,
                              double stop,
-                             double mmaBound)
+                             double epigraphBound)
 {
     std::filesystem::path temporary_path;
     try {
@@ -466,7 +466,7 @@ bool Exporter::exportRunData(const std::filesystem::path& directory,
 
         const std::string json = make_json(
             settings, result, geometry, status, iteration,
-            pass, stop, mmaBound);
+            pass, stop, epigraphBound);
         int archive_error = 0;
         zip_t* archive = zip_openwitherror(
             temporary_path.string().c_str(),

@@ -28,6 +28,8 @@ int main()
         {App::FrequencyBandType::pass, 600.0, 4000.0, 1.0}
     };
     written.optSettings.objectiveMode = App::ObjectiveMode::freeform;
+    written.optSettings.convergenceTolerance = 2.0e-7;
+    written.optSettings.acceptableTolerance = 3.0e-5;
     written.optSettings.freeformObjective = {
         {60.0, 110.0}, {1.0, 0.01}};
     written.uiSettings.plotXMinHz = 55.0;
@@ -48,6 +50,8 @@ int main()
     assert(loaded.optSettings.frequencyBands.size() == 2);
     assert(loaded.optSettings.frequencyBands.front().startHz == 60.0);
     assert(loaded.optSettings.objectiveMode == App::ObjectiveMode::freeform);
+    assert(loaded.optSettings.convergenceTolerance == 2.0e-7);
+    assert(loaded.optSettings.acceptableTolerance == 3.0e-5);
     assert(loaded.optSettings.freeformObjective.frequencyHz.size() == 2);
     assert(loaded.optSettings.freeformObjective.targetTransmission[1] == 0.01);
     assert(loaded.uiSettings.plotXMinHz == 55.0);

@@ -20,8 +20,38 @@ set(_configure
   --with-precision=double
   --with-intsize=32
 )
+set(_ipopt_binary_directory "${IPOPT_BINARY_DIR}")
 
 if(IPOPT_WINDOWS)
+  if(NOT DEFINED IPOPT_CYGPATH)
+    message(FATAL_ERROR "The MSYS2 cygpath executable is required on Windows.")
+  endif()
+  execute_process(
+    COMMAND "${IPOPT_CYGPATH}" -u "${IPOPT_SOURCE_DIR}/configure"
+    OUTPUT_VARIABLE _ipopt_configure_script
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    COMMAND_ERROR_IS_FATAL ANY
+  )
+  execute_process(
+    COMMAND "${IPOPT_CYGPATH}" -u "${IPOPT_INSTALL_DIR}"
+    OUTPUT_VARIABLE _ipopt_install_prefix
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    COMMAND_ERROR_IS_FATAL ANY
+  )
+  execute_process(
+    COMMAND "${IPOPT_CYGPATH}" -u "${IPOPT_BINARY_DIR}"
+    OUTPUT_VARIABLE _ipopt_binary_directory
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    COMMAND_ERROR_IS_FATAL ANY
+  )
+  list(POP_FRONT _configure)
+  list(POP_FRONT _configure)
+  list(POP_FRONT _configure)
+  list(PREPEND _configure
+    "${_ipopt_configure_script}"
+    "--prefix=${_ipopt_install_prefix}"
+    "--includedir=${_ipopt_install_prefix}/include/coin"
+  )
   set(ENV{MSYS2_PATH_TYPE} inherit)
   set(ENV{CC} cl)
   set(ENV{CXX} cl)
@@ -43,8 +73,17 @@ if(IPOPT_DEBUG)
   list(APPEND _configure --enable-debug)
 endif()
 
-execute_process(
-  COMMAND "${IPOPT_BASH}" -lc "exec \"$@\"" _ ${_configure}
-  WORKING_DIRECTORY "${IPOPT_BINARY_DIR}"
-  COMMAND_ERROR_IS_FATAL ANY
-)
+if(IPOPT_WINDOWS)
+  list(JOIN _configure " " _configure_command)
+  execute_process(
+    COMMAND "${IPOPT_BASH}" -c
+      "export PATH=/usr/bin:$PATH && cd ${_ipopt_binary_directory} && exec ${_configure_command}"
+    COMMAND_ERROR_IS_FATAL ANY
+  )
+else()
+  execute_process(
+    COMMAND "${IPOPT_BASH}" -lc "exec \"$@\"" _ ${_configure}
+    WORKING_DIRECTORY "${IPOPT_BINARY_DIR}"
+    COMMAND_ERROR_IS_FATAL ANY
+  )
+endif()

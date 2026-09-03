@@ -10,9 +10,11 @@
 namespace App {
 
 struct OptimizerPerformance {
-    double paroptSeconds = 0.0;
+    double optimizerSeconds = 0.0;
     double forwardCallbackSeconds = 0.0;
     double gradientCallbackSeconds = 0.0;
+    int forwardCallbacks = 0;
+    int gradientCallbacks = 0;
 };
 
 class Optimizer {
@@ -24,7 +26,6 @@ class Optimizer {
 
         void prepare_run();
         void run();
-        bool optimize();
         void request_cancel();
         OptimizerStatus get_status() const;
         SolverStatus get_solver_status() const;
@@ -32,8 +33,13 @@ class Optimizer {
         bool is_exportable() const;
         double get_pass_objective() const;
         double get_stop_objective() const;
-        double get_mma_bound() const;
+        double get_epigraph_bound() const;
         const OptimizerPerformance& performance() const;
+
+        /// Finite-difference the production TNLP on fake or coarse problems.
+        /// This costs two forward solves per active design variable.
+        bool check_derivatives(double relative_step = 1.0e-6,
+                               double tolerance = 1.0e-5);
 
     private:
         class Problem;
@@ -51,6 +57,7 @@ class Optimizer {
         };
 
         bool evaluateObjectives(ObjectiveEvaluation& objective) const;
+        bool optimize();
         void check_cancelled() const;
         void clear_requests();
 
@@ -64,7 +71,7 @@ class Optimizer {
         std::atomic<int> iteration{0};
         std::atomic<double> pass_objective{0.0};
         std::atomic<double> stop_objective{0.0};
-        std::atomic<double> mma_bound{0.0};
+        std::atomic<double> epigraph_bound{0.0};
         OptimizerPerformance performance_data;
 };
 

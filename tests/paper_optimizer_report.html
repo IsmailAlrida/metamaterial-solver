@@ -51,7 +51,7 @@
 <body>
   <header>
     <h1>2D Vibroacoustic Topology Optimization</h1>
-    <p>Real MFEM forward solve · fully discrete adjoint · ParOpt MMA</p>
+    <p>Real MFEM forward solve · fully discrete adjoint · Ipopt</p>
     <div class="toolbar">
       <input id="file" type="file" accept="application/json,.json">
       <span id="status">Loading the default quick result…</span>
@@ -361,7 +361,7 @@
       comparisonRow('Mesh elements ny', reference.settings.ny, data.settings.ny, integer);
       comparisonRow('Duration [s]', reference.settings.duration_s, data.settings.duration_s);
       comparisonRow('Time step [s]', reference.settings.dt_s, data.settings.dt_s);
-      comparisonRow('MMA iterations', reference.settings.maximum_iterations,
+      comparisonRow('Optimizer iterations', reference.settings.maximum_iterations,
         data.settings.maximum_iterations, integer);
       comparisonRow('Final pass objective Φ₁', reference.objectives.final_pass,
         data.objectives.final_pass);
@@ -384,7 +384,12 @@
       const rows = [
         ['Complete optimization', data.runtime.optimizer_wall_seconds],
         ['Initial empty + designed forward pair', data.runtime.initial_reference_and_design_seconds],
-        ['Mean completed MMA iteration', data.runtime.average_iteration_seconds]
+        ['Mean completed optimizer iteration', data.runtime.average_iteration_seconds],
+        [`Forward callbacks (${data.runtime.optimizer_phases?.forward_callbacks ?? 0})`,
+          data.runtime.optimizer_phases?.forward_callback_seconds],
+        [`Gradient callbacks (${data.runtime.optimizer_phases?.gradient_callbacks ?? 0})`,
+          data.runtime.optimizer_phases?.gradient_callback_seconds],
+        ['Ipopt bookkeeping', data.runtime.optimizer_phases?.optimizer_bookkeeping_seconds]
       ];
       for (const [label, implementation] of rows) {
         const row = document.createElement('tr');

@@ -206,6 +206,123 @@ Warnings:
 - physical model caveat: the rear plate constrains the extrusion in a way the
   present 2D structural model does not explicitly resolve.
 
+## Manufacturing-aware optimization
+
+Recorded: 2026-09-03 09:51:46 +04:00 (Asia/Dubai)
+
+Treat four requirements separately. They are not interchangeable:
+
+1. minimum solid member thickness;
+2. minimum void/channel width;
+3. solid attachment to declared duct walls (no free islands);
+4. build-direction overhang/support rules.
+
+Do not constrain connected-component bounding boxes or component diameters.
+Those quantities are discontinuous when topology changes, awkward for Ipopt,
+and allow a long but unprintably thin member to pass. A component-size rule
+also says nothing about whether that component is attached.
+
+The existing Helmholtz/PDE filter remains the regularizer, but increasing its
+radius alone is not a length-scale guarantee. A smooth filtered field can still
+cross zero twice over a small distance. Add differentiable geometric
+constraints on top of the existing filter, following Zhou et al. rather than
+replacing the CutFEM material model.
+
+For the current mapping, let
+
+```text
+q_i = 1/2 + filtered_center_i / level_set_scale
+rho_i = H_beta(q_i; eta_i),   eta_i = 1/2
+```
+
+where `q` is the normalized cell-centred field already computed by
+`Solver::smooth_level_set` and `H_beta` is used only as a smooth phase indicator
+for manufacturing constraints. The simulated geometry remains the sharp Q1
+zero contour `phi == 0`.
+
+Use the two geometric constraints from the three-field formulation:
+
+```text
+I_s = rho       exp(-c |grad q|^2)
+I_v = (1 - rho) exp(-c |grad q|^2)
+
+g_s = mean(I_s [min(q - eta_e, 0)]^2) <= epsilon_s
+g_v = mean(I_v [min(eta_d - q, 0)]^2) <= epsilon_v
+```
+
+`g_s` suppresses undersized solid members and `g_v` suppresses undersized voids.
+The effective physical sizes depend jointly on filter radius and the threshold
+interval `(eta_d, eta_e)`. The published calibration is for a linear hat
+filter, while this repository uses a Helmholtz finite-volume filter. Therefore
+the UI must not label `filterRadius` as a guaranteed wall thickness. Calibrate
+the mapping in metres with deterministic bar, ligament, hole, and slot cases,
+and have the final contour validator measure it independently.
+
+For attachment, define exactly what "connected" means: every solid component
+must have a load path to a chosen anchor boundary `Gamma_anchor`, normally the
+duct ceiling/floor or another manufactured wall. Use one auxiliary virtual
+temperature problem over a smooth phase indicator:
+
+```text
+-div(k(rho) grad T) = q0 rho
+T = 0 on Gamma_anchor;  n.grad(T) = 0 elsewhere
+k(rho) = k_void + (k_solid - k_void) rho^p
+g_conn = KS(T / T_max - 1) <= 0
+```
+
+Connected solid conducts its virtual heat to the anchor. An isolated island, or
+an impractically weak neck, becomes hot and violates the constraint. This adds
+one scalar sparse solve and one self-adjoint sensitivity solve per design
+evaluation. The same construction with solid/void roles reversed and the
+inlet/outlet as sinks can later enforce an open air path if a product variant
+requires it.
+
+At finite conductivity contrast and finite KS sharpness, virtual temperature is
+a differentiable optimization surrogate, not a Boolean proof. The faithful
+manufacturing gate must also inspect the extracted 2D components *before* union
+with the tray and require every component to touch an allowed anchor. Otherwise
+export fails. A separate explicit `tray-supported` product mode may join those
+components to a rear plate, but its report must state that the mount was not in
+the simulated model until mounted physics is implemented.
+
+The rear tray plate is not a substitute for a solver constraint when acoustic
+fidelity matters. It makes every extrusion printable, but it also mechanically
+supports/clamps resonators in a way the present 2D model does not contain. A
+floating resonator must either acquire printable ligaments inside the optimized
+2D geometry or its real mounting plate/rods must be included in the physical
+model. The exporter must not silently invent supports and still claim the
+original response.
+
+Keep the robust eroded/nominal/dilated formulation as an optional later mode for
+performance under manufacturing variation. It requires multiple full
+vibroacoustic forward/adjoint analyses per iteration and is not needed merely
+to enforce member/gap size. Also, `phi` is not maintained as a signed-distance
+field, so `phi +/- delta` must not be presented as an exact offset in metres.
+
+Repository integration sequence:
+
+1. retain/expose the normalized filtered cell field and its spatial gradient;
+2. add `g_s` and `g_v` to the existing Ipopt constraint vector, mapping their
+   derivatives through the existing transpose node/cell and filter chain;
+3. add finite-difference gradient checks plus canonical minimum-thickness and
+   minimum-gap fixtures;
+4. enable the geometric constraints after a short unconstrained topology
+   warm-up and continue the projection sharpness, since imposing them on the
+   initial grey field can trap a poor local minimum;
+5. add the virtual-temperature attachment constraint and anchored/island
+   fixtures;
+6. expose requested solid thickness, gap width, anchor selection, and measured
+   export values in millimetres; keep numerical threshold/tolerance parameters
+   in an advanced panel;
+7. for the current constant 2D extrusion printed flat, defer overhang
+   optimization: every vertical extrusion is self-supporting and the lid is a
+   separate part. Revisit layer-wise overhang filtering only for native 3D or
+   non-constant-depth designs.
+
+Primary references: [geometric minimum-length constraints](https://doi.org/10.1016/j.cma.2015.05.003),
+[robust projection formulation](https://doi.org/10.1007/s00158-010-0602-y), and
+[virtual-temperature connectivity](https://doi.org/10.1007/s00158-016-1459-5).
+
 ## Tests before UI
 
 Add one focused manufacturing check executable covering:
@@ -278,3 +395,8 @@ GLVis blocks part coloring, transparency, or dependable camera behavior.
   solver, and renderer review recorded. Selected adaptive Q1 contouring plus
   Manifold extrusion/Boolean and a two-part tray assembly. Deferred B-Rep until
   STEP is a real output requirement.
+- 2026-09-03 09:51:46 +04:00: Separated minimum member, minimum gap,
+  attachment, and overhang requirements. Selected filter-plus-geometric
+  constraints for solid/void length scale and a virtual-temperature constraint
+  for wall attachment. Rejected component bounding boxes and filter radius
+  alone. Deferred robust multi-realization physics and 3D overhang filtering.

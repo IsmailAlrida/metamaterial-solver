@@ -10,7 +10,9 @@
 #include <string>
 #include <utility>
 
+#if METAMATERIAL_USE_MPI
 #include "mpi.h"
+#endif
 
 #include "exporter.hpp"
 #include "global_types.hpp"
@@ -37,7 +39,7 @@ void request_shutdown(int)
 
     We need to put the white noise and FFT calculator in the solver
 
-    Then we need to implement the MMA optimizer algorithm
+    Then we need to implement the optimizer algorithm
 
     Then an exporter algorihtm to make the mesh (marching cubes?)
 
@@ -60,26 +62,16 @@ void request_shutdown(int)
 int main(int argc, char** argv)
 {
     std::signal(SIGINT, request_shutdown);
-    int provided_thread_level = 0;
 #if METAMATERIAL_USE_MPI
+    int provided_thread_level = 0;
     mfem::Mpi::Init(
         argc, argv, MPI_THREAD_SERIALIZED, &provided_thread_level);
     mfem::Hypre::Init();
-#else
-    if (MPI_Init_thread(
-            &argc, &argv, MPI_THREAD_SERIALIZED, &provided_thread_level)
-            != MPI_SUCCESS) {
-        std::cerr << "Could not initialize MPI for ParOpt.\n";
-        return 1;
-    }
-#endif
     if (provided_thread_level < MPI_THREAD_SERIALIZED) {
         std::cerr << "The MPI runtime does not support the optimizer worker thread.\n";
-#if !METAMATERIAL_USE_MPI
-        MPI_Finalize();
-#endif
         return 1;
     }
+#endif
     int rank = 0;
 #if METAMATERIAL_USE_MPI
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -181,8 +173,5 @@ int main(int argc, char** argv)
                   << rank << ".\n";
         exit_code = 1;
     }
-#if !METAMATERIAL_USE_MPI
-    MPI_Finalize();
-#endif
     return exit_code;
 }

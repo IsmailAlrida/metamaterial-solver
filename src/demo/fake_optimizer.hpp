@@ -39,7 +39,7 @@ class FakeOptimizer {
             status.store(OptimizerStatus::Working);
             passObjective.store(0.0);
             stopObjective.store(0.0);
-            mmaBound.store(0.0);
+            epigraphBound.store(0.0);
 
             try {
                 if (cancelRequested.load()) {
@@ -59,7 +59,7 @@ class FakeOptimizer {
                 }
                 passObjective.store(10.0);
                 stopObjective.store(14.0);
-                mmaBound.store(14.0);
+                epigraphBound.store(14.0);
 
                 const int maximumIterations = std::max(settings.maxIterations, 1);
 
@@ -109,7 +109,7 @@ class FakeOptimizer {
             const double progress = static_cast<double>(iteration.load() + 1);
             passObjective.store(10.0 / (1.0 + progress));
             stopObjective.store(14.0 / (1.0 + progress));
-            mmaBound.store(std::max(passObjective.load(), stopObjective.load()));
+            epigraphBound.store(std::max(passObjective.load(), stopObjective.load()));
             log(LogLevel::Message,
                 "Demo optimizer updated the shared level-set design.");
         }
@@ -157,9 +157,9 @@ class FakeOptimizer {
             return stopObjective.load();
         }
 
-        double get_mma_bound() const
+        double get_epigraph_bound() const
         {
-            return mmaBound.load();
+            return epigraphBound.load();
         }
 
     private:
@@ -178,7 +178,7 @@ class FakeOptimizer {
         std::atomic<int> iteration{0};
         std::atomic<double> passObjective{0.0};
         std::atomic<double> stopObjective{0.0};
-        std::atomic<double> mmaBound{0.0};
+        std::atomic<double> epigraphBound{0.0};
 };
 
 } // namespace App::Demo

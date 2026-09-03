@@ -24,10 +24,10 @@ class FakeExporter {
                            int iteration,
                            double pass,
                            double stop,
-                           double mmaBound)
+                           double epigraphBound)
         {
             return exporter.exportRunData(
-                directory, status, iteration, pass, stop, mmaBound);
+                directory, status, iteration, pass, stop, epigraphBound);
         }
 
         bool exportMesh()

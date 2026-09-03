@@ -318,10 +318,8 @@ bool App::loadAppSettings(AppSettings& settings,
         READ_OPTIMIZER(attenuationMaxDb);
         READ_OPTIMIZER(frequencySamples);
         READ_OPTIMIZER(maxIterations);
-        READ_OPTIMIZER(mmaInitialAsymptote);
-        READ_OPTIMIZER(mmaDecreaseAsymptote);
-        READ_OPTIMIZER(mmaIncreaseAsymptote);
-        READ_OPTIMIZER(mmaConstraintPenalty);
+        READ_OPTIMIZER(convergenceTolerance);
+        READ_OPTIMIZER(acceptableTolerance);
 #undef READ_OPTIMIZER
         if (!readBool(*object, "displayTargetInDb",
                       optimizer.displayTargetInDb, error)) {
@@ -499,10 +497,8 @@ bool App::saveAppSettings(const AppSettings& settings,
     WRITE_OPTIMIZER(attenuationMaxDb);
     WRITE_OPTIMIZER(frequencySamples);
     WRITE_OPTIMIZER(maxIterations);
-    WRITE_OPTIMIZER(mmaInitialAsymptote);
-    WRITE_OPTIMIZER(mmaDecreaseAsymptote);
-    WRITE_OPTIMIZER(mmaIncreaseAsymptote);
-    WRITE_OPTIMIZER(mmaConstraintPenalty);
+    WRITE_OPTIMIZER(convergenceTolerance);
+    WRITE_OPTIMIZER(acceptableTolerance);
 #undef WRITE_OPTIMIZER
     optimizer_object["displayTargetInDb"] =
         picojson::value(optimizer.displayTargetInDb);
