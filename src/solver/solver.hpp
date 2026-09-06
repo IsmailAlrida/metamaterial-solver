@@ -44,9 +44,8 @@ namespace App {
         int differentiatedDofs = 0;
     };
 
-    // The optimizer needs only the forward/adjoint contract. Keeping this
-    // seam here lets its CTest suite use deterministic curated physics while
-    // the application continues to pass the real Solver by reference.
+    // The optimizer depends only on this forward/adjoint contract, allowing
+    // its deterministic suite to exercise the production optimization loop.
     class ForwardSolver {
     public:
         virtual ~ForwardSolver() = default;

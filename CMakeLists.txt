@@ -306,10 +306,11 @@ endif()
 set_target_properties(metis PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON)
 
 # ParOpt is source-only upstream, so expose only its C++ core as a static target.
+set(_paropt_revision eae156b756e517fb7fd4a5abb9a203050357b815)
 FetchContent_Declare(
   paropt
   GIT_REPOSITORY https://github.com/smdogroup/paropt.git
-  GIT_TAG        v2.1.5
+  GIT_TAG        ${_paropt_revision}
   SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/paropt-src"
   SOURCE_SUBDIR  _source-only
 )
@@ -352,6 +353,15 @@ if(MSVC)
       "min2=paropt_interior_min2;max2=paropt_interior_max2"
   )
 endif()
+
+# The application owns its MMA variant as normal source. Upstream ParOpt stays
+# pristine while the epigraph handling and termination contract remain easy to
+# edit, review, and test in this repository.
+add_library(metamaterial_epigraph_mma STATIC src/optimizer/EpigraphMMA.cpp)
+target_include_directories(metamaterial_epigraph_mma PUBLIC
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/optimizer"
+)
+target_link_libraries(metamaterial_epigraph_mma PUBLIC ParOpt::paropt)
 
 # 9. Fetch MFEM's CutFEM dependencies
 FetchContent_Declare(
@@ -522,6 +532,7 @@ set(_glvis_compile_opts
 )
 set(_glvis_include_dirs
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/renderer"
   "${GLVIS_SOURCE_DIR}/lib"
 )
 set(_glvis_libraries
@@ -558,17 +569,21 @@ file(READ "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Metamaterial.m"
   METAMATERIAL_MATLAB_TEMPLATE)
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
 configure_file(
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/export_templates.hpp.in"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/exporter/export_templates.hpp.in"
   "${CMAKE_CURRENT_BINARY_DIR}/generated/export_templates.hpp"
   @ONLY
 )
 
-file(GLOB sources "src/*.cpp")
-list(REMOVE_ITEM sources "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
-if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
-  file(GLOB cuda_sources "src/*.cu")
-  list(APPEND sources ${cuda_sources})
-endif()
+set(sources
+  src/dispatcher/dispatcher.cpp
+  src/exporter/exporter.cpp
+  src/optimizer/optimizer.cpp
+  src/renderer/glvis_adapter.cpp
+  src/renderer/renderer.cpp
+  src/solver/par_solver.cpp
+  src/solver/solver.cpp
+  src/types/settings.cpp
+)
 
 add_library(metamaterial_imgui STATIC
     ${IMGUI_DIR}/backends/imgui_impl_sdl2.cpp
@@ -603,6 +618,12 @@ message(STATUS "Interactive demo mode: ${METAMATERIAL_DEMO_MODE}")
 # Target-specific paths
 target_include_directories(metamaterial_core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/dispatcher"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/exporter"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/optimizer"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/renderer"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/solver"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/types"
     "${fftw_SOURCE_DIR}/api"
     "${assimp_SOURCE_DIR}/contrib/zip/src"
     "${CMAKE_CURRENT_BINARY_DIR}/generated"
@@ -616,7 +637,7 @@ target_link_libraries(metamaterial_core PUBLIC
     assimp
     Eigen3::Eigen
     fftw3
-    ParOpt::paropt
+    metamaterial_epigraph_mma
     mfem         # Enforces direct linkage to the compiled MFEM static library
     glvis
 )
@@ -644,17 +665,19 @@ add_executable(dispatcher_backend_check
     tests/dispatcher_backend_check.cpp
 )
 target_include_directories(dispatcher_backend_check PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/dispatcher"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/renderer"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/types"
 )
 target_link_libraries(dispatcher_backend_check PRIVATE mfem)
 add_test(NAME dispatcher_backend COMMAND dispatcher_backend_check)
 
 add_executable(settings_persistence_check
     tests/settings_persistence_check.cpp
-    src/settings.cpp
+    src/types/settings.cpp
 )
 target_include_directories(settings_persistence_check PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/types"
 )
 target_link_libraries(settings_persistence_check PRIVATE mfem)
 add_test(NAME settings_persistence COMMAND settings_persistence_check)

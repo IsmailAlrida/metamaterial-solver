@@ -13,7 +13,7 @@
 #include <string>
 #include <utility>
 
-#include "ParOptOptimizer.h"
+#include "EpigraphMMA.hpp"
 
 namespace App {
 
@@ -21,219 +21,6 @@ namespace {
 
 struct OptimizationCancelled {
 };
-
-// ParOpt's MMA implementation exposes its subproblem through ParOptProblem's
-// virtual methods. Preserve the base MMA approximation for geometry while the
-// epigraph variable remains exactly linear and free of geometry move limits.
-class EpigraphMMA final : public ::ParOptMMA {
-public:
-    EpigraphMMA(
-        ::ParOptProblem* problem,
-        ::ParOptOptions* options,
-        int epigraph_index)
-        : ::ParOptMMA(problem, options),
-          epigraph_index(epigraph_index)
-    {
-        int variables = 0;
-        int constraints = 0;
-        int sparse_constraints = 0;
-        problem->getProblemSizes(
-            &variables, &constraints, &sparse_constraints);
-        if (epigraph_index < 0 || epigraph_index >= variables) {
-            throw std::out_of_range("The MMA epigraph index is invalid.");
-        }
-        centered_constraints.resize(constraints);
-        centered = createDesignVec();
-        centered->incref();
-    }
-
-    ~EpigraphMMA() override
-    {
-        centered->decref();
-    }
-
-    void getVarsAndBounds(
-        ::ParOptVec* variables,
-        ::ParOptVec* lower_bounds,
-        ::ParOptVec* upper_bounds) override
-    {
-        ::ParOptMMA::getVarsAndBounds(
-            variables, lower_bounds, upper_bounds);
-        ::ParOptScalar* lower;
-        ::ParOptScalar* upper;
-        lower_bounds->getArray(&lower);
-        upper_bounds->getArray(&upper);
-        lower[epigraph_index] = -1.0e20;
-        upper[epigraph_index] = 1.0e20;
-    }
-
-    int evalObjCon(
-        ::ParOptVec* variables,
-        ::ParOptScalar* objective,
-        ::ParOptScalar* constraints) override
-    {
-        ::ParOptVec* center = nullptr;
-        getOptimizedPoint(&center);
-        ::ParOptScalar* candidate_values;
-        ::ParOptScalar* center_values;
-        variables->getArray(&candidate_values);
-        center->getArray(&center_values);
-        const ::ParOptScalar epigraph_step =
-            candidate_values[epigraph_index]
-            - center_values[epigraph_index];
-
-        freezeEpigraph(variables, center_values[epigraph_index]);
-        ::ParOptScalar centered_objective = 0.0;
-        const int failed = ::ParOptMMA::evalObjCon(
-            centered, &centered_objective,
-            centered_constraints.data());
-        *objective = centered_objective + epigraph_step;
-        for (std::size_t constraint = 0;
-             constraint < centered_constraints.size(); ++constraint) {
-            constraints[constraint] =
-                centered_constraints[constraint] + epigraph_step;
-        }
-        return failed;
-    }
-
-    int evalObjConGradient(
-        ::ParOptVec* variables,
-        ::ParOptVec* objective_gradient,
-        ::ParOptVec** constraint_gradients) override
-    {
-        const int failed = ::ParOptMMA::evalObjConGradient(
-            frozenAtCenter(variables),
-            objective_gradient,
-            constraint_gradients);
-        ::ParOptScalar* gradient;
-        objective_gradient->getArray(&gradient);
-        gradient[epigraph_index] = 1.0;
-        for (std::size_t constraint = 0;
-             constraint < centered_constraints.size(); ++constraint) {
-            constraint_gradients[constraint]->getArray(&gradient);
-            gradient[epigraph_index] = 1.0;
-        }
-        return failed;
-    }
-
-    int evalHvecProduct(
-        ::ParOptVec* variables,
-        ::ParOptScalar* multipliers,
-        ::ParOptVec* sparse_multipliers,
-        ::ParOptVec* direction,
-        ::ParOptVec* product) override
-    {
-        const int failed = ::ParOptMMA::evalHvecProduct(
-            frozenAtCenter(variables), multipliers,
-            sparse_multipliers, direction, product);
-        ::ParOptScalar* values;
-        product->getArray(&values);
-        values[epigraph_index] = 0.0;
-        return failed;
-    }
-
-    int evalHessianDiag(
-        ::ParOptVec* variables,
-        ::ParOptScalar* multipliers,
-        ::ParOptVec* sparse_multipliers,
-        ::ParOptVec* diagonal) override
-    {
-        const int failed = ::ParOptMMA::evalHessianDiag(
-            frozenAtCenter(variables), multipliers,
-            sparse_multipliers, diagonal);
-        ::ParOptScalar* values;
-        diagonal->getArray(&values);
-        values[epigraph_index] = 0.0;
-        return failed;
-    }
-
-private:
-    void freezeEpigraph(
-        ::ParOptVec* variables,
-        ::ParOptScalar center_value)
-    {
-        centered->copyValues(variables);
-        ::ParOptScalar* values;
-        centered->getArray(&values);
-        values[epigraph_index] = center_value;
-    }
-
-    ::ParOptVec* frozenAtCenter(::ParOptVec* variables)
-    {
-        ::ParOptVec* center = nullptr;
-        getOptimizedPoint(&center);
-        ::ParOptScalar* center_values;
-        center->getArray(&center_values);
-        freezeEpigraph(variables, center_values[epigraph_index]);
-        return centered;
-    }
-
-    int epigraph_index;
-    ::ParOptVec* centered = nullptr;
-    std::vector<::ParOptScalar> centered_constraints;
-};
-
-struct MMAResult {
-    bool converged = false;
-    int iterations = 0;
-    double l1 = std::numeric_limits<double>::infinity();
-    double linfinity = std::numeric_limits<double>::infinity();
-    double infeasibility = std::numeric_limits<double>::infinity();
-};
-
-MMAResult runMMA(
-    ::ParOptMMA& mma,
-    ::ParOptInteriorPoint& interior_point,
-    ::ParOptOptions& options)
-{
-    MMAResult result;
-    const int maximum_iterations =
-        options.getIntOption("mma_max_iterations");
-    const double l1_tolerance =
-        options.getFloatOption("mma_l1_tol");
-    const double linfinity_tolerance =
-        options.getFloatOption("mma_linfty_tol");
-    const double infeasibility_tolerance =
-        options.getFloatOption("mma_infeas_tol");
-
-    if (mma.initializeSubProblem(nullptr) != 0) {
-        throw std::runtime_error(
-            "ParOpt could not initialize the first MMA subproblem.");
-    }
-    interior_point.resetDesignAndBounds();
-    for (int iteration = 0;
-         iteration < maximum_iterations; ++iteration) {
-        if (interior_point.optimize() != 0) {
-            throw std::runtime_error(
-                "ParOpt's interior-point MMA subproblem failed.");
-        }
-
-        ::ParOptVec* variables = nullptr;
-        ::ParOptVec* sparse_lower = nullptr;
-        ::ParOptVec* lower = nullptr;
-        ::ParOptVec* upper = nullptr;
-        ::ParOptScalar* dense = nullptr;
-        interior_point.getOptimizedPoint(
-            &variables, &dense, &sparse_lower, &lower, &upper);
-        mma.setMultipliers(dense, sparse_lower, lower, upper);
-        if (mma.initializeSubProblem(variables) != 0) {
-            throw std::runtime_error(
-                "ParOpt could not update the MMA subproblem.");
-        }
-        interior_point.resetDesignAndBounds();
-
-        result.iterations = iteration + 1;
-        mma.computeKKTError(
-            &result.l1, &result.linfinity, &result.infeasibility);
-        if (result.infeasibility < infeasibility_tolerance
-            && (result.l1 < l1_tolerance
-                || result.linfinity < linfinity_tolerance)) {
-            result.converged = true;
-            break;
-        }
-    }
-    return result;
-}
 
 } // namespace
 
@@ -301,10 +88,11 @@ public:
             upper[design] = 1.0;
         }
 
-        // The constraints bound z from below. Keep its box effectively open,
-        // matching the paper instead of imposing an extra optimization rule.
+        // Phi_pass and Phi_stop are nonnegative, so z cannot be negative at a
+        // feasible point. The explicit lower bound also supplies the barrier
+        // curvature needed by ParOpt's exact-linear z subproblem.
         x[active_design_size] = initial_bound;
-        lower[active_design_size] = -1.0e20;
+        lower[active_design_size] = 0.0;
         upper[active_design_size] = 1.0e20;
     }
 
@@ -813,19 +601,22 @@ bool Optimizer::optimize()
         std::unique_ptr<ParOptOptions, decltype(release)> options(
             new ParOptOptions(MPI_COMM_SELF), release);
         options->incref();
-        ParOptOptimizer::addDefaultOptions(options.get());
+        ParOptInteriorPoint::addDefaultOptions(options.get());
+        EpigraphMMA::addDefaultOptions(options.get());
         int option_error = 0;
-        option_error |= options->setOption("algorithm", "mma");
         option_error |= options->setOption("output_file", "");
         option_error |= options->setOption("mma_output_file", "");
         option_error |= options->setOption(
             "mma_max_iterations", settings.maxIterations);
+        option_error |= options->setOption("mma_fixed_iterations", 1);
         option_error |= options->setOption(
             "mma_init_asymptote_offset", settings.mmaInitialAsymptote);
         option_error |= options->setOption(
             "mma_asymptote_contract", settings.mmaDecreaseAsymptote);
         option_error |= options->setOption(
             "mma_asymptote_relax", settings.mmaIncreaseAsymptote);
+        // ParOpt defines penalty_gamma as the L1 penalty on inequality
+        // slacks, which is the paper's MMA constraint penalty c_i.
         option_error |= options->setOption(
             "penalty_gamma", settings.mmaConstraintPenalty);
         option_error |= options->setOption(
@@ -847,11 +638,11 @@ bool Optimizer::optimize()
         }
 
         std::unique_ptr<EpigraphMMA, decltype(release)> mma(
-            new EpigraphMMA(
-                problem.get(), options.get(),
-                geometry.activeDesignDofs.Size()),
-            release);
+            new EpigraphMMA(problem.get(), options.get()), release);
         mma->incref();
+        if (mma->setLinearVariable(geometry.activeDesignDofs.Size()) != 0) {
+            throw std::runtime_error("The MMA epigraph index is invalid.");
+        }
         std::unique_ptr<ParOptInteriorPoint, decltype(release)> interior_point(
             new ParOptInteriorPoint(mma.get(), options.get()), release);
         interior_point->incref();
@@ -862,11 +653,24 @@ bool Optimizer::optimize()
                 + std::to_string(settings.maxIterations)
                 + " requested iterations.");
         const auto paropt_started_at = std::chrono::steady_clock::now();
-        const MMAResult mma_result = runMMA(
-            *mma, *interior_point, *options);
+        mma->optimize(interior_point.get());
         performance_data.paroptSeconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - paropt_started_at).count();
         check_cancelled();
+
+        const EpigraphMMA::TerminationReason termination =
+            mma->getTerminationReason();
+        if (termination == EpigraphMMA::INITIALIZATION_FAILED) {
+            throw std::runtime_error(
+                "ParOpt could not initialize an MMA subproblem.");
+        }
+        if (termination == EpigraphMMA::SUBPROBLEM_FAILED) {
+            throw std::runtime_error(
+                "ParOpt's interior-point MMA subproblem failed.");
+        }
+        if (termination == EpigraphMMA::NOT_STARTED) {
+            throw std::runtime_error("ParOpt MMA did not start.");
+        }
 
         if (cancel_requested.load()) {
             status.store(OptimizerStatus::Cancelled);
@@ -881,19 +685,24 @@ bool Optimizer::optimize()
                 "ParOpt returned a design that has not completed its forward analysis.");
         }
 
-        iteration.store(mma_result.iterations);
-        status.store(mma_result.converged
+        const int completed_iterations = mma->getIterationCount();
+        double l1 = 0.0;
+        double linfinity = 0.0;
+        double infeasibility = 0.0;
+        mma->getLastKKTError(&l1, &linfinity, &infeasibility);
+        iteration.store(completed_iterations);
+        status.store(termination == EpigraphMMA::CONVERGED
             ? OptimizerStatus::Converged
             : OptimizerStatus::MaximumIterations);
         log(LogLevel::Message,
-            std::string(mma_result.converged
+            std::string(termination == EpigraphMMA::CONVERGED
                 ? "ParOpt converged after "
                 : "ParOpt reached the requested limit of ")
-                + std::to_string(mma_result.iterations)
+                + std::to_string(completed_iterations)
                 + " MMA iterations; KKT l1/linfinity/infeasibility = "
-                + std::to_string(mma_result.l1) + " / "
-                + std::to_string(mma_result.linfinity) + " / "
-                + std::to_string(mma_result.infeasibility) + ".");
+                + std::to_string(l1) + " / "
+                + std::to_string(linfinity) + " / "
+                + std::to_string(infeasibility) + ".");
         return true;
     }
     catch (const OptimizationCancelled&) {
