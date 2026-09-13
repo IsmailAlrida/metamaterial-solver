@@ -51,6 +51,7 @@ int main()
     assert(loaded.optSettings.freeformObjective.frequencyHz.size() == 2);
     assert(loaded.optSettings.freeformObjective.targetTransmission[1] == 0.01);
     assert(loaded.uiSettings.plotXMinHz == 55.0);
+    assert(loaded.uiSettings.plotYMinDb == -240.0);
 
     std::filesystem::remove_all(directory);
 }

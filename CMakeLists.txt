@@ -150,8 +150,8 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(fftw)
 
-# 7. Fetch ParOpt and its METIS dependency. ParOpt requires a system MPI SDK
-# even when MFEM itself is serial; setup.bat installs MS-MPI and oneMKL.
+# 7. Configure MPI and the linear-algebra libraries used by the solver and
+# ParOpt. ParOpt uses MPI_COMM_SELF even when MFEM itself is serial.
 if(WIN32)
   set(_msmpi_sdk "$ENV{SystemDrive}/Program Files (x86)/Microsoft SDKs/MPI")
   if(NOT EXISTS "$ENV{MSMPI_INC}/mpi.h" AND
@@ -305,7 +305,6 @@ if(MSVC)
 endif()
 set_target_properties(metis PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON)
 
-# ParOpt is source-only upstream, so expose only its C++ core as a static target.
 set(_paropt_revision eae156b756e517fb7fd4a5abb9a203050357b815)
 FetchContent_Declare(
   paropt
@@ -316,6 +315,8 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(paropt)
 
+# Build the pinned upstream ParOpt MMA unchanged. The application-side driver
+# corrects only the released computeKKTError argument-order bug.
 add_library(paropt STATIC
   "${paropt_SOURCE_DIR}/src/ParOptOptions.cpp"
   "${paropt_SOURCE_DIR}/src/ParOptInteriorPoint.cpp"
@@ -344,9 +345,6 @@ target_link_libraries(paropt PUBLIC
 )
 if(MSVC)
   target_compile_definitions(paropt PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
-  # ParOptInteriorPoint.cpp gives min2/max2 external linkage while three
-  # other translation units define the same inline helpers. Keep the fetched
-  # source untouched and give only the strong MSVC definitions local names.
   set_source_files_properties(
     "${paropt_SOURCE_DIR}/src/ParOptInteriorPoint.cpp"
     PROPERTIES COMPILE_DEFINITIONS
@@ -354,16 +352,7 @@ if(MSVC)
   )
 endif()
 
-# The application owns its MMA variant as normal source. Upstream ParOpt stays
-# pristine while the epigraph handling and termination contract remain easy to
-# edit, review, and test in this repository.
-add_library(metamaterial_epigraph_mma STATIC src/optimizer/EpigraphMMA.cpp)
-target_include_directories(metamaterial_epigraph_mma PUBLIC
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/optimizer"
-)
-target_link_libraries(metamaterial_epigraph_mma PUBLIC ParOpt::paropt)
-
-# 9. Fetch MFEM's CutFEM dependencies
+# 8. Fetch MFEM's CutFEM dependencies
 FetchContent_Declare(
   blitz
   GIT_REPOSITORY https://github.com/blitzpp/blitz.git
@@ -443,7 +432,7 @@ if(METAMATERIAL_USE_MPI)
   set(HYPRE_LIBRARIES HYPRE CACHE STRING "" FORCE)
 endif()
 
-# 10. Fetch MFEM (Finite Element Method Library)
+# 9. Fetch MFEM (Finite Element Method Library)
 set(MFEM_USE_MPI ${METAMATERIAL_USE_MPI} CACHE BOOL "" FORCE)
 set(MFEM_FETCH_TPLS OFF CACHE BOOL "" FORCE)
 set(MFEM_USE_METIS OFF CACHE BOOL "" FORCE)
@@ -637,7 +626,7 @@ target_link_libraries(metamaterial_core PUBLIC
     assimp
     Eigen3::Eigen
     fftw3
-    metamaterial_epigraph_mma
+    ParOpt::paropt
     mfem         # Enforces direct linkage to the compiled MFEM static library
     glvis
 )
@@ -693,13 +682,17 @@ target_link_libraries(optimizer_test_suite PRIVATE metamaterial_core)
 add_test(NAME optimizer_suite COMMAND optimizer_test_suite)
 
 add_executable(solver_test_suite tests/SolverTestSuite.cpp)
-target_link_libraries(solver_test_suite PRIVATE metamaterial_core)
+target_link_libraries(solver_test_suite PRIVATE
+    metamaterial_core
+    MPI::MPI_CXX
+)
 
 add_executable(paper_optimizer_miniapp
     tests/paper_optimizer_miniapp.cpp
 )
 target_link_libraries(paper_optimizer_miniapp PRIVATE
     metamaterial_core
+    MPI::MPI_CXX
 )
 if(METAMATERIAL_USE_MPI)
   set(_solver_rank_reference

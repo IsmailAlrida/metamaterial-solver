@@ -2,15 +2,32 @@
 
 #include <atomic>
 #include <complex>
+#include <string>
 #include <vector>
 #include "global_types.hpp"
 #include "logging.hpp"
 #include "solver.hpp"
 
+class ParOptInteriorPoint;
+class ParOptMMA;
+
 namespace App {
 
+struct ParOptMmaResult {
+    int completedIterations = 0;
+    double l1 = 0.0;
+    double linfinity = 0.0;
+    double infeasibility = 0.0;
+    bool converged = false;
+    std::string error;
+};
+
+ParOptMmaResult runParOptMma(
+    ParOptMMA& mma,
+    ParOptInteriorPoint& optimizer);
+
 struct OptimizerPerformance {
-    double paroptSeconds = 0.0;
+    double mmaSeconds = 0.0;
     double forwardCallbackSeconds = 0.0;
     double gradientCallbackSeconds = 0.0;
 };

@@ -143,13 +143,14 @@ test.bat all
 test.bat parallel-cpu debug
 ```
 
-The optimizer miniapp uses FGMRES by default. `--paper` runs the paper's
-low-pass case, `--high-pass` runs its successful 1000--2500 Hz stop-band case,
-`--high-pass-20db` targets 20 dB attenuation from 60--1000 Hz, `--iterations`
-sets the iteration count, and `--mumps` selects the direct solver:
+The optimizer miniapp uses FGMRES by default. The paper-configuration baseline
+is `--paper --mumps`; `--paper` without `--mumps` is the corresponding FGMRES
+variant. `--high-pass` runs the paper's successful 1000--2500 Hz stop-band case,
+`--high-pass-20db` targets 20 dB attenuation from 60--1000 Hz, and `--iterations`
+sets the iteration count:
 
 ```bat
-mpiexec -n 2 build\parallel-cpu\paper_optimizer_miniapp.exe --paper
+mpiexec -n 2 build\parallel-cpu\paper_optimizer_miniapp.exe --paper --mumps
 mpiexec -n 2 build\parallel-cpu\paper_optimizer_miniapp.exe --high-pass
 mpiexec -n 2 build\parallel-cpu\paper_optimizer_miniapp.exe --high-pass-20db --iterations 50
 mpiexec -n 2 build\parallel-cpu\paper_optimizer_miniapp.exe --high-pass --mumps

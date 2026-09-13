@@ -7,6 +7,7 @@
 #include <cmath>
 #include <complex>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -14,6 +15,10 @@
 
 #include <mpi.h>
 
+#include "ParOptInteriorPoint.h"
+#include "ParOptMMA.h"
+#include "ParOptOptions.h"
+#include "ParOptProblem.h"
 #include "optimizer.hpp"
 
 namespace {
@@ -54,6 +59,207 @@ struct CaseResult {
     bool logged_error = false;
     std::string error;
 };
+
+enum class AnalyticProblem {
+    symmetric_minimax,
+    opening_direction,
+    upper_bound_escape,
+    flat_response,
+    evaluation_failure
+};
+
+class AnalyticParOptProblem final : public ParOptProblem {
+public:
+    AnalyticParOptProblem(
+        AnalyticProblem problem,
+        double initial_design,
+        double objective_magnitude)
+        : ParOptProblem(MPI_COMM_SELF),
+          problem(problem),
+          initial_design(initial_design),
+          objective_magnitude(objective_magnitude)
+    {
+        constraint_count = problem == AnalyticProblem::symmetric_minimax
+            ? 2 : 1;
+        setProblemSizes(2, constraint_count, 0);
+        setNumInequalities(constraint_count, 0);
+    }
+
+    ParOptQuasiDefMat* createQuasiDefMat() override
+    {
+        return new ParOptQuasiDefBlockMat(this, 0);
+    }
+
+    void getVarsAndBounds(
+        ParOptVec* variables,
+        ParOptVec* lower_bounds,
+        ParOptVec* upper_bounds) override
+    {
+        ParOptScalar* x = nullptr;
+        ParOptScalar* lower = nullptr;
+        ParOptScalar* upper = nullptr;
+        variables->getArray(&x);
+        lower_bounds->getArray(&lower);
+        upper_bounds->getArray(&upper);
+        x[0] = initial_design;
+        x[1] = maximumObjective(initial_design) / objective_magnitude;
+        lower[0] = 0.0;
+        upper[0] = 1.0;
+        lower[1] = 0.0;
+        upper[1] = 1.0e20;
+    }
+
+    int evalObjCon(
+        ParOptVec* variables,
+        ParOptScalar* objective,
+        ParOptScalar* constraints) override
+    {
+        if (problem == AnalyticProblem::evaluation_failure
+            && evaluations++ != 0) {
+            return 1;
+        }
+        ParOptScalar* x = nullptr;
+        variables->getArray(&x);
+        const double design = ParOptRealPart(x[0]);
+        const double bound = ParOptRealPart(x[1]);
+        *objective = bound;
+        std::vector<double> values;
+        objectiveValues(design, values);
+        for (int index = 0; index < constraint_count; ++index) {
+            constraints[index] = bound
+                - values[static_cast<std::size_t>(index)] / objective_magnitude;
+        }
+        return 0;
+    }
+
+    int evalObjConGradient(
+        ParOptVec* variables,
+        ParOptVec* objective_gradient,
+        ParOptVec** constraint_gradients) override
+    {
+        ParOptScalar* x = nullptr;
+        variables->getArray(&x);
+        std::vector<double> gradients;
+        objectiveGradients(ParOptRealPart(x[0]), gradients);
+        objective_gradient->zeroEntries();
+        ParOptScalar* objective_entries = nullptr;
+        objective_gradient->getArray(&objective_entries);
+        objective_entries[1] = 1.0;
+        for (int index = 0; index < constraint_count; ++index) {
+            constraint_gradients[index]->zeroEntries();
+            ParOptScalar* entries = nullptr;
+            constraint_gradients[index]->getArray(&entries);
+            entries[0] = -gradients[static_cast<std::size_t>(index)]
+                / objective_magnitude;
+            entries[1] = 1.0;
+        }
+        return 0;
+    }
+
+    void objectiveValues(double x, std::vector<double>& objectives) const
+    {
+        objectives.assign(static_cast<std::size_t>(constraint_count), 0.0);
+        if (problem == AnalyticProblem::flat_response) {
+            objectives[0] = objective_magnitude;
+        }
+        else if (problem == AnalyticProblem::upper_bound_escape) {
+            objectives[0] = objective_magnitude * x * x;
+        }
+        else {
+            const double difference = 1.0 - x;
+            objectives[0] = objective_magnitude * difference * difference;
+            if (problem == AnalyticProblem::symmetric_minimax) {
+                objectives[1] = objective_magnitude * x * x;
+            }
+        }
+    }
+
+    double maximumObjective(double x) const
+    {
+        std::vector<double> objectives;
+        objectiveValues(x, objectives);
+        return *std::max_element(objectives.begin(), objectives.end());
+    }
+
+private:
+    void objectiveGradients(double x, std::vector<double>& gradients) const
+    {
+        gradients.assign(static_cast<std::size_t>(constraint_count), 0.0);
+        if (problem == AnalyticProblem::upper_bound_escape) {
+            gradients[0] = 2.0 * objective_magnitude * x;
+        }
+        else if (problem != AnalyticProblem::flat_response) {
+            gradients[0] = -2.0 * objective_magnitude * (1.0 - x);
+            if (problem == AnalyticProblem::symmetric_minimax) {
+                gradients[1] = 2.0 * objective_magnitude * x;
+            }
+        }
+    }
+
+    AnalyticProblem problem;
+    double initial_design;
+    double objective_magnitude;
+    int constraint_count = 0;
+    int evaluations = 0;
+};
+
+struct AnalyticResult {
+    App::ParOptMmaResult run;
+    std::vector<double> design;
+    std::vector<double> objectives;
+    double trueBound = 0.0;
+};
+
+AnalyticResult run_analytic_problem(
+    AnalyticProblem analytic_problem,
+    double initial_design,
+    double objective_magnitude = 1.0,
+    int iterations = 80)
+{
+    const auto release = [](auto* object) {
+        if (object != nullptr) {
+            object->decref();
+        }
+    };
+    std::unique_ptr<AnalyticParOptProblem, decltype(release)> problem(
+        new AnalyticParOptProblem(
+            analytic_problem, initial_design, objective_magnitude), release);
+    problem->incref();
+    std::unique_ptr<ParOptOptions, decltype(release)> options(
+        new ParOptOptions(MPI_COMM_SELF), release);
+    options->incref();
+    ParOptInteriorPoint::addDefaultOptions(options.get());
+    ParOptMMA::addDefaultOptions(options.get());
+    options->setOption("output_file", "");
+    options->setOption("mma_output_file", "");
+    options->setOption("mma_max_iterations", iterations);
+    options->setOption("penalty_gamma", 1000.0);
+    options->setOption("max_major_iters", 100);
+    options->setOption("abs_res_tol", 1.0e-10);
+    options->setOption("use_diag_hessian", 1);
+    options->setOption("starting_point_strategy", "affine_step");
+    options->setOption("barrier_strategy", "mehrotra");
+    options->setOption("use_line_search", 0);
+    std::unique_ptr<ParOptMMA, decltype(release)> mma(
+        new ParOptMMA(problem.get(), options.get()), release);
+    mma->incref();
+    std::unique_ptr<ParOptInteriorPoint, decltype(release)> interior_point(
+        new ParOptInteriorPoint(mma.get(), options.get()), release);
+    interior_point->incref();
+
+    AnalyticResult result;
+    result.run = App::runParOptMma(*mma, *interior_point);
+    ParOptVec* optimized = nullptr;
+    mma->getOptimizedPoint(&optimized);
+    if (optimized != nullptr) {
+        ParOptScalar* x = nullptr;
+        optimized->getArray(&x);
+        result.design = {ParOptRealPart(x[0])};
+        problem->objectiveValues(result.design[0], result.objectives);
+        result.trueBound = problem->maximumObjective(result.design[0]);
+    }
+    return result;
+}
 
 class FakeSolver final : public App::ForwardSolver {
 public:
@@ -122,6 +328,10 @@ public:
         mfem::Vector& stop_gradient) override
     {
         ++gradient_calls;
+        if (fail_gradient_call == gradient_calls) {
+            status = App::SolverStatus::Error;
+            return false;
+        }
         if ((!pass_derivative.empty()
                 && pass_derivative.size() != frequencies.size())
             || (!stop_derivative.empty()
@@ -147,6 +357,11 @@ public:
                     std::conj(stop_derivative[bin]) * response_derivative);
             }
         }
+        if (nonfinite_gradient_call == gradient_calls) {
+            mfem::Vector& corrupted = pass_derivative.empty()
+                ? stop_gradient : pass_gradient;
+            corrupted[0] = std::numeric_limits<double>::infinity();
+        }
         return true;
     }
 
@@ -154,6 +369,8 @@ public:
     int assembly_calls = 0;
     int solve_calls = 0;
     int gradient_calls = 0;
+    int fail_gradient_call = 0;
+    int nonfinite_gradient_call = 0;
 
 private:
     App::LevelSet& geometry;
@@ -237,11 +454,12 @@ Objectives objectives(const CaseSpec& test, const std::vector<double>& design)
             + transmission_span * design[bin];
         const double relative_error =
             (transmission - test.target[bin]) / test.target[bin];
+        const double error = relative_error * relative_error;
         if (test.group[bin] == Group::pass) {
-            value.pass += relative_error * relative_error;
+            value.pass += error;
         }
         else {
-            value.stop += relative_error * relative_error;
+            value.stop += error;
         }
         if (test.settings.objectiveMode == App::ObjectiveMode::freeform) {
             ++freeform_bins;
@@ -269,7 +487,9 @@ CaseResult run_case(
     CaseSpec test,
     const std::vector<double>& initial_design,
     double spectrum_scale,
-    int iterations)
+    int iterations,
+    int fail_gradient_call = 0,
+    int nonfinite_gradient_call = 0)
 {
     test.settings.maxIterations = iterations;
     App::LevelSet geometry;
@@ -291,6 +511,8 @@ CaseResult run_case(
         }
     };
     FakeSolver solver(geometry, spectrum_scale);
+    solver.fail_gradient_call = fail_gradient_call;
+    solver.nonfinite_gradient_call = nonfinite_gradient_call;
     App::Optimizer optimizer(test.settings, solver, geometry, log);
     optimizer.run();
 
@@ -368,6 +590,195 @@ bool near(double left, double right, double tolerance = 1.0e-8)
 {
     return std::abs(left - right) <= tolerance
         * std::max({1.0, std::abs(left), std::abs(right)});
+}
+
+bool analytic_run_finished(const AnalyticResult& result)
+{
+    return result.run.error.empty() && result.run.completedIterations > 0;
+}
+
+bool analytic_result_is_finite(const AnalyticResult& result)
+{
+    const auto finite = [](const std::vector<double>& values) {
+        return std::all_of(values.begin(), values.end(),
+            [](double value) { return std::isfinite(value); });
+    };
+    return std::isfinite(result.trueBound)
+        && std::isfinite(result.run.l1)
+        && std::isfinite(result.run.linfinity)
+        && std::isfinite(result.run.infeasibility)
+        && finite(result.design)
+        && finite(result.objectives);
+}
+
+void print_analytic_result(
+    const char* name,
+    const AnalyticResult& result)
+{
+    std::cerr << "[DIAGNOSTIC] " << name
+              << ": converged=" << result.run.converged
+              << ", iterations=" << result.run.completedIterations
+              << ", true bound=" << result.trueBound
+              << ", KKT l1/linfinity/infeasibility="
+              << result.run.l1 << "/" << result.run.linfinity << "/"
+              << result.run.infeasibility;
+    if (!result.design.empty()) {
+        std::cerr << ", design=" << result.design[0];
+    }
+    if (!result.run.error.empty()) {
+        std::cerr << ", error=" << result.run.error;
+    }
+    std::cerr << '\n';
+}
+
+bool check_analytic_symmetric_minimax()
+{
+    const AnalyticResult result = run_analytic_problem(
+        AnalyticProblem::symmetric_minimax, 0.1);
+    const bool complete = result.design.size() == 1
+        && result.objectives.size() == 2;
+    const double design = complete ? result.design[0] : 0.0;
+    const double actual_maximum = std::max(
+        design * design,
+        (1.0 - design) * (1.0 - design));
+    const bool passed = analytic_run_finished(result)
+        && complete
+        && analytic_result_is_finite(result)
+        && near(design, 0.5, 2.0e-3)
+        && near(result.trueBound, 0.25, 5.0e-3)
+        && near(result.trueBound, actual_maximum);
+    if (!passed) {
+        print_analytic_result("analytic symmetric minimax", result);
+    }
+    return passed;
+}
+
+bool check_analytic_opening_direction()
+{
+    const AnalyticResult result = run_analytic_problem(
+        AnalyticProblem::opening_direction, 0.0);
+    const bool complete = result.design.size() == 1
+        && result.objectives.size() == 1;
+    const double design = complete ? result.design[0] : 0.0;
+    const double objective = (1.0 - design) * (1.0 - design);
+    const bool passed = analytic_run_finished(result)
+        && complete
+        && analytic_result_is_finite(result)
+        && design > 0.9
+        && result.trueBound < 0.02
+        && near(result.trueBound, objective);
+    if (!passed) {
+        print_analytic_result("analytic lower-bound escape", result);
+    }
+    return passed;
+}
+
+bool check_paropt_first_move_limit()
+{
+    const AnalyticResult opening = run_analytic_problem(
+        AnalyticProblem::opening_direction, 0.0, 1.0, 1);
+    const AnalyticResult closing = run_analytic_problem(
+        AnalyticProblem::upper_bound_escape, 1.0, 1.0, 1);
+    const bool passed = opening.run.error.empty() && closing.run.error.empty()
+        && opening.design.size() == 1 && closing.design.size() == 1
+        && opening.design[0] > 0.0 && opening.design[0] <= 0.2
+        && closing.design[0] < 1.0 && closing.design[0] >= 0.8;
+    if (!passed) {
+        print_analytic_result("ParOpt first opening move", opening);
+        print_analytic_result("ParOpt first closing move", closing);
+    }
+    return passed;
+}
+
+bool check_analytic_upper_bound_escape()
+{
+    const AnalyticResult result = run_analytic_problem(
+        AnalyticProblem::upper_bound_escape, 1.0);
+    const bool complete = result.design.size() == 1
+        && result.objectives.size() == 1;
+    const double design = complete ? result.design[0] : 1.0;
+    const double objective = design * design;
+    const bool passed = analytic_run_finished(result)
+        && complete
+        && analytic_result_is_finite(result)
+        && design < 0.1
+        && result.trueBound < 0.02
+        && near(result.trueBound, objective);
+    if (!passed) {
+        print_analytic_result("analytic upper-bound escape", result);
+    }
+    return passed;
+}
+
+bool check_analytic_flat_response()
+{
+    constexpr double initial_design = 0.37;
+    const AnalyticResult result = run_analytic_problem(
+        AnalyticProblem::flat_response, initial_design);
+    const bool passed = analytic_run_finished(result)
+        && result.design.size() == 1
+        && result.objectives.size() == 1
+        && analytic_result_is_finite(result)
+        && near(result.design[0], initial_design, 1.0e-7)
+        && near(result.trueBound, 1.0, 1.0e-5);
+    if (!passed) {
+        print_analytic_result("analytic zero-gradient response", result);
+    }
+    return passed;
+}
+
+bool check_analytic_raw_objective_scale()
+{
+    constexpr double scale = 1.0e8;
+    const AnalyticResult result = run_analytic_problem(
+        AnalyticProblem::symmetric_minimax, 0.1, scale);
+    const bool complete = result.design.size() == 1
+        && result.objectives.size() == 2;
+    const double design = complete ? result.design[0] : 0.0;
+    const double actual_maximum = scale * std::max(
+        design * design,
+        (1.0 - design) * (1.0 - design));
+    const bool passed = analytic_run_finished(result)
+        && complete
+        && analytic_result_is_finite(result)
+        && near(design, 0.5, 2.0e-3)
+        && near(result.trueBound / scale, 0.25, 5.0e-3)
+        && near(result.trueBound, actual_maximum);
+    if (!passed) {
+        print_analytic_result("analytic raw objective scale", result);
+    }
+    return passed;
+}
+
+bool check_analytic_evaluation_failure()
+{
+    const AnalyticResult result = run_analytic_problem(
+        AnalyticProblem::evaluation_failure, 0.2);
+    return !result.run.error.empty()
+        && result.run.completedIterations == 0;
+}
+
+bool check_paper_optimizer_defaults()
+{
+    const App::OptimizerSettings settings;
+    if (settings.objectiveMode != App::ObjectiveMode::band
+        || settings.maxIterations != 400
+        || !near(settings.mmaInitialAsymptote, 0.5)
+        || !near(settings.mmaDecreaseAsymptote, 0.7)
+        || !near(settings.mmaIncreaseAsymptote, 1.2)
+        || !near(settings.mmaConstraintPenalty, 1000.0)
+        || settings.frequencyBands.size() != 2) {
+        return false;
+    }
+
+    const App::FrequencyBand& pass = settings.frequencyBands[0];
+    const App::FrequencyBand& stop = settings.frequencyBands[1];
+    return pass.type == App::FrequencyBandType::pass
+        && near(pass.startHz, 1000.0) && near(pass.endHz, 2500.0)
+        && near(pass.targetTransmission, 1.0)
+        && stop.type == App::FrequencyBandType::stop
+        && near(stop.startHz, 2500.0) && near(stop.endHz, 4000.0)
+        && near(stop.targetTransmission, 1.0e-2);
 }
 
 std::string unsuccessful_reason(const CaseResult& result)
@@ -468,7 +879,7 @@ bool check_common_spectrum_scale()
         || !near(unit.stop, scaled.stop, 1.0e-6)
         || !near(unit.bound, scaled.bound, 1.0e-6)) {
         const std::string reason = "common FFT scaling should leave the "
-            "design and normalized objectives unchanged (tolerance 1e-6)";
+            "design and transmission objectives unchanged (tolerance 1e-6)";
         print_result("unit spectrum", unit,
                      unsuccessful_reason(unit).empty()
                         ? reason : unsuccessful_reason(unit));
@@ -491,7 +902,7 @@ bool check_common_spectrum_scale()
     return true;
 }
 
-bool check_epigraph_tracks_active_objective()
+bool check_first_adapter_step()
 {
     const CaseSpec test = freeform_case();
     const std::vector<double> initial(frequencies.size(), 0.5);
@@ -513,7 +924,7 @@ bool check_epigraph_tracks_active_objective()
                << ", final worst=" << worst << " (required < "
                << 0.75 * initial_worst << "), bound=" << result.bound
                << " (required within 0.5% of " << worst << ")";
-        print_result("one-step epigraph", result, reason.str());
+        print_result("one-step optimizer adapter", result, reason.str());
     }
     return passed;
 }
@@ -521,7 +932,8 @@ bool check_epigraph_tracks_active_objective()
 bool check_converged_status()
 {
     const CaseSpec test = freeform_case();
-    const CaseResult result = run_case(test, optimum(test), 1.0, 30);
+    const std::vector<double> expected = optimum(test);
+    const CaseResult result = run_case(test, expected, 1.0, 30);
     const bool passed = result.status == App::OptimizerStatus::Converged
         && result.solver_status == App::SolverStatus::Converged
         && result.exportable
@@ -573,7 +985,7 @@ bool check_cancelled_status()
     return passed;
 }
 
-bool check_wall_trap_escape()
+bool check_fake_response_adapter_escape()
 {
     const CaseSpec test = low_pass_case();
     const std::vector<double> wall(frequencies.size(), 0.0);
@@ -591,9 +1003,25 @@ bool check_wall_trap_escape()
         reason << "worst objective changed from " << initial_worst
                << " to " << final_worst
                << "; pass-band design variables must move above zero";
-        print_result("wall escape", result, reason.str());
+        print_result("fake-response adapter escape", result, reason.str());
     }
     return passed;
+}
+
+bool check_failed_adapter_gradient_restores_design()
+{
+    const CaseSpec test = low_pass_case();
+    const std::vector<double> initial(frequencies.size(), 0.5);
+    const CaseResult callback_failure = run_case(test, initial, 1.0, 6, 2);
+    const CaseResult nonfinite_gradient = run_case(test, initial, 1.0, 6, 0, 2);
+    const auto restored = [&](const CaseResult& result) {
+        return result.status == App::OptimizerStatus::Error
+            && result.iterations == 0
+            && result.solve_calls >= 3
+            && result.gradient_calls == 2
+            && design_error(result.design, initial) < 1.0e-20;
+    };
+    return restored(callback_failure) && restored(nonfinite_gradient);
 }
 
 } // namespace
@@ -615,28 +1043,46 @@ int main(int argc, char** argv)
         }
     };
     if (provided < MPI_THREAD_SERIALIZED) {
-        check(false, "Optimizer test suite needs MPI_THREAD_SERIALIZED.");
+        std::cerr << "Optimizer test suite needs MPI_THREAD_SERIALIZED.\n";
+        MPI_Finalize();
+        return 1;
     }
-    else {
-        check(check_filter_case("low-pass", low_pass_case()),
-            "The real Optimizer failed the curated low-pass objective.");
-        check(check_filter_case("high-pass", high_pass_case()),
-            "The real Optimizer failed the curated high-pass objective.");
-        check(check_filter_case("band-pass", band_pass_case()),
-            "The real Optimizer failed the curated band-pass objective.");
-        check(check_filter_case("freeform", freeform_case()),
-            "The real Optimizer failed the curated freeform objective.");
-        check(check_common_spectrum_scale(),
-            "Common FFT scaling changed the optimizer result.");
-        check(check_epigraph_tracks_active_objective(),
-            "The epigraph bound lagged behind the active objective like a geometry variable.");
-        check(check_converged_status(),
-            "An already optimal design did not report convergence.");
-        check(check_cancelled_status(),
-            "Prepared cancellation did not stop before the forward solve.");
-        check(check_wall_trap_escape(),
-            "The optimizer stayed in a wall despite an exact opening gradient.");
-    }
+    check(check_analytic_symmetric_minimax(),
+        "ParOpt MMA failed min max{x^2, (1-x)^2}: expected x=0.5, z=0.25.");
+    check(check_analytic_opening_direction(),
+        "ParOpt MMA did not leave a lower bound with an exact improving gradient.");
+    check(check_paropt_first_move_limit(),
+        "ParOpt MMA violated its default 0.2 first move limit.");
+    check(check_analytic_upper_bound_escape(),
+        "ParOpt MMA did not leave an upper bound with an exact improving gradient.");
+    check(check_analytic_flat_response(),
+        "ParOpt MMA moved a design when the analytical objective had zero gradient.");
+    check(check_analytic_raw_objective_scale(),
+        "ParOpt MMA changed the minimax solution under fixed objective normalization.");
+    check(check_analytic_evaluation_failure(),
+        "The corrected ParOpt MMA driver did not report an objective failure.");
+    check(check_paper_optimizer_defaults(),
+        "OptimizerSettings no longer matches the published low-pass baseline.");
+    check(check_filter_case("low-pass", low_pass_case()),
+        "The real Optimizer failed the curated low-pass objective.");
+    check(check_filter_case("high-pass", high_pass_case()),
+        "The real Optimizer failed the curated high-pass objective.");
+    check(check_filter_case("band-pass", band_pass_case()),
+        "The real Optimizer failed the curated band-pass objective.");
+    check(check_filter_case("freeform", freeform_case()),
+        "The real Optimizer failed the curated freeform objective.");
+    check(check_common_spectrum_scale(),
+        "Common FFT scaling changed the optimizer result.");
+    check(check_first_adapter_step(),
+        "The optimizer adapter did not improve its exact analytical response.");
+    check(check_converged_status(),
+        "An already optimal design did not report ParOpt convergence.");
+    check(check_cancelled_status(),
+        "Prepared cancellation did not stop before the forward solve.");
+    check(check_fake_response_adapter_escape(),
+        "The optimizer adapter ignored the fake response's exact opening gradient.");
+    check(check_failed_adapter_gradient_restores_design(),
+        "The optimizer adapter retained a candidate whose gradient failed.");
 
     MPI_Finalize();
     if (failures != 0) {

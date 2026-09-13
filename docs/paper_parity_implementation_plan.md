@@ -134,10 +134,9 @@ Direct 3D optimization, Bloch-Floquet unit cells, export implementation, and GLV
 - [x] Avoid ParOpt 2.1.5's swapped MMA convergence outputs with a small local
   driver over the public `ParOptMMA`/`ParOptInteriorPoint` classes. Its KKT
   call uses `(l1, linfty, infeasibility)` in the declared order.
-- [x] Preserve the exact epigraph formulation without patching ParOpt:
-  `EpigraphMMA` derives from `ParOptMMA`, reuses its geometry approximation,
-  and overrides the virtual subproblem evaluations/bounds so only `z` remains
-  exact-linear, unregularized, and free of geometry move limits.
+- [x] Use pinned upstream `ParOptMMA` with `z` as an ordinary normalized
+  external design variable. Paper-exact MMA iteration parity is no longer a
+  requirement; optimizer robustness is the baseline.
 
 ## Implementation Order
 
@@ -299,3 +298,7 @@ Gate: the complete Start/Cancel/Export state flow remains responsive while a rea
   tolerances, and the recommended interior-point settings. A local
   `EpigraphMMA` subclass keeps `z` exact-linear, while a short public-API MMA
   driver corrects KKT output ordering; fetched ParOpt remains unmodified.
+- 2026-09-13: Superseded the custom epigraph implementation with regular
+  upstream `ParOptMMA`. The public-API driver is retained only to correct the
+  pinned release's swapped `computeKKTError` call; it does not change ParOpt's
+  MMA subproblem mathematics.

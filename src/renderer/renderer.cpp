@@ -1108,6 +1108,15 @@ void Renderer::FilterDesignerPanel(const dispatcher_t& dispatcher)
             static_cast<int>(response->transmission.size()),
             static_cast<int>(response->valid.size())})
         : 0;
+    double responseMinimumDb = std::numeric_limits<double>::infinity();
+    for (int bin = 0; bin < responseCount; ++bin) {
+        if (response->valid[bin] != 0
+            && std::isfinite(response->attenuationDB[bin])) {
+            responseMinimumDb = std::min(
+                responseMinimumDb,
+                static_cast<double>(response->attenuationDB[bin]));
+        }
+    }
     ImGui::SameLine();
     if (ImGui::Button("Fit")) {
         fitFrequencyPlot = true;
@@ -1120,7 +1129,7 @@ void Renderer::FilterDesignerPanel(const dispatcher_t& dispatcher)
         if (ImGui::MenuItem("Reset saved view")) {
             ui.plotXMinHz = optimizer.frequencyMin;
             ui.plotXMaxHz = optimizer.frequencyMax;
-            ui.plotYMinDb = optimizer.attenuationMinDb;
+            ui.plotYMinDb = -240.0;
             ui.plotYMaxDb = optimizer.attenuationMaxDb;
             ui.plotYMinLinear = 0.0;
             ui.plotYMaxLinear = 1.1;
@@ -1183,6 +1192,16 @@ void Renderer::FilterDesignerPanel(const dispatcher_t& dispatcher)
         ImGui::TextDisabled("Left drag: draw/edit  Right drag: pan");
         ImGui::TextDisabled("Wheel: zoom  Shift + right drag: frame zoom");
         ImGui::EndPopup();
+    }
+    if (ui.displayInDb && responseMinimumDb < ui.plotYMinDb) {
+        ImGui::TextColored(
+            ImVec4(1.0f, 0.70f, 0.30f, 1.0f),
+            "Response reaches %.1f dB below this view; use Fit to reveal it.",
+            responseMinimumDb);
+    }
+    if (ui.displayInDb && responseMinimumDb <= -240.0) {
+        ImGui::TextDisabled(
+            "-240 dB is the reporting floor (transmission <= 1e-12).");
     }
     if (fitFrequencyPlot) {
         ImPlot::SetNextAxesToFit();
