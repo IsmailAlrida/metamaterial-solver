@@ -150,8 +150,8 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(fftw)
 
-# 7. Fetch ParOpt and its METIS dependency. ParOpt requires a system MPI SDK
-# even when MFEM itself is serial; setup.bat installs MS-MPI and oneMKL.
+# 7. Configure MPI and the linear-algebra libraries used by the solver and
+# ParOpt. ParOpt uses MPI_COMM_SELF even when MFEM itself is serial.
 if(WIN32)
   set(_msmpi_sdk "$ENV{SystemDrive}/Program Files (x86)/Microsoft SDKs/MPI")
   if(NOT EXISTS "$ENV{MSMPI_INC}/mpi.h" AND
@@ -305,16 +305,18 @@ if(MSVC)
 endif()
 set_target_properties(metis PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON)
 
-# ParOpt is source-only upstream, so expose only its C++ core as a static target.
+set(_paropt_revision eae156b756e517fb7fd4a5abb9a203050357b815)
 FetchContent_Declare(
   paropt
   GIT_REPOSITORY https://github.com/smdogroup/paropt.git
-  GIT_TAG        v2.1.5
+  GIT_TAG        ${_paropt_revision}
   SOURCE_DIR     "${METAMATERIAL_DEPS_SOURCE_DIR}/paropt-src"
   SOURCE_SUBDIR  _source-only
 )
 FetchContent_MakeAvailable(paropt)
 
+# Build the pinned upstream ParOpt MMA unchanged. The application-side driver
+# corrects only the released computeKKTError argument-order bug.
 add_library(paropt STATIC
   "${paropt_SOURCE_DIR}/src/ParOptOptions.cpp"
   "${paropt_SOURCE_DIR}/src/ParOptInteriorPoint.cpp"
@@ -343,9 +345,6 @@ target_link_libraries(paropt PUBLIC
 )
 if(MSVC)
   target_compile_definitions(paropt PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
-  # ParOptInteriorPoint.cpp gives min2/max2 external linkage while three
-  # other translation units define the same inline helpers. Keep the fetched
-  # source untouched and give only the strong MSVC definitions local names.
   set_source_files_properties(
     "${paropt_SOURCE_DIR}/src/ParOptInteriorPoint.cpp"
     PROPERTIES COMPILE_DEFINITIONS
@@ -353,7 +352,7 @@ if(MSVC)
   )
 endif()
 
-# 9. Fetch MFEM's CutFEM dependencies
+# 8. Fetch MFEM's CutFEM dependencies
 FetchContent_Declare(
   blitz
   GIT_REPOSITORY https://github.com/blitzpp/blitz.git
@@ -433,7 +432,7 @@ if(METAMATERIAL_USE_MPI)
   set(HYPRE_LIBRARIES HYPRE CACHE STRING "" FORCE)
 endif()
 
-# 10. Fetch MFEM (Finite Element Method Library)
+# 9. Fetch MFEM (Finite Element Method Library)
 set(MFEM_USE_MPI ${METAMATERIAL_USE_MPI} CACHE BOOL "" FORCE)
 set(MFEM_FETCH_TPLS OFF CACHE BOOL "" FORCE)
 set(MFEM_USE_METIS OFF CACHE BOOL "" FORCE)
@@ -522,6 +521,7 @@ set(_glvis_compile_opts
 )
 set(_glvis_include_dirs
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/renderer"
   "${GLVIS_SOURCE_DIR}/lib"
 )
 set(_glvis_libraries
@@ -558,17 +558,21 @@ file(READ "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Metamaterial.m"
   METAMATERIAL_MATLAB_TEMPLATE)
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
 configure_file(
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/export_templates.hpp.in"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/exporter/export_templates.hpp.in"
   "${CMAKE_CURRENT_BINARY_DIR}/generated/export_templates.hpp"
   @ONLY
 )
 
-file(GLOB sources "src/*.cpp")
-list(REMOVE_ITEM sources "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
-if(METAMATERIAL_MFEM_BACKEND MATCHES "cuda")
-  file(GLOB cuda_sources "src/*.cu")
-  list(APPEND sources ${cuda_sources})
-endif()
+set(sources
+  src/dispatcher/dispatcher.cpp
+  src/exporter/exporter.cpp
+  src/optimizer/optimizer.cpp
+  src/renderer/glvis_adapter.cpp
+  src/renderer/renderer.cpp
+  src/solver/par_solver.cpp
+  src/solver/solver.cpp
+  src/types/settings.cpp
+)
 
 add_library(metamaterial_imgui STATIC
     ${IMGUI_DIR}/backends/imgui_impl_sdl2.cpp
@@ -603,6 +607,12 @@ message(STATUS "Interactive demo mode: ${METAMATERIAL_DEMO_MODE}")
 # Target-specific paths
 target_include_directories(metamaterial_core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/dispatcher"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/exporter"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/optimizer"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/renderer"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/solver"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/types"
     "${fftw_SOURCE_DIR}/api"
     "${assimp_SOURCE_DIR}/contrib/zip/src"
     "${CMAKE_CURRENT_BINARY_DIR}/generated"
@@ -644,17 +654,19 @@ add_executable(dispatcher_backend_check
     tests/dispatcher_backend_check.cpp
 )
 target_include_directories(dispatcher_backend_check PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/dispatcher"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/renderer"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/types"
 )
 target_link_libraries(dispatcher_backend_check PRIVATE mfem)
 add_test(NAME dispatcher_backend COMMAND dispatcher_backend_check)
 
 add_executable(settings_persistence_check
     tests/settings_persistence_check.cpp
-    src/settings.cpp
+    src/types/settings.cpp
 )
 target_include_directories(settings_persistence_check PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/types"
 )
 target_link_libraries(settings_persistence_check PRIVATE mfem)
 add_test(NAME settings_persistence COMMAND settings_persistence_check)
@@ -665,51 +677,56 @@ add_executable(exporter_bundle_check
 target_link_libraries(exporter_bundle_check PRIVATE metamaterial_core)
 add_test(NAME exporter_bundle COMMAND exporter_bundle_check)
 
-add_executable(paropt_smoke_check
-    tests/paropt_smoke_check.cpp
-)
-target_link_libraries(paropt_smoke_check PRIVATE ParOpt::paropt)
-add_test(NAME paropt_smoke COMMAND paropt_smoke_check)
+add_executable(optimizer_test_suite tests/OptimizerTestSuite.cpp)
+target_link_libraries(optimizer_test_suite PRIVATE metamaterial_core)
+add_test(NAME optimizer_suite COMMAND optimizer_test_suite)
 
-if(NOT METAMATERIAL_USE_MPI)
-  add_executable(solver_adjoint_check
-      tests/solver_adjoint_check.cpp
-  )
-  target_link_libraries(solver_adjoint_check PRIVATE metamaterial_core)
-  add_test(NAME solver_adjoint COMMAND solver_adjoint_check)
-endif()
+add_executable(solver_test_suite tests/SolverTestSuite.cpp)
+target_link_libraries(solver_test_suite PRIVATE
+    metamaterial_core
+    MPI::MPI_CXX
+)
 
 add_executable(paper_optimizer_miniapp
     tests/paper_optimizer_miniapp.cpp
 )
 target_link_libraries(paper_optimizer_miniapp PRIVATE
     metamaterial_core
+    MPI::MPI_CXX
 )
 if(METAMATERIAL_USE_MPI)
-  add_executable(mumps_smoke_check tests/mumps_smoke_check.cpp)
-  target_link_libraries(mumps_smoke_check PRIVATE mfem)
-
-  add_test(NAME mumps_2_ranks
-      COMMAND "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}" 2
-              ${MPIEXEC_PREFLAGS} $<TARGET_FILE:mumps_smoke_check>
+  set(_solver_rank_reference
+      "${CMAKE_CURRENT_BINARY_DIR}/solver-suite-rank-reference.txt")
+  add_test(NAME solver_suite_fgmres_1_rank
+      COMMAND "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}" 1
+              ${MPIEXEC_PREFLAGS} $<TARGET_FILE:solver_test_suite>
+              --write-rank-reference "${_solver_rank_reference}"
               ${MPIEXEC_POSTFLAGS})
-  set_tests_properties(mumps_2_ranks PROPERTIES
-      PROCESSORS 2)
+  set_tests_properties(solver_suite_fgmres_1_rank PROPERTIES
+      PROCESSORS 1 FIXTURES_SETUP solver_rank_reference)
 
-  add_executable(parallel_solver_check
-      tests/parallel_solver_check.cpp
-  )
-  target_link_libraries(parallel_solver_check PRIVATE
-      metamaterial_core
-  )
-
-  foreach(_ranks 1 2 4)
-    add_test(NAME parallel_solver_${_ranks}_ranks
-        COMMAND "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}" ${_ranks}
-                ${MPIEXEC_PREFLAGS} $<TARGET_FILE:parallel_solver_check>
+  foreach(_solver_case IN ITEMS fgmres_2_rank mumps_1_rank mumps_2_rank)
+    if(_solver_case MATCHES "_2_rank$")
+      set(_solver_ranks 2)
+    else()
+      set(_solver_ranks 1)
+    endif()
+    if(_solver_case MATCHES "^mumps_")
+      set(_solver_method --mumps)
+    else()
+      set(_solver_method)
+    endif()
+    add_test(NAME solver_suite_${_solver_case}
+        COMMAND "${MPIEXEC_EXECUTABLE}" "${MPIEXEC_NUMPROC_FLAG}"
+                ${_solver_ranks} ${MPIEXEC_PREFLAGS}
+                $<TARGET_FILE:solver_test_suite> ${_solver_method}
+                --compare-rank-reference "${_solver_rank_reference}"
                 ${MPIEXEC_POSTFLAGS})
-    set_tests_properties(parallel_solver_${_ranks}_ranks PROPERTIES
-        PROCESSORS ${_ranks})
+    set_tests_properties(solver_suite_${_solver_case} PROPERTIES
+        PROCESSORS ${_solver_ranks}
+        FIXTURES_REQUIRED solver_rank_reference)
   endforeach()
+else()
+  add_test(NAME solver_suite COMMAND solver_test_suite)
 endif()
 endif()

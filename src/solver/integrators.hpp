@@ -49,20 +49,18 @@ public:
     {
         mfem::DenseMatrix full_matrix;
         integrator->SetIntRule(nullptr);
-        integrator->AssembleElementMatrix(
-            element, transformation, full_matrix);
+        integrator->AssembleElementMatrix(element, transformation, full_matrix);
 
         mfem::GridFunctionCoefficient phi_coefficient(&phi);
         NegatedCoefficient negative_phi(phi_coefficient);
+
         // Algoim integrates where its coefficient is positive.
         mfem::Coefficient& cut_coefficient = positive
             ? static_cast<mfem::Coefficient&>(phi_coefficient)
             : static_cast<mfem::Coefficient&>(negative_phi);
-        mfem::AlgoimIntegrationRules integration_rules(
-            integration_order, cut_coefficient, level_set_order);
+        mfem::AlgoimIntegrationRules integration_rules(integration_order, cut_coefficient, level_set_order);
         mfem::IntegrationRule cut_rule;
-        integration_rules.GetVolumeIntegrationRule(
-            transformation, cut_rule);
+        integration_rules.GetVolumeIntegrationRule(transformation, cut_rule);
 
         for (int point = 0; point < cut_rule.GetNPoints(); ++point) {
             const mfem::IntegrationPoint& ip = cut_rule.IntPoint(point);
@@ -72,8 +70,7 @@ public:
 
         mfem::DenseMatrix cut_matrix;
         integrator->SetIntegrationRule(cut_rule);
-        integrator->AssembleElementMatrix(
-            element, transformation, cut_matrix);
+        integrator->AssembleElementMatrix(element, transformation, cut_matrix);
         integrator->SetIntRule(nullptr);
 
         element_matrix = full_matrix;

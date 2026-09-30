@@ -158,7 +158,7 @@ struct ExporterSettings {
 struct UiSettings {
     double plotXMinHz = 60.0;
     double plotXMaxHz = 600.0;
-    double plotYMinDb = -80.0;
+    double plotYMinDb = -240.0;
     double plotYMaxDb = 10.0;
     double plotYMinLinear = 0.0;
     double plotYMaxLinear = 1.1;

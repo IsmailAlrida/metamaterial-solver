@@ -548,6 +548,7 @@ bool App::Solver::setMeshParallelLocal()
             state.reference_ready = false;
         }
         if (!matrices_match || !source_matches) {
+            reference_inlet_pressure.clear();
             reference_outlet_pressure.clear();
             fft_window.clear();
             reference_spectrum.clear();
@@ -749,6 +750,7 @@ bool App::Solver::assembleSolutionSpaceParallelLocal()
     result.residualNorms.clear();
     pass_adjoint_history.clear();
     stop_adjoint_history.clear();
+    inlet_pressure.clear();
     outlet_pressure.clear();
     state.initial_mumps.reset();
     state.effective_mumps.reset();
@@ -1660,6 +1662,8 @@ bool App::Solver::solveParallelLocal()
             };
         }
 
+        std::vector<double>& measured_inlet = reference_analysis
+            ? reference_inlet_pressure : inlet_pressure;
         std::vector<double>& measured_outlet = reference_analysis
             ? reference_outlet_pressure : outlet_pressure;
         write_mumps_diagnostic(
@@ -1694,6 +1698,7 @@ bool App::Solver::solveParallelLocal()
                 !reference_analysis,
                 result.U,
                 result.residualNorms,
+                measured_inlet,
                 measured_outlet,
                 performance_data,
                 rank_log,

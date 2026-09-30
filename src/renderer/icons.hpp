@@ -83,8 +83,8 @@ inline const ImWchar* glyphRanges()
 
 inline std::filesystem::path fontPath()
 {
-    // icons.hpp is in src; the checked-in font lives in the adjacent public folder.
-    return std::filesystem::path(__FILE__).parent_path().parent_path()
+    // icons.hpp is in src/renderer; the checked-in font lives in public.
+    return std::filesystem::path(__FILE__).parent_path().parent_path().parent_path()
         / "public"
         / "Material_Symbols_Rounded"
         / "static"

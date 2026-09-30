@@ -124,19 +124,17 @@ mpiexec -n 2 build\parallel-cpu\metamaterial_app.exe
 ```
 
 Keep `MPI ranks x OMP_NUM_THREADS` at or below the machine's logical processor
-count. Prove the parallel linear algebra and forward Solver before running the
-optimizer:
+count. Prove the real Solver and deterministic Optimizer seams before a paper
+run:
 
 ```bat
-mpiexec -n 2 build\parallel-cpu\mumps_smoke_check.exe
-mpiexec -n 1 build\parallel-cpu\parallel_solver_check.exe
-mpiexec -n 2 build\parallel-cpu\parallel_solver_check.exe
-mpiexec -n 4 build\parallel-cpu\parallel_solver_check.exe
+ctest --test-dir build\parallel-cpu -R "solver_suite|optimizer_suite" --output-on-failure
 ```
 
 After building, the test wrapper runs the registered serial and/or MPI checks
-without configuring or compiling anything and merges the results into
-`test-results/tests.json`:
+without configuring or compiling anything. It prints a compact pass/fail
+summary and merges the results into `test-results/tests.json` and the readable
+`test-results/tests.md`:
 
 ```bat
 test.bat serial
@@ -145,13 +143,14 @@ test.bat all
 test.bat parallel-cpu debug
 ```
 
-The optimizer miniapp uses FGMRES by default. `--paper` runs the paper's
-low-pass case, `--high-pass` runs its successful 1000--2500 Hz stop-band case,
-`--high-pass-20db` targets 20 dB attenuation from 60--1000 Hz, `--iterations`
-sets the iteration count, and `--mumps` selects the direct solver:
+The optimizer miniapp uses FGMRES by default. The paper-configuration baseline
+is `--paper --mumps`; `--paper` without `--mumps` is the corresponding FGMRES
+variant. `--high-pass` runs the paper's successful 1000--2500 Hz stop-band case,
+`--high-pass-20db` targets 20 dB attenuation from 60--1000 Hz, and `--iterations`
+sets the iteration count:
 
 ```bat
-mpiexec -n 2 build\parallel-cpu\paper_optimizer_miniapp.exe --paper
+mpiexec -n 2 build\parallel-cpu\paper_optimizer_miniapp.exe --paper --mumps
 mpiexec -n 2 build\parallel-cpu\paper_optimizer_miniapp.exe --high-pass
 mpiexec -n 2 build\parallel-cpu\paper_optimizer_miniapp.exe --high-pass-20db --iterations 50
 mpiexec -n 2 build\parallel-cpu\paper_optimizer_miniapp.exe --high-pass --mumps
@@ -206,10 +205,7 @@ Run the MPI backend with the same rank/worker model:
 
 ```bash
 OMP_NUM_THREADS=4 mpiexec -n 2 build/linux/parallel-cpu/metamaterial_app
-mpiexec -n 2 build/linux/parallel-cpu/mumps_smoke_check
-mpiexec -n 1 build/linux/parallel-cpu/parallel_solver_check
-mpiexec -n 2 build/linux/parallel-cpu/parallel_solver_check
-mpiexec -n 4 build/linux/parallel-cpu/parallel_solver_check
+ctest --test-dir build/linux/parallel-cpu -R "solver_suite|optimizer_suite" --output-on-failure
 ./test.sh parallel-cpu
 ./test.sh all
 ```

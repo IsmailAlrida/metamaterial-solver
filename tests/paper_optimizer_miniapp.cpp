@@ -352,15 +352,15 @@ bool write_report_data(
            << solver_performance.differentiatedDofs << "\n"
            << "    },\n"
            << "    \"optimizer_phases\": {\n"
-           << "      \"paropt_seconds\": "
-           << optimizer_performance.paroptSeconds << ",\n"
+           << "      \"mma_seconds\": "
+           << optimizer_performance.mmaSeconds << ",\n"
            << "      \"forward_callback_seconds\": "
            << optimizer_performance.forwardCallbackSeconds << ",\n"
            << "      \"gradient_callback_seconds\": "
            << optimizer_performance.gradientCallbackSeconds << ",\n"
-           << "      \"paropt_bookkeeping_seconds\": "
+           << "      \"mma_bookkeeping_seconds\": "
            << std::max(0.0,
-                optimizer_performance.paroptSeconds
+                optimizer_performance.mmaSeconds
                     - optimizer_performance.forwardCallbackSeconds
                     - optimizer_performance.gradientCallbackSeconds)
            << "\n"
@@ -696,7 +696,7 @@ int main(int argc, char** argv)
             }
             if (optimizer != nullptr
                 && (message.rfind("Initial pass/stop objectives:", 0) == 0
-                    || message.rfind("Completed optimization iteration ", 0) == 0)) {
+                    || message.rfind("Completed MMA iteration ", 0) == 0)) {
                 const ObjectivePoint point{
                     optimizer->get_iteration(),
                     optimizer->get_pass_objective(),
